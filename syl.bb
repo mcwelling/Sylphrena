@@ -24,43 +24,54 @@
   (shell {:continue true :out :string :err :string}
          (str "podman rm -f " container-name)))
 
+(defn exec-setup [& cmd]
+  @(process (into ["podman" "exec" container-name] cmd)
+            {:out :string :err :string :continue true}))
+
 (defn configure-git-and-ssh []
   (let [home      (System/getProperty "user.home")
         git-name  (str/trim (:out (shell {:out :string :err :string :continue true}
                                          "git config --global user.name")))
         git-email (str/trim (:out (shell {:out :string :err :string :continue true}
-                                         "git config --global user.email")))
-        ssh-src   (str home "/.ssh")]
-    ;; Copy SSH keys and fix permissions
-    (when (.exists (java.io.File. ssh-src))
-      (println "[Syl Setup] Copying SSH keys into container...")
-      (shell {:continue true :out :string :err :string}
-             (str "podman cp " ssh-src " " container-name ":/root/"))
-      (shell {:continue true :out :string :err :string}
-             (str "podman exec " container-name
-                  " bash -c 'chmod 700 /root/.ssh"
-                  " && find /root/.ssh -type f -exec chmod 600 {} \\;"
-                  " && find /root/.ssh -name \"*.pub\" -exec chmod 644 {} \\;"
-                  " && ssh-keyscan -H github.com >> /root/.ssh/known_hosts 2>/dev/null"
-                  " && true'")))
+                                         "git config --global user.email")))]
+    ;; ~/.ssh is a read-only mount owned by UID 501 (macOS user), not root.
+    ;; SSH refuses to use files it doesn't own, so we copy everything to /tmp/.ssh,
+    ;; fix ownership and permissions, then shadow /usr/bin/ssh with a wrapper that
+    ;; uses the clean copy — making all ssh calls (direct or via git) work seamlessly.
+    (when (.exists (java.io.File. (str home "/.ssh")))
+      (println "[Syl Setup] Configuring SSH for git operations...")
+      (exec-setup "bash" "-c"
+                  (str "cp -rp /root/.ssh/. /tmp/.ssh/ 2>/dev/null || true"
+                       " && chown -R root:root /tmp/.ssh"
+                       " && chmod 700 /tmp/.ssh"
+                       " && find /tmp/.ssh -type f -exec chmod 600 {} \\;"
+                       " && find /tmp/.ssh -name '*.pub' -exec chmod 644 {} \\;"
+                       " && [ -f /tmp/.ssh/config ] || touch /tmp/.ssh/config"
+                       " && ssh-keyscan -H github.com >> /tmp/.ssh/known_hosts 2>/dev/null"
+                       " && echo '#!/bin/sh' > /usr/local/bin/ssh"
+                       " && echo 'exec /usr/bin/ssh -F /tmp/.ssh/config"
+                       " -o UserKnownHostsFile=/tmp/.ssh/known_hosts \"$@\"'"
+                       " >> /usr/local/bin/ssh"
+                       " && chmod +x /usr/local/bin/ssh")))
     ;; Apply git identity read from host
     (when-not (str/blank? git-name)
       (println "[Syl Setup] Configuring git identity as:" git-name git-email)
-      (shell {:continue true :out :string :err :string}
-             (str "podman exec " container-name
-                  " git config --global user.name '" git-name "'"))
-      (shell {:continue true :out :string :err :string}
-             (str "podman exec " container-name
-                  " git config --global user.email '" git-email "'")))))
+      (exec-setup "git" "config" "--global" "user.name"  git-name)
+      (exec-setup "git" "config" "--global" "user.email" git-email))))
 
 (defn start-container []
   (nuke-container)
-  (println "Summoning a more powerful Syl in:" project-dir)
-  (shell (str "podman run -d --name " container-name " "
-              "--memory=2g "
-              "-v " project-dir ":/workspace:rw "
-              "--workdir /workspace "
-              "-it mcr.microsoft.com/devcontainers/base:ubuntu /bin/bash"))
+  (let [home    (System/getProperty "user.home")
+        ssh-dir (str home "/.ssh")]
+    (println "Summoning a more powerful Syl in:" project-dir)
+    (shell (str "podman run -d --name " container-name " "
+                "--memory=2g "
+                "-v " project-dir ":/workspace:rw "
+                (if (.exists (java.io.File. ssh-dir))
+                  (str "-v " ssh-dir ":/root/.ssh:ro ")
+                  "")
+                "--workdir /workspace "
+                "-it mcr.microsoft.com/devcontainers/base:ubuntu /bin/bash")))
   (configure-git-and-ssh))
 
 ;; --- 2. The Execution Bridge ---
