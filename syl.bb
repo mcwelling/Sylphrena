@@ -178,10 +178,42 @@
          :text              (:text text-block)
          :raw-model-content content}))))
 
-;; --- 4. The Main Agent Loop ---
+;; --- 4. Splash Banner ---
+(defn print-banner []
+  (let [r  "\u001b[0m"
+        b  "\u001b[1m"
+        cy "\u001b[96m"
+        ye "\u001b[93m"
+        wh "\u001b[97m"
+        mg "\u001b[95m"]
+    (println (str ye "  ✦ · * · ✦ · * · ✦ · * · ✦ · * · ✦ · * · ✦" r))
+    (println (str cy "  ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋" r))
+    (println)
+    (println (str "      " b wh "Life before death" r "           " cy "≋≋" r))
+    (println (str "      " wh "Strength before weakness" r "    " cy "≋≋" r))
+    (println (str "      " wh "Journey before destination" r "  " cy "≋≋" r))
+    (println)
+    (println (str cy "  ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋" r))
+    (println)
+    (println (str "                 " ye b "✦" r))
+    (println (str "                " wh "/|\\" r))
+    (println (str "               " wh "/ | \\" r))
+    (println (str "  " cy "≋≋≋" r wh "─────────── " ye b "✦" r wh " ───────────" r cy "≋≋≋" r))
+    (println (str "               " wh "\\ | /" r))
+    (println (str "                " wh "\\|/" r))
+    (println (str "                 " ye b "✦" r))
+    (println)
+    (println (str "              " mg b "S  Y  L" r))
+    (println (str "        " wh "The Ancient Daughter" r))
+    (println)
+    (println (str cy "  ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋" r))
+    (println (str ye "  ✦ · * · ✦ · * · ✦ · * · ✦ · * · ✦ · * · ✦" r))
+    (println)))
+
+;; --- 5. The Main Agent Loop ---
 (defn main-loop []
   (start-container)
-  (println "\n--- Syl Harness Ready (Powered by Claude) ---")
+  (print-banner)
 
   (loop [messages []]
     (print "\nYou: ")
