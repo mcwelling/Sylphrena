@@ -307,7 +307,118 @@
     (is (= 1 (count @events)))))
 
 ;; ============================================================
-;; 8. Slash Commands
+;; 8. Workflow Parsing
+;; ============================================================
+
+(deftest test-parse-workflow-basic
+  (let [content "# Ship\nTest and push.\n\n- Run tests: `bb test`\n- Push: `git push`\n"
+        wf (parse-workflow content)]
+    (is (= "Ship" (:name wf)))
+    (is (= "Test and push." (:description wf)))
+    (is (= 2 (count (:steps wf))))
+    (is (= "Run tests" (:label (first (:steps wf)))))
+    (is (= "bb test" (:command (first (:steps wf)))))
+    (is (= "Push" (:label (second (:steps wf)))))
+    (is (= "git push" (:command (second (:steps wf)))))))
+
+(deftest test-parse-workflow-no-heading
+  (let [content "- Step one: `echo hello`\n- Step two: `echo world`\n"
+        wf (parse-workflow content)]
+    (is (= "unnamed" (:name wf)))
+    (is (= 2 (count (:steps wf))))))
+
+(deftest test-parse-workflow-no-steps
+  (let [content "# Empty\nJust a heading, no steps.\n"]
+    (is (nil? (parse-workflow content)))))
+
+(deftest test-parse-workflow-asterisk-bullets
+  (let [content "# Deploy\n* Build: `npm run build`\n* Deploy: `npm run deploy`\n"
+        wf (parse-workflow content)]
+    (is (= 2 (count (:steps wf))))
+    (is (= "npm run build" (:command (first (:steps wf)))))))
+
+(deftest test-list-workflows-empty
+  (let [tmp (str (System/getProperty "java.io.tmpdir") "/syl-test-wf-empty-" (System/currentTimeMillis))
+        _ (.mkdirs (java.io.File. tmp))
+        _ (alter-var-root #'workflow-dir (constantly tmp))]
+    (try
+      (is (empty? (list-workflows)))
+      (finally
+        (.delete (java.io.File. tmp))
+        (alter-var-root #'workflow-dir (constantly (str project-dir "/.syl/workflows")))))))
+
+(deftest test-list-and-load-workflows
+  (let [tmp (str (System/getProperty "java.io.tmpdir") "/syl-test-wf-" (System/currentTimeMillis))
+        _ (.mkdirs (java.io.File. tmp))
+        _ (alter-var-root #'workflow-dir (constantly tmp))]
+    (try
+      (spit (str tmp "/ship.md") "# Ship\nPush code.\n\n- Test: `bb test`\n- Push: `git push`\n")
+      (spit (str tmp "/check.md") "# Check\nRun checks.\n\n- Lint: `bb lint`\n")
+
+      (testing "list-workflows returns sorted entries"
+        (let [wfs (list-workflows)]
+          (is (= 2 (count wfs)))
+          (is (= "check" (:key (first wfs))))
+          (is (= "ship" (:key (second wfs))))))
+
+      (testing "load-workflow parses correctly"
+        (let [wf (load-workflow "ship")]
+          (is (= "Ship" (:name wf)))
+          (is (= 2 (count (:steps wf))))))
+
+      (testing "load-workflow returns nil for missing"
+        (is (nil? (load-workflow "nope"))))
+
+      (finally
+        (doseq [f (.listFiles (java.io.File. tmp))]
+          (.delete f))
+        (.delete (java.io.File. tmp))
+        (alter-var-root #'workflow-dir (constantly (str project-dir "/.syl/workflows")))))))
+
+(deftest test-workflow-write-and-delete
+  (let [tmp (str (System/getProperty "java.io.tmpdir") "/syl-test-wf-write-" (System/currentTimeMillis))
+        _ (alter-var-root #'workflow-dir (constantly tmp))]
+    (try
+      (let [content "# Deploy\nDeploy to prod.\n\n- Build: `npm run build`\n- Deploy: `npm run deploy`\n"]
+
+        (testing "workflow-write creates a new workflow"
+          (let [res (workflow-write "deploy" content)]
+            (is (str/includes? res "created"))
+            (is (str/includes? res "2 steps"))
+            (is (.exists (java.io.File. (str tmp "/deploy.md"))))))
+
+        (testing "workflow-write rejects duplicate name"
+          (let [res (workflow-write "deploy" content)]
+            (is (str/starts-with? res "Error"))
+            (is (str/includes? res "already exists"))))
+
+        (testing "workflow-write rejects invalid format"
+          (let [res (workflow-write "bad" "# Bad\nNo steps here.\n")]
+            (is (str/starts-with? res "Error"))
+            (is (str/includes? res "Invalid workflow format"))))
+
+        (testing "workflow-delete removes an existing workflow"
+          (let [res (workflow-delete "deploy")]
+            (is (str/includes? res "deleted"))
+            (is (not (.exists (java.io.File. (str tmp "/deploy.md")))))))
+
+        (testing "workflow-delete returns error for missing"
+          (let [res (workflow-delete "deploy")]
+            (is (str/starts-with? res "Error"))
+            (is (str/includes? res "not found"))))
+
+        (testing "workflow-write succeeds after delete (no collision)"
+          (let [res (workflow-write "deploy" content)]
+            (is (str/includes? res "created")))))
+
+      (finally
+        (doseq [f (.listFiles (java.io.File. tmp))]
+          (.delete f))
+        (.delete (java.io.File. tmp))
+        (alter-var-root #'workflow-dir (constantly (str project-dir "/.syl/workflows")))))))
+
+;; ============================================================
+;; 9. Slash Commands (including /workflow)
 ;; ============================================================
 
 (deftest test-slash-help
@@ -361,8 +472,23 @@
   (let [result (handle-slash "  /help  " [])]
     (is (= :continue (:action result)))))
 
+(deftest test-slash-workflow-list
+  (let [result (handle-slash "/workflow" [{:role "user" :content "hi"}])]
+    (is (= :continue (:action result)))))
+
+(deftest test-slash-workflow-missing
+  (let [tmp (str (System/getProperty "java.io.tmpdir") "/syl-test-wf-slash-" (System/currentTimeMillis))
+        _ (.mkdirs (java.io.File. tmp))
+        _ (alter-var-root #'workflow-dir (constantly tmp))]
+    (try
+      (let [result (handle-slash "/workflow nonexistent" [])]
+        (is (= :continue (:action result))))
+      (finally
+        (.delete (java.io.File. tmp))
+        (alter-var-root #'workflow-dir (constantly (str project-dir "/.syl/workflows")))))))
+
 ;; ============================================================
-;; 9. Rate Limit Budgeting
+;; 10. Rate Limit Budgeting
 ;; ============================================================
 
 (deftest test-record-usage
@@ -408,7 +534,7 @@
         (reset! recent-api-calls original)))))
 
 ;; ============================================================
-;; 10. System Prompt Construction
+;; 11. System Prompt Construction
 ;; ============================================================
 
 (deftest test-build-system-blocks-structure

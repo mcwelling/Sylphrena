@@ -117,14 +117,16 @@ Environment:
 
 Type these at the `You:` prompt during a session:
 
-| Command   | Description                                              |
-|-----------|----------------------------------------------------------|
-| `/help`   | Show available slash commands                            |
-| `/clear`  | Reset conversation history (container is preserved)      |
-| `/status` | Show session stats: model, tokens used, message count    |
-| `/save`   | Save conversation to `.syl/session.json` for later `--resume` |
-| `/exit`   | Gracefully shut down Syl and remove the container        |
-| `/quit`   | Alias for `/exit`                                        |
+| Command              | Description                                              |
+|----------------------|----------------------------------------------------------|
+| `/help`              | Show available slash commands                            |
+| `/clear`             | Reset conversation history (container is preserved)      |
+| `/status`            | Show session stats: model, tokens used, message count    |
+| `/save`              | Save conversation to `.syl/session.json` for later `--resume` |
+| `/workflow`          | List available workflow pipelines                        |
+| `/workflow <name>`   | Run a named workflow pipeline                            |
+| `/exit`              | Gracefully shut down Syl and remove the container        |
+| `/quit`              | Alias for `/exit`                                        |
 
 ## Configuration
 
@@ -176,13 +178,32 @@ The following values can be set at runtime via CLI flags or are hardcoded inline
 - **Conversation Persistence** — `/save` writes the conversation to `.syl/session.json`. Use `--resume` to pick up where you left off after a crash or restart.
 - **Diff Preview (Transparency Oath)** — Before modifying any file, Syl shows the intended changes using `diff` or `git diff` so you can review before anything is applied.
 
+### 🔄 Workflow Automation
+
+- **Pipeline Definitions** — Define multi-step workflows as markdown files in `.syl/workflows/`. Each step is a list item with a label and a backtick-enclosed bash command.
+- **Sequential Execution** — `/workflow <name>` runs steps one by one inside the container. Each step's command and output are displayed in real-time.
+- **Fail-Fast** — If any step fails, the workflow stops immediately and reports which step failed.
+- **Built-in Workflows** — Syl ships with example workflows: `ship` (test → stage → commit → push) and `check` (test → status → log).
+
+**Example workflow** (`.syl/workflows/ship.md`):
+
+```markdown
+# Ship
+Test, commit, and push changes to remote.
+
+- Run tests: `bb test`
+- Stage all changes: `git add -A`
+- Commit changes: `git commit -m "update"`
+- Push to remote: `git push`
+```
+
 ### 🛠️ Developer Experience
 
 - **Anthropic Claude Integration** — Powered by `claude-sonnet-4-6` (default) via the Anthropic Messages API. Override with `--model` or `SYL_MODEL`.
 - **Prompt Caching** — The system prompt and tools include `cache_control` markers so Anthropic caches them across turns, reducing cost and rate limit pressure.
 - **Rate-Limit Resilience** — Three layers of defense: proactive token-per-minute budgeting, exponential backoff retry on 429/529 errors, and `retry-after` header support.
 - **Git Identity Forwarding** — Your host's `user.name` and `user.email` are applied inside the container so commits are attributed correctly.
-- **Slash Commands** — `/help`, `/clear`, `/status`, `/save`, `/exit`, `/quit` for session control without leaving the REPL.
+- **Slash Commands** — `/help`, `/clear`, `/status`, `/save`, `/workflow`, `/exit`, `/quit` for session control without leaving the REPL.
 - **Graceful Shutdown** — `/exit`, `/quit`, and Ctrl+D trigger clean teardown. A JVM shutdown hook also handles Ctrl+C / SIGINT.
 - **Splash Banner** — A styled ASCII art banner displays the First Ideal and active session config on startup. Suppress with `--no-banner`.
 
@@ -282,10 +303,13 @@ Syl's long-term memory is stored as plain markdown files in `.syl/memory/`:
 ```
 .syl/
 ├── session.json              # Conversation history (ephemeral)
-└── memory/
-    ├── project-stack.md      # e.g. "Babashka + Podman + Claude API"
-    ├── user-preferences.md   # e.g. "Prefers concise responses, uses zsh"
-    └── api-decisions.md      # e.g. "Chose SSE streaming over polling"
+├── memory/
+│   ├── project-stack.md      # e.g. "Babashka + Podman + Claude API"
+│   ├── user-preferences.md   # e.g. "Prefers concise responses, uses zsh"
+│   └── api-decisions.md      # e.g. "Chose SSE streaming over polling"
+└── workflows/
+    ├── ship.md               # Test → stage → commit → push
+    └── check.md              # Test → status → log
 ```
 
 - **`memory_write`** — Syl stores a note by topic key. Overwrites if the key exists.

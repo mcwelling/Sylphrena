@@ -1,0 +1,17 @@
+
+# Babashka / clj-kondo cache
+.clj-kondo/.cache/
+.cpcache/
+
+# Syl session data
+.syl/
+
+# Claude settings
+.claude/
+
+# IDE / Editor artifacts
+.idea/
+.lsp/
+
+# Backup files
+*.bak

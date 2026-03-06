@@ -73,6 +73,7 @@
 (def session-dir      (str project-dir "/.syl"))
 (def session-file     (str session-dir "/session.json"))
 (def memory-dir       (str session-dir "/memory"))
+(def workflow-dir     (str session-dir "/workflows"))
 
 ;; --- Session State ---
 (def session-tokens (atom {:input 0 :output 0 :calls 0}))
@@ -229,7 +230,119 @@
                      (str "## " k "\n" (slurp (str memory-dir "/" fname)))))
                  files)))))))
 
-;; --- 5. Anthropic API & Tool Schema ---
+;; --- 5. Workflows ---
+;; Workflows are markdown files in .syl/workflows/ that define multi-step pipelines.
+;; Format: each step is a markdown list item with a description and a `backtick command`.
+;;
+;; Example (.syl/workflows/ship.md):
+;;   # Ship
+;;   Test, commit, and push changes.
+;;   - Run tests: `bb test`
+;;   - Stage changes: `git add -A`
+;;   - Commit: `git commit -m "update"`
+;;   - Push to remote: `git push`
+
+(defn parse-workflow
+  "Parse a workflow markdown string into {:name, :description, :steps}.
+   Steps are [{:label \"Run tests\" :command \"bb test\"} ...]."
+  [content]
+  (let [lines    (str/split-lines content)
+        name     (some->> lines
+                          (filter #(str/starts-with? (str/trim %) "# "))
+                          first
+                          str/trim
+                          (re-find #"^#\s+(.+)")
+                          second)
+        ;; Description is any non-blank, non-heading, non-step line before the first step
+        step-re  #"^\s*[-*]\s+(.+?):\s*`(.+?)`\s*$"
+        steps    (->> lines
+                      (map #(re-matches step-re %))
+                      (remove nil?)
+                      (mapv (fn [[_ label cmd]]
+                              {:label (str/trim label) :command (str/trim cmd)})))
+        desc     (->> lines
+                      (drop-while #(or (str/blank? %) (str/starts-with? (str/trim %) "#")))
+                      (take-while #(not (re-matches step-re %)))
+                      (remove str/blank?)
+                      (str/join " ")
+                      str/trim)]
+    (when (seq steps)
+      {:name        (or name "unnamed")
+       :description (when-not (str/blank? desc) desc)
+       :steps       steps})))
+
+(defn list-workflows
+  "List all available workflow files. Returns [{:key \"ship\" :file \"ship.md\"} ...]."
+  []
+  (let [dir (java.io.File. workflow-dir)]
+    (when (and (.exists dir) (.isDirectory dir))
+      (->> (.list dir)
+           sort
+           (filter #(str/ends-with? % ".md"))
+           (mapv (fn [fname]
+                   {:key  (str/replace fname #"\.md$" "")
+                    :file fname}))))))
+
+(defn load-workflow
+  "Load and parse a workflow by key name. Returns parsed workflow map or nil."
+  [key]
+  (let [f (java.io.File. (str workflow-dir "/" key ".md"))]
+    (when (.exists f)
+      (parse-workflow (slurp f)))))
+
+(defn run-workflow
+  "Execute a workflow's steps sequentially inside the container.
+   Prints progress and stops on first failure. Returns {:success bool :results [...]}."
+  [workflow]
+  (let [steps  (:steps workflow)
+        total  (count steps)]
+    (println (str "\n[Workflow: " (:name workflow) "] " total " steps"))
+    (when-let [desc (:description workflow)]
+      (println (str "  " desc)))
+    (println)
+    (loop [i      0
+           results []]
+      (if (>= i total)
+        (do (println (str "[Workflow] All " total " steps completed successfully."))
+            {:success true :results results})
+        (let [step    (nth steps i)
+              label   (:label step)
+              cmd     (:command step)]
+          (println (str "  [" (inc i) "/" total "] " label))
+          (println (str "  $ " cmd))
+          (let [output (run-in-container cmd)
+                failed? (str/starts-with? (str output) "Error")]
+            (when-not (str/blank? output)
+              (println (str/trim output)))
+            (println)
+            (if failed?
+              (do (println (str "[Workflow] Step " (inc i) " failed. Stopping."))
+                  {:success false :results (conj results {:step step :output output :failed true})})
+              (recur (inc i) (conj results {:step step :output output})))))))))
+
+(defn workflow-write
+  "Create a new workflow. Refuses to overwrite an existing workflow with the same name."
+  [key content]
+  (.mkdirs (java.io.File. workflow-dir))
+  (let [f (java.io.File. (str workflow-dir "/" key ".md"))]
+    (if (.exists f)
+      (str "Error: Workflow '" key "' already exists. Use workflow_delete first, then create it again.")
+      (let [parsed (parse-workflow content)]
+        (if (nil? parsed)
+          (str "Error: Invalid workflow format. Must have at least one step like: - Label: `command`")
+          (do (spit f content)
+              (str "Workflow '" key "' created with " (count (:steps parsed)) " steps.")))))))
+
+(defn workflow-delete
+  "Delete a workflow by key name."
+  [key]
+  (let [f (java.io.File. (str workflow-dir "/" key ".md"))]
+    (if (.exists f)
+      (do (.delete f)
+          (str "Workflow '" key "' deleted."))
+      (str "Error: Workflow '" key "' not found."))))
+
+;; --- 6. Anthropic API & Tool Schema ---
 (def tools-schema
   [{:name "run_bash"
     :description "Executes a bash command in the isolated project container. Use this to read files, edit code, run tests, or install dependencies."
@@ -250,7 +363,21 @@
     :input_schema {:type "object"
                    :properties {:key {:type "string"
                                       :description "Topic name to read (e.g. 'project-stack'). Omit or leave empty to list all memories."}}
-                   :required []}
+                   :required []}}
+   {:name "workflow_write"
+    :description "Create a new workflow pipeline. Workflows are run with the /workflow slash command. Will refuse to overwrite an existing workflow — delete it first if you need to replace it."
+    :input_schema {:type "object"
+                   :properties {:name    {:type "string"
+                                          :description "Workflow name in kebab-case (e.g. 'ship', 'deploy-staging'). Must be unique."}
+                                :content {:type "string"
+                                          :description "Workflow content in markdown. Format: a `# Title` heading, a description line, then steps as list items like `- Label: `command``. Example:\n# Ship\nTest and push.\n\n- Run tests: `bb test`\n- Push: `git push`"}}
+                   :required ["name" "content"]}}
+   {:name "workflow_delete"
+    :description "Delete an existing workflow pipeline by name."
+    :input_schema {:type "object"
+                   :properties {:name {:type "string"
+                                       :description "The workflow name to delete (e.g. 'ship')."}}
+                   :required ["name"]}
     :cache_control {:type "ephemeral"}}])
 
 (def system-instruction
@@ -267,7 +394,9 @@
        "- **Git** is pre-installed. Use it to track changes and provide context.\n"
        "- Use the `run_bash` tool to execute commands. **Always think before you act.**\n"
        "- Use `memory_write` to remember important things across sessions: project conventions, user preferences, architecture decisions, recurring issues.\n"
-       "- Use `memory_read` to recall what you've previously learned. Your memories are auto-loaded at startup, but you can read specific topics on demand.\n\n"
+       "- Use `memory_read` to recall what you've previously learned. Your memories are auto-loaded at startup, but you can read specific topics on demand.\n"
+       "- **Workflows** are multi-step pipelines that users run with `/workflow <name>`. Use `workflow_write` to create new workflows and `workflow_delete` to remove them. "
+       "Workflow names must be unique — `workflow_write` will reject duplicates. To replace a workflow, delete it first then create it again.\n\n"
 
        "### OPERATIONAL RULES\n"
        "1. **Plan First:** Before writing large blocks of code, explain what you intend to do.\n"
@@ -284,7 +413,7 @@
        "### TECHNICAL SPECS\n"
        "- Packages: use 'sudo apt-get install -y'\n"
        "- Workspace: /workspace\n"
-       "- Tools: You have run_bash, memory_write, and memory_read.\n\n"
+       "- Tools: You have run_bash, memory_write, memory_read, workflow_write, and workflow_delete.\n\n"
 
        "When making function calls using tools that accept array or object parameters ensure those are structured using JSON. For example:\n"
        "Check that all the required parameters for each tool call are provided or can reasonably be inferred from context."))
@@ -578,47 +707,70 @@
 ;; --- 11. Slash Commands ---
 (def slash-help-text
   (str "\n  Available slash commands:\n"
-       "    /help    — Show this message\n"
-       "    /clear   — Reset conversation history (container is preserved)\n"
-       "    /status  — Show session stats (tokens used, message count)\n"
-       "    /save    — Save conversation to disk for later --resume\n"
-       "    /exit    — Gracefully shut down Syl and remove the container\n"
-       "    /quit    — Alias for /exit\n"))
+       "    /help               — Show this message\n"
+       "    /clear              — Reset conversation history (container is preserved)\n"
+       "    /status             — Show session stats (tokens used, message count)\n"
+       "    /save               — Save conversation to disk for later --resume\n"
+       "    /workflow <name>    — Run a workflow pipeline (or list available workflows)\n"
+       "    /exit               — Gracefully shut down Syl and remove the container\n"
+       "    /quit               — Alias for /exit\n"))
 
 (defn handle-slash [input messages]
-  (condp = (str/trim input)
-    "/help"
-    (do (println slash-help-text)
+  (let [trimmed (str/trim input)]
+    (cond
+      (= trimmed "/help")
+      (do (println slash-help-text)
+          {:action :continue :messages messages})
+
+      (= trimmed "/clear")
+      (do (println "\n[Syl] Conversation history cleared. The container lives on.\n")
+          {:action :continue :messages []})
+
+      (= trimmed "/status")
+      (let [{:keys [input output calls]} @session-tokens
+            total (+ input output)]
+        (println (str "\n  Session status:"
+                      "\n    Model:          " model
+                      (when thinking-budget (str "\n    Thinking:       " thinking-budget " token budget"))
+                      "\n    Timeout:        " (/ cmd-timeout-ms 1000) "s"
+                      "\n    API calls:      " calls
+                      "\n    Input tokens:   " input
+                      "\n    Output tokens:  " output
+                      "\n    Total tokens:   " total
+                      "\n    Messages:       " (count messages) "\n"))
         {:action :continue :messages messages})
 
-    "/clear"
-    (do (println "\n[Syl] Conversation history cleared. The container lives on.\n")
-        {:action :continue :messages []})
+      (= trimmed "/save")
+      (do (save-session! messages)
+          {:action :continue :messages messages})
 
-    "/status"
-    (let [{:keys [input output calls]} @session-tokens
-          total (+ input output)]
-      (println (str "\n  Session status:"
-                    "\n    Model:          " model
-                    (when thinking-budget (str "\n    Thinking:       " thinking-budget " token budget"))
-                    "\n    Timeout:        " (/ cmd-timeout-ms 1000) "s"
-                    "\n    API calls:      " calls
-                    "\n    Input tokens:   " input
-                    "\n    Output tokens:  " output
-                    "\n    Total tokens:   " total
-                    "\n    Messages:       " (count messages) "\n"))
-      {:action :continue :messages messages})
-
-    "/save"
-    (do (save-session! messages)
+      (or (= trimmed "/workflow") (str/starts-with? trimmed "/workflow "))
+      (let [wf-name (str/trim (subs trimmed (count "/workflow")))]
+        (if (str/blank? wf-name)
+          ;; List available workflows
+          (let [workflows (list-workflows)]
+            (if (seq workflows)
+              (do (println "\n  Available workflows:")
+                  (doseq [{:keys [key]} workflows]
+                    (let [wf (load-workflow key)]
+                      (println (str "    /workflow " key
+                                    (when (:description wf) (str " — " (:description wf)))))))
+                  (println))
+              (println (str "\n  No workflows found. Create markdown files in " workflow-dir "/"
+                            "\n  See /help for format.\n"))))
+          ;; Run named workflow
+          (if-let [wf (load-workflow wf-name)]
+            (run-workflow wf)
+            (println (str "\n  Workflow '" wf-name "' not found. Use /workflow to list available workflows.\n"))))
         {:action :continue :messages messages})
 
-    "/exit"
-    {:action :exit :messages messages}
+      (= trimmed "/exit")
+      {:action :exit :messages messages}
 
-    "/quit"
-    {:action :exit :messages messages}
-    nil))
+      (= trimmed "/quit")
+      {:action :exit :messages messages}
+
+      :else nil)))
 
 ;; --- 12. Splash Banner ---
 (defn print-banner []
@@ -729,6 +881,19 @@
                                                           (println (str "\n[Memory] "
                                                                         (if (str/blank? k) "All memories" (str "'" k "'"))
                                                                         " (" (count res) " chars)"))
+                                                          res)
+
+                                                        "workflow_write"
+                                                        (let [n (-> tu :input :name)
+                                                              c (-> tu :input :content)
+                                                              res (workflow-write n c)]
+                                                          (println (str "\n[Workflow] " res))
+                                                          res)
+
+                                                        "workflow_delete"
+                                                        (let [n (-> tu :input :name)
+                                                              res (workflow-delete n)]
+                                                          (println (str "\n[Workflow] " res))
                                                           res)
 
                                                         (str "Unknown tool: " tool-name))]
