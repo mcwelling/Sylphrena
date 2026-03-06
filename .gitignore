@@ -1,7 +1,0 @@
-
-# Babashka / clj-kondo cache
-.clj-kondo/.cache/
-.cpcache/
-
-# Claude settings
-.claude/
