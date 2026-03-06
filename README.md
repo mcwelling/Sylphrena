@@ -153,27 +153,38 @@ The following values can be set at runtime via CLI flags or are hardcoded inline
 
 ## Features
 
-- **Streaming Responses** — Text streams word-by-word via SSE as Claude generates it, instead of waiting for the full response. Tool use and text are parsed incrementally from the event stream.
-- **Prompt Caching** — The system prompt and tools include `cache_control` markers, so Anthropic caches them across turns. After the first call, input tokens drop significantly, reducing cost and rate limit pressure.
-- **Proactive Rate Limit Budgeting** — Tracks input tokens per minute and automatically throttles before hitting the API rate limit, instead of waiting for a 429 error.
-- **Extended Thinking** — Enable Claude's extended thinking with `--thinking <budget>`. Thinking text streams in dim terminal text so you can follow the reasoning process in real-time.
-- **Persistent Memory** — Syl can store and retrieve notes across sessions using `memory_write` and `memory_read` tools. Memories are stored as markdown files in `.syl/memory/`, organized by topic. All memories are auto-loaded into the system prompt at startup, so Syl remembers project conventions, user preferences, and past decisions without being asked.
-- **Diff Preview (Transparency Oath)** — Before modifying any file, Syl is instructed to show the intended changes using `diff` or `git diff`, so you can review what will change before it happens.
-- **Conversation Persistence** — `/save` writes the conversation to `.syl/session.json`. Use `--resume` to pick up where you left off after a crash or restart.
-- **Workspace Context Injection** — At startup, Syl auto-injects a directory listing, `git status`, and persistent memories into the system prompt so she knows the project layout without a tool call.
-- **Graceful Shutdown** — `/exit`, `/quit`, and Ctrl+D trigger clean teardown. A JVM shutdown hook also cleans up the container on Ctrl+C / SIGINT.
-- **Anthropic Claude Integration** — Powered by `claude-sonnet-4-6` (default) via the Anthropic Messages API. Override at runtime with `--model` or the `SYL_MODEL` environment variable.
-- **Slash Commands** — `/help`, `/clear`, `/status`, `/save`, `/exit`, `/quit` for session control without leaving the REPL.
-- **Token Usage Tracking** — Every API call's input/output tokens are accumulated. View totals at any time with `/status`.
-- **Container Health Check** — Before each command, Syl verifies the container is running. If it has died, she automatically resummmons and reconfigures it.
-- **Configurable Timeout** — Command execution timeout defaults to 60s but can be set with `--timeout <secs>`.
-- **Splash Banner** — On startup, Syl displays a styled ASCII art banner featuring the First Ideal and a Shardblade glyph, with the active model, timeout, and thinking budget shown. Suppress with `--no-banner`.
-- **Read-Only SSH Mount with Wrapper** — Your host `~/.ssh` is bind-mounted read-only. Keys are copied to `/tmp/.ssh` with corrected ownership and permissions, and a wrapper script ensures all SSH invocations (including `git push/pull`) use the corrected keys.
-- **Git Identity Forwarding** — Your host's `user.name` and `user.email` are applied inside the container.
-- **Parallel Tool Execution** — Claude can issue multiple `run_bash` calls in a single response; Syl executes them all and returns results together.
-- **Rate-Limit Retry with Backoff** — Both the main API call and compaction calls retry on 429/529 responses with exponential backoff and `retry-after` header support.
-- **Tool Output Truncation** — Long command outputs are automatically truncated to `max-tool-output` characters.
+### 🤖 AI & Conversation
+
+- **Streaming Responses** — Text streams word-by-word via SSE as Claude generates it. Tool use and text are parsed incrementally from the event stream.
+- **Extended Thinking** — Enable Claude's extended thinking with `--thinking <budget>`. Thinking streams in dim terminal text so you can follow the reasoning in real-time.
 - **Context Compaction** — When the conversation exceeds `max-history` messages, older messages are summarized by `claude-haiku-4-5` into a concise digest. The most recent `compact-keep` messages are kept verbatim with role-boundary correction.
+- **Token Usage Tracking** — Every API call's input/output tokens are accumulated. View totals at any time with `/status`.
+- **Parallel Tool Execution** — Claude can issue multiple `run_bash` calls in a single response; Syl executes them all and returns results together.
+
+### 🛡️ Safety & Isolation
+
+- **Containerized Execution** — All commands run inside an isolated, memory-limited (2GB) Podman container. Nothing touches your host system directly.
+- **Container Health Check** — Before each command, Syl verifies the container is running. If it has died, she automatically re-summons and reconfigures it.
+- **Read-Only SSH Mount** — Your host `~/.ssh` is bind-mounted read-only. Keys are copied to `/tmp/.ssh` with corrected ownership and permissions, and a wrapper script ensures all SSH invocations (including `git push/pull`) use them correctly.
+- **Tool Output Truncation** — Long command outputs are automatically truncated to `max-tool-output` characters to keep the context window healthy.
+- **Configurable Timeout** — Command execution timeout defaults to 60s but can be set with `--timeout <secs>`.
+
+### 🧠 Memory & Context
+
+- **Persistent Memory** — Syl stores and retrieves notes across sessions using `memory_write` and `memory_read` tools. Memories are markdown files in `.syl/memory/`, organized by topic key.
+- **Auto-Injected Context** — At startup, Syl injects a directory listing, `git status`, and all saved memories into the system prompt — no tool call needed.
+- **Conversation Persistence** — `/save` writes the conversation to `.syl/session.json`. Use `--resume` to pick up where you left off after a crash or restart.
+- **Diff Preview (Transparency Oath)** — Before modifying any file, Syl shows the intended changes using `diff` or `git diff` so you can review before anything is applied.
+
+### 🛠️ Developer Experience
+
+- **Anthropic Claude Integration** — Powered by `claude-sonnet-4-6` (default) via the Anthropic Messages API. Override with `--model` or `SYL_MODEL`.
+- **Prompt Caching** — The system prompt and tools include `cache_control` markers so Anthropic caches them across turns, reducing cost and rate limit pressure.
+- **Rate-Limit Resilience** — Three layers of defense: proactive token-per-minute budgeting, exponential backoff retry on 429/529 errors, and `retry-after` header support.
+- **Git Identity Forwarding** — Your host's `user.name` and `user.email` are applied inside the container so commits are attributed correctly.
+- **Slash Commands** — `/help`, `/clear`, `/status`, `/save`, `/exit`, `/quit` for session control without leaving the REPL.
+- **Graceful Shutdown** — `/exit`, `/quit`, and Ctrl+D trigger clean teardown. A JVM shutdown hook also handles Ctrl+C / SIGINT.
+- **Splash Banner** — A styled ASCII art banner displays the First Ideal and active session config on startup. Suppress with `--no-banner`.
 
 ## Architecture Notes
 
