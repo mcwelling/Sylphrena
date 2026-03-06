@@ -8,8 +8,8 @@
 (import '[java.io BufferedReader InputStreamReader])
 
 ;; --- CLI Argument Parsing ---
-(def cli-args
-  (loop [args (vec *command-line-args*)
+(defn parse-cli-args [args]
+  (loop [args (vec args)
          acc  {}]
     (if (empty? args)
       acc
@@ -22,7 +22,11 @@
         "--help"       (recur (drop 1 args) (assoc acc :help       true))
         (recur (drop 1 args) acc)))))
 
-(when (:help cli-args)
+(def cli-args (parse-cli-args *command-line-args*))
+
+(def ^:dynamic *main-script* (= *file* (System/getProperty "babashka.file")))
+
+(when (and *main-script* (:help cli-args))
   (println "Usage: ./syl.bb [options]")
   (println)
   (println "Options:")
@@ -51,7 +55,7 @@
 (def project-dir    (System/getProperty "user.dir"))
 (def api-key        (System/getenv "ANTHROPIC_API_KEY"))
 
-(when (str/blank? api-key)
+(when (and *main-script* (str/blank? api-key))
   (println "Error: ANTHROPIC_API_KEY environment variable is missing.")
   (System/exit 1))
 
@@ -358,30 +362,42 @@
           (do (record-usage! (:usage body))
               (-> body :content first :text)))))))
 
+(defn find-valid-start
+  "Drop leading messages until we find a plain user message (string content, not tool_result).
+   Returns a vector of messages starting from the first valid user message, or [] if none found."
+  [msgs]
+  (let [msgs (vec msgs)]
+    (loop [ms msgs]
+      (if (empty? ms)
+        []
+        (let [m (first ms)]
+          (if (and (= (:role m) "user") (string? (:content m)))
+            ms
+            (recur (subvec ms 1))))))))
+
+(defn build-compacted-messages
+  "Assemble a compacted message history from a summary string and kept messages.
+   If summary is nil (compaction failed), returns just the kept messages."
+  [summary keep-msgs]
+  (if summary
+    (into [{:role "user"
+            :content (str "[Context summary of earlier conversation]\n" summary)}
+           {:role "assistant"
+            :content [{:type "text"
+                       :text "Understood. I have the context from our earlier conversation and will continue from here."}]}]
+          keep-msgs)
+    keep-msgs))
+
 (defn compact-history [messages]
   (if (<= (count messages) max-history)
     messages
     (let [old-msgs  (vec (drop-last compact-keep messages))
-          keep-msgs (vec (take-last compact-keep messages))
-          ;; Ensure keep-msgs starts on a plain user message (valid API sequence).
-          keep-msgs (loop [msgs keep-msgs]
-                      (if (empty? msgs)
-                        []
-                        (let [m (first msgs)]
-                          (if (and (= (:role m) "user") (string? (:content m)))
-                            msgs
-                            (recur (subvec msgs 1))))))
-          _       (println "\n[Syl] Compacting context..." (count old-msgs) "messages -> summary")
-          summary (summarize-messages old-msgs)]
-      (if summary
-        (into [{:role "user"
-                :content (str "[Context summary of earlier conversation]\n" summary)}
-               {:role "assistant"
-                :content [{:type "text"
-                           :text "Understood. I have the context from our earlier conversation and will continue from here."}]}]
-              keep-msgs)
-        (do (println "[Syl] Compaction failed, falling back to simple trim.")
-            keep-msgs)))))
+          keep-msgs (find-valid-start (take-last compact-keep messages))
+          _         (println "\n[Syl] Compacting context..." (count old-msgs) "messages -> summary")
+          summary   (summarize-messages old-msgs)]
+      (when-not summary
+        (println "[Syl] Compaction failed, falling back to simple trim."))
+      (build-compacted-messages summary keep-msgs))))
 
 ;; --- 8. Streaming SSE Parser ---
 (defn parse-sse-stream [input-stream on-event]
@@ -641,10 +657,11 @@
     (println)))
 
 ;; --- 13. Shutdown Hook ---
-(.addShutdownHook (Runtime/getRuntime)
-  (Thread. (fn []
-    (println "\n[Syl] Cleaning up container...")
-    (nuke-container))))
+(when *main-script*
+  (.addShutdownHook (Runtime/getRuntime)
+    (Thread. (fn []
+      (println "\n[Syl] Cleaning up container...")
+      (nuke-container)))))
 
 ;; --- 14. The Main Agent Loop ---
 (defn main-loop []
@@ -730,5 +747,5 @@
 
             (recur (compact-history final-msgs))))))))
 
-(when (= *file* (System/getProperty "babashka.file"))
+(when *main-script*
   (main-loop))
