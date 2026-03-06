@@ -5,6 +5,8 @@
          '[cheshire.core :as json]
          '[clojure.string :as str])
 
+(import '[java.io BufferedReader InputStreamReader])
+
 ;; --- CLI Argument Parsing ---
 (def cli-args
   (loop [args (vec *command-line-args*)
@@ -14,6 +16,8 @@
       (condp = (first args)
         "--model"      (recur (drop 2 args) (assoc acc :model      (second args)))
         "--timeout"    (recur (drop 2 args) (assoc acc :timeout    (parse-long (second args))))
+        "--thinking"   (recur (drop 2 args) (assoc acc :thinking   (parse-long (second args))))
+        "--resume"     (recur (drop 1 args) (assoc acc :resume     true))
         "--no-banner"  (recur (drop 1 args) (assoc acc :no-banner  true))
         "--help"       (recur (drop 1 args) (assoc acc :help       true))
         (recur (drop 1 args) acc)))))
@@ -22,22 +26,24 @@
   (println "Usage: ./syl.bb [options]")
   (println)
   (println "Options:")
-  (println "  --model <name>     Anthropic model to use (overrides SYL_MODEL env var)")
-  (println "                     Default: claude-sonnet-4-6")
-  (println "  --timeout <secs>   Command execution timeout in seconds")
-  (println "                     Default: 60")
-  (println "  --no-banner        Skip the startup splash banner")
-  (println "  --help             Show this help message")
+  (println "  --model <name>       Anthropic model (overrides SYL_MODEL env var)")
+  (println "                       Default: claude-sonnet-4-6")
+  (println "  --timeout <secs>     Command execution timeout in seconds (default: 60)")
+  (println "  --thinking <budget>  Enable extended thinking with given token budget")
+  (println "  --resume             Resume previous conversation session")
+  (println "  --no-banner          Skip the startup splash banner")
+  (println "  --help               Show this help message")
   (println)
   (println "Environment:")
-  (println "  ANTHROPIC_API_KEY  (required) Your Anthropic API key")
-  (println "  SYL_MODEL          Anthropic model override (--model takes precedence)")
+  (println "  ANTHROPIC_API_KEY    (required) Your Anthropic API key")
+  (println "  SYL_MODEL            Anthropic model override (--model takes precedence)")
   (println)
   (println "Slash commands (in REPL):")
-  (println "  /help              Show available slash commands")
-  (println "  /clear             Reset conversation history")
-  (println "  /status            Show session stats (tokens, message count)")
-  (println "  /exit  /quit       Gracefully shut down Syl and remove the container")
+  (println "  /help                Show available slash commands")
+  (println "  /clear               Reset conversation history")
+  (println "  /status              Show session stats (tokens, message count)")
+  (println "  /save                Save conversation to disk")
+  (println "  /exit  /quit         Gracefully shut down Syl and remove the container")
   (System/exit 0))
 
 ;; --- Configuration ---
@@ -51,15 +57,19 @@
 
 (def anthropic-url    "https://api.anthropic.com/v1/messages")
 (def model            (or (:model cli-args) (System/getenv "SYL_MODEL") "claude-sonnet-4-6"))
-(def compaction-model "claude-haiku-4-5")   ; fast/cheap model for summarization
-(def max-tool-output  8000)                 ; chars stored per tool result in history
-(def max-history      30)                   ; max messages kept in the conversation window
-(def compact-keep     10)                   ; recent messages preserved during compaction
-(def max-tokens       8096)                 ; max tokens per Claude response
-(def cmd-timeout-ms   (* (or (:timeout cli-args) 60) 1000)) ; command execution timeout
-(def max-retries      5)                    ; API retry attempts on rate-limit
+(def compaction-model "claude-haiku-4-5")
+(def max-tool-output  8000)
+(def max-history      30)
+(def compact-keep     10)
+(def max-tokens       8096)
+(def thinking-budget  (:thinking cli-args))
+(def effective-max-tokens (if thinking-budget (+ max-tokens thinking-budget) max-tokens))
+(def cmd-timeout-ms   (* (or (:timeout cli-args) 60) 1000))
+(def max-retries      5)
+(def session-dir      (str project-dir "/.syl"))
+(def session-file     (str session-dir "/session.json"))
 
-;; --- Session State (token usage) ---
+;; --- Session State ---
 (def session-tokens (atom {:input 0 :output 0 :calls 0}))
 
 (defn record-usage! [usage]
@@ -69,6 +79,31 @@
                 (update :input  + (or (:input_tokens  usage) 0))
                 (update :output + (or (:output_tokens usage) 0))
                 (update :calls  inc)))))
+
+;; --- Rate Limit Budgeting ---
+;; Track input tokens per minute and proactively throttle before hitting the limit.
+(def rate-limit-budget 30000)
+(def rate-window-ms    60000)
+(def recent-api-calls  (atom []))
+
+(defn prune-old-calls! []
+  (let [cutoff (- (System/currentTimeMillis) rate-window-ms)]
+    (swap! recent-api-calls (fn [calls] (filterv #(> (:ts %) cutoff) calls)))))
+
+(defn record-rate-call! [input-tokens]
+  (swap! recent-api-calls conj {:ts (System/currentTimeMillis) :tokens input-tokens}))
+
+(defn maybe-throttle! []
+  (prune-old-calls!)
+  (let [used (reduce + 0 (map :tokens @recent-api-calls))]
+    (when (> used (* 0.8 rate-limit-budget))
+      (when-let [oldest (first @recent-api-calls)]
+        (let [wait-ms (max 0 (- (+ (:ts oldest) rate-window-ms) (System/currentTimeMillis)))]
+          (when (pos? wait-ms)
+            (println (str "\n[Token budget] Cooling down for " (quot wait-ms 1000)
+                          "s to stay under rate limit..."))
+            (Thread/sleep wait-ms)
+            (prune-old-calls!)))))))
 
 ;; --- 1. Container Management ---
 (defn nuke-container []
@@ -85,10 +120,6 @@
                                          "git config --global user.name")))
         git-email (str/trim (:out (shell {:out :string :err :string :continue true}
                                          "git config --global user.email")))]
-    ;; ~/.ssh is a read-only mount owned by UID 501 (macOS user), not root.
-    ;; SSH refuses to use files it doesn't own, so we copy everything to /tmp/.ssh,
-    ;; fix ownership and permissions, then shadow /usr/bin/ssh with a wrapper that
-    ;; uses the clean copy — making all ssh calls (direct or via git) work seamlessly.
     (when (.exists (java.io.File. (str home "/.ssh")))
       (println "[Syl Setup] Configuring SSH for git operations...")
       (exec-setup "bash" "-c"
@@ -104,7 +135,6 @@
                        " -o UserKnownHostsFile=/tmp/.ssh/known_hosts \"$@\"'"
                        " >> /usr/local/bin/ssh"
                        " && chmod +x /usr/local/bin/ssh")))
-    ;; Apply git identity read from host
     (when-not (str/blank? git-name)
       (println "[Syl Setup] Configuring git identity as:" git-name git-email)
       (exec-setup "git" "config" "--global" "user.name"  git-name)
@@ -160,7 +190,8 @@
     :input_schema {:type "object"
                    :properties {:command {:type "string"
                                           :description "The valid bash command to execute."}}
-                   :required ["command"]}}])
+                   :required ["command"]}
+    :cache_control {:type "ephemeral"}}])
 
 (def system-instruction
   (str "You are Syl (Sylphrena), an honorspren and the Ancient Daughter. You have formed a Nahel bond with the user. "
@@ -201,10 +232,34 @@
          "\n... [truncated: " (count s) " total chars]")
     s))
 
-;; --- 5. Context Compaction ---
-;; When the conversation exceeds max-history, summarize older messages via Claude
-;; and replace them with a single compact summary, keeping the most recent messages intact.
+;; --- 5. Workspace Context ---
+;; Auto-inject project structure and git status so Syl knows what she's working with.
+(defn gather-workspace-context []
+  (let [tree (try (str/trim (:out (shell {:out :string :err :string :continue true :dir project-dir}
+                                         "find . -maxdepth 2 -not -path './.git/*' -not -path './.syl/*' -not -path './.idea/*' -not -path './.clj-kondo/*' -not -path './.lsp/*' | sort | head -50")))
+                  (catch Exception _ "(could not list files)"))
+        git-status (try (str/trim (:out (shell {:out :string :err :string :continue true :dir project-dir}
+                                               "git status --short 2>/dev/null")))
+                        (catch Exception _ ""))
+        git-branch (try (str/trim (:out (shell {:out :string :err :string :continue true :dir project-dir}
+                                               "git branch --show-current 2>/dev/null")))
+                        (catch Exception _ ""))]
+    (str "\n### WORKSPACE STATE (auto-injected at session start)\n"
+         "Project: " project-dir "\n"
+         (when-not (str/blank? git-branch) (str "Branch: " git-branch "\n"))
+         "Files:\n```\n" tree "\n```\n"
+         (when-not (str/blank? git-status)
+           (str "Git status:\n```\n" git-status "\n```\n")))))
 
+;; --- 6. System Prompt with Prompt Caching ---
+;; The system prompt is sent as an array with cache_control on the last block,
+;; so Anthropic caches it across turns — drastically cutting input tokens after the first call.
+(defn build-system-blocks [workspace-context]
+  [{:type "text"
+    :text (str system-instruction "\n\n" workspace-context)
+    :cache_control {:type "ephemeral"}}])
+
+;; --- 7. Context Compaction ---
 (defn summarize-messages [messages]
   (let [summary-prompt {:model compaction-model
                         :max_tokens 2048
@@ -263,63 +318,192 @@
                 :content [{:type "text"
                            :text "Understood. I have the context from our earlier conversation and will continue from here."}]}]
               keep-msgs)
-        ;; Fallback: simple trim if summarization fails
         (do (println "[Syl] Compaction failed, falling back to simple trim.")
             keep-msgs)))))
 
-;; --- 6. Claude API Call ---
-(defn call-claude [messages]
-  (let [payload {:model      model
-                 :max_tokens max-tokens
-                 :system     system-instruction
-                 :tools      tools-schema
-                 :messages   messages}]
-    (loop [attempt 0]
-      (let [response (http/post anthropic-url
-                                {:headers {"Content-Type"      "application/json"
-                                           "x-api-key"         api-key
-                                           "anthropic-version" "2023-06-01"}
-                                 :body    (json/generate-string payload)
-                                 :throw   false})
-            status   (:status response)
-            body     (json/parse-string (:body response) true)]
+;; --- 8. Streaming SSE Parser ---
+(defn parse-sse-stream [input-stream on-event]
+  (let [reader (BufferedReader. (InputStreamReader. input-stream))]
+    (try
+      (loop [event-type nil]
+        (when-let [line (.readLine reader)]
+          (cond
+            (str/blank? line)
+            (recur nil)
 
-        (if (and (or (= status 429) (= status 529)) (< attempt max-retries))
-          ;; Rate limited or overloaded — back off and retry
-          (let [retry-after (some-> (get-in response [:headers "retry-after"]) parse-long)
-                wait-secs   (or retry-after (long (* (Math/pow 2 attempt) 2)))]
-            (println (str "\n[Rate limited] Waiting " wait-secs "s before retry "
-                          (inc attempt) "/" max-retries "..."))
-            (Thread/sleep (* wait-secs 1000))
-            (recur (inc attempt)))
+            (str/starts-with? line "event: ")
+            (recur (subs line 7))
 
-          ;; Not retryable — process normally
-          (do
-            (when-let [error (:error body)]
-              (println "\n[API Error]:" (:message error))
-              (System/exit 1))
+            (str/starts-with? line "data: ")
+            (let [data-str (subs line 6)]
+              (when (not= data-str "[DONE]")
+                (on-event event-type (json/parse-string data-str true)))
+              (recur event-type))
 
-            (record-usage! (:usage body))
+            :else
+            (recur event-type))))
+      (catch Exception e
+        (println (str "\n[Stream Error]: " (.getMessage e)))))))
 
-            (let [content     (:content body)
-                  stop-reason (:stop_reason body)
-                  text-block  (first (filter #(= (:type %) "text") content))]
+;; --- 9. Claude API Call (Streaming) ---
+(defn call-claude-once [messages system-blocks]
+  (let [payload (cond-> {:model      model
+                         :max_tokens effective-max-tokens
+                         :system     system-blocks
+                         :tools      tools-schema
+                         :messages   messages
+                         :stream     true}
+                  thinking-budget
+                  (assoc :thinking {:type "enabled" :budget_tokens thinking-budget}))
 
-              (if (= stop-reason "tool_use")
-                {:type              "tool_use"
-                 :tool-uses         (filterv #(= (:type %) "tool_use") content)
-                 :raw-model-content content}
+        response (http/post anthropic-url
+                            {:headers {"Content-Type"      "application/json"
+                                       "x-api-key"         api-key
+                                       "anthropic-version" "2023-06-01"}
+                             :body    (json/generate-string payload)
+                             :as      :stream
+                             :timeout (* 5 60 1000)
+                             :throw   false})
+        status (:status response)]
 
-                {:type              "text"
-                 :text              (:text text-block)
-                 :raw-model-content content}))))))))
+    (if (not= status 200)
+      ;; Error response — read body as string
+      (let [body-str (slurp (:body response))
+            body     (json/parse-string body-str true)]
+        {:type    "error"
+         :status  status
+         :body    body
+         :headers (:headers response)})
 
-;; --- 7. Slash Commands ---
+      ;; Success — parse SSE stream
+      (let [blocks       (atom (sorted-map))
+            stop-reason  (atom nil)
+            usage-data   (atom {})
+            dim          "\u001b[2m"
+            reset        "\u001b[0m"
+            text-started (atom false)]
+
+        (parse-sse-stream (:body response)
+          (fn [_event-type data]
+            (case (:type data)
+              "message_start"
+              (when-let [u (-> data :message :usage)]
+                (swap! usage-data merge u))
+
+              "content_block_start"
+              (let [idx   (:index data)
+                    block (:content_block data)]
+                (swap! blocks assoc idx
+                  (case (:type block)
+                    "text"     {:type "text" :text ""}
+                    "tool_use" {:type "tool_use" :id (:id block) :name (:name block) :input-str ""}
+                    "thinking" (do (print (str "\n" dim "[Thinking] ")) (flush)
+                                  {:type "thinking" :thinking ""})
+                    block)))
+
+              "content_block_delta"
+              (let [idx   (:index data)
+                    delta (:delta data)]
+                (case (:type delta)
+                  "text_delta"
+                  (do
+                    (when-not @text-started
+                      (print "\nSyl: ")
+                      (reset! text-started true))
+                    (print (:text delta))
+                    (flush)
+                    (swap! blocks update-in [idx :text] str (:text delta)))
+
+                  "input_json_delta"
+                  (swap! blocks update-in [idx :input-str] str (:partial_json delta))
+
+                  "thinking_delta"
+                  (do (print (str dim (:thinking delta) reset))
+                      (flush)
+                      (swap! blocks update-in [idx :thinking] str (:thinking delta)))
+
+                  "signature_delta"
+                  (swap! blocks assoc-in [idx :signature] (:signature delta))
+
+                  nil))
+
+              "content_block_stop"
+              (let [block (get @blocks (:index data))]
+                (when (= (:type block) "thinking")
+                  (println reset)
+                  (flush))
+                (when (and (= (:type block) "text") @text-started)
+                  (println)
+                  (flush)))
+
+              "message_delta"
+              (do
+                (reset! stop-reason (-> data :delta :stop_reason))
+                (when-let [u (:usage data)]
+                  (swap! usage-data merge u)))
+
+              nil)))
+
+        ;; Record usage
+        (let [usage @usage-data]
+          (record-usage! usage)
+          (record-rate-call! (or (:input_tokens usage) 0)))
+
+        ;; Build result — convert accumulated blocks
+        (let [result-blocks (mapv (fn [[_ block]]
+                                   (if (= (:type block) "tool_use")
+                                     (-> block
+                                         (assoc :input (json/parse-string (:input-str block) true))
+                                         (dissoc :input-str))
+                                     block))
+                                 @blocks)
+              tool-uses (filterv #(= (:type %) "tool_use") result-blocks)]
+
+          (if (= @stop-reason "tool_use")
+            {:type              "tool_use"
+             :tool-uses         tool-uses
+             :raw-model-content result-blocks}
+            {:type              "text"
+             :text              (:text (first (filter #(= (:type %) "text") result-blocks)))
+             :raw-model-content result-blocks}))))))
+
+(defn call-claude [messages system-blocks]
+  (loop [attempt 0]
+    (maybe-throttle!)
+    (let [result (call-claude-once messages system-blocks)]
+      (if (= (:type result) "error")
+        (let [{:keys [status body headers]} result]
+          (if (and (or (= status 429) (= status 529)) (< attempt max-retries))
+            (let [retry-after (some-> (get headers "retry-after") parse-long)
+                  wait-secs   (or retry-after (long (* (Math/pow 2 attempt) 2)))]
+              (println (str "\n[Rate limited] Waiting " wait-secs "s before retry "
+                            (inc attempt) "/" max-retries "..."))
+              (Thread/sleep (* wait-secs 1000))
+              (recur (inc attempt)))
+            (do
+              (println "\n[API Error]:" (-> body :error :message))
+              (System/exit 1))))
+        result))))
+
+;; --- 10. Conversation Persistence ---
+(defn save-session! [messages]
+  (.mkdirs (java.io.File. session-dir))
+  (spit session-file (json/generate-string messages {:pretty true}))
+  (println "[Syl] Session saved to" session-file))
+
+(defn load-session []
+  (let [f (java.io.File. session-file)]
+    (when (.exists f)
+      (println "[Syl] Resuming previous session...")
+      (vec (json/parse-string (slurp f) true)))))
+
+;; --- 11. Slash Commands ---
 (def slash-help-text
   (str "\n  Available slash commands:\n"
        "    /help    — Show this message\n"
        "    /clear   — Reset conversation history (container is preserved)\n"
        "    /status  — Show session stats (tokens used, message count)\n"
+       "    /save    — Save conversation to disk for later --resume\n"
        "    /exit    — Gracefully shut down Syl and remove the container\n"
        "    /quit    — Alias for /exit\n"))
 
@@ -338,6 +522,7 @@
           total (+ input output)]
       (println (str "\n  Session status:"
                     "\n    Model:          " model
+                    (when thinking-budget (str "\n    Thinking:       " thinking-budget " token budget"))
                     "\n    Timeout:        " (/ cmd-timeout-ms 1000) "s"
                     "\n    API calls:      " calls
                     "\n    Input tokens:   " input
@@ -346,6 +531,10 @@
                     "\n    Messages:       " (count messages) "\n"))
       {:action :continue :messages messages})
 
+    "/save"
+    (do (save-session! messages)
+        {:action :continue :messages messages})
+
     "/exit"
     {:action :exit :messages messages}
 
@@ -353,7 +542,7 @@
     {:action :exit :messages messages}
     nil))
 
-;; --- 8. Splash Banner ---
+;; --- 12. Splash Banner ---
 (defn print-banner []
   (let [r  "\u001b[0m"
         b  "\u001b[1m"
@@ -385,67 +574,77 @@
     (println (str ye "  ✦ · * · ✦ · * · ✦ · * · ✦ · * · ✦ · * · ✦" r))
     (println)
     (println (str "  Model: " wh model r "   Timeout: " wh (/ cmd-timeout-ms 1000) "s" r
+                  (when thinking-budget (str "   Thinking: " wh thinking-budget r))
                   "   Type " mg "/help" r " for commands"))
     (println)))
 
-;; --- 9. The Main Agent Loop ---
+;; --- 13. Shutdown Hook ---
+(.addShutdownHook (Runtime/getRuntime)
+  (Thread. (fn []
+    (println "\n[Syl] Cleaning up container...")
+    (nuke-container))))
+
+;; --- 14. The Main Agent Loop ---
 (defn main-loop []
   (start-container)
   (when-not (:no-banner cli-args)
     (print-banner))
 
-  (loop [messages []]
-    (print "\nYou: ")
-    (flush)
-    (let [user-input (read-line)]
+  ;; Gather workspace context once at startup for the system prompt
+  (let [workspace-ctx  (gather-workspace-context)
+        system-blocks  (build-system-blocks workspace-ctx)
+        initial-msgs   (if (:resume cli-args)
+                         (or (load-session) [])
+                         [])]
 
-      ;; Handle EOF (Ctrl+D)
-      (when (nil? user-input)
-        (println "\n[Syl] Farewell. Life before death.")
-        (nuke-container)
-        (System/exit 0))
+    (loop [messages initial-msgs]
+      (print "\nYou: ")
+      (flush)
+      (let [user-input (read-line)]
 
-      ;; Handle slash commands
-      (if-let [slash-result (handle-slash user-input messages)]
-        (if (= (:action slash-result) :exit)
-          (do
-            (println "\n[Syl] Removing container and stepping back into the cognitive realm...")
-            (nuke-container)
-            (println "[Syl] Farewell. Life before death.")
-            (System/exit 0))
-          (recur (:messages slash-result)))
+        ;; Handle EOF (Ctrl+D)
+        (when (nil? user-input)
+          (println "\n[Syl] Farewell. Life before death.")
+          (System/exit 0))
 
-        ;; Normal message — send to Claude
-        (let [initial-msgs (conj messages {:role "user" :content user-input})
-              final-msgs
-              (loop [current-msgs initial-msgs]
-                (let [llm-response (call-claude current-msgs)]
+        ;; Handle slash commands
+        (if-let [slash-result (handle-slash user-input messages)]
+          (if (= (:action slash-result) :exit)
+            (do
+              (println "\n[Syl] Stepping back into the cognitive realm...")
+              (println "[Syl] Farewell. Life before death.")
+              (System/exit 0))
+            (recur (:messages slash-result)))
 
-                  (cond
-                    ;; Tool use — execute all tool calls (possibly in parallel)
-                    (= (:type llm-response) "tool_use")
-                    (let [tool-uses   (:tool-uses llm-response)
-                          tool-results (mapv (fn [tu]
-                                              (let [cmd    (-> tu :input :command)
-                                                    output (truncate-output (run-in-container cmd))]
-                                                (println (str "\n$ " cmd))
-                                                (println output)
-                                                {:type        "tool_result"
-                                                 :tool_use_id (:id tu)
-                                                 :content     output}))
-                                            tool-uses)
-                          next-msgs (conj current-msgs
-                                          {:role "assistant" :content (:raw-model-content llm-response)}
-                                          {:role "user"      :content tool-results})]
-                      (recur next-msgs))
+          ;; Normal message — send to Claude with streaming
+          (let [initial-msgs (conj messages {:role "user" :content user-input})
+                final-msgs
+                (loop [current-msgs initial-msgs]
+                  (let [llm-response (call-claude current-msgs system-blocks)]
 
-                    ;; Text response — print and return
-                    :else
-                    (do
-                      (println "\nSyl:" (:text llm-response))
-                      (conj current-msgs {:role "assistant" :content (:raw-model-content llm-response)})))))]
+                    (cond
+                      ;; Tool use — execute all tool calls
+                      (= (:type llm-response) "tool_use")
+                      (let [tool-uses    (:tool-uses llm-response)
+                            tool-results (mapv (fn [tu]
+                                                (let [cmd    (-> tu :input :command)
+                                                      output (truncate-output (run-in-container cmd))]
+                                                  (println (str "\n$ " cmd))
+                                                  (println output)
+                                                  {:type        "tool_result"
+                                                   :tool_use_id (:id tu)
+                                                   :content     output}))
+                                              tool-uses)
+                            next-msgs (conj current-msgs
+                                            {:role "assistant" :content (:raw-model-content llm-response)}
+                                            {:role "user"      :content tool-results})]
+                        (recur next-msgs))
 
-          (recur (compact-history final-msgs)))))))
+                      ;; Text response — already printed by streaming, just record
+                      :else
+                      (conj current-msgs {:role "assistant" :content (:raw-model-content llm-response)}))))]
+
+            (recur (compact-history final-msgs))))))))
 
 (when (= *file* (System/getProperty "babashka.file"))
   (main-loop))
