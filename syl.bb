@@ -18,6 +18,7 @@
 (def model "claude-opus-4-6")
 (def max-tool-output 8000) ; chars of tool output stored per result in history
 (def max-history 30)       ; max messages kept in the conversation window
+(def compact-keep 10)      ; recent messages to preserve during compaction
 
 ;; --- 1. Container Management ---
 (defn nuke-container []
@@ -134,17 +135,57 @@
          "\n... [truncated: " (count s) " total chars]")
     s))
 
-;; Trim the message history to a sliding window, always starting on a plain user message.
-(defn trim-history [messages]
+;; --- Context Compaction ---
+;; When the conversation exceeds max-history, summarize older messages via Claude
+;; and replace them with a single compact summary, keeping the most recent messages intact.
+
+(defn summarize-messages [messages]
+  (let [summary-prompt {:model model
+                        :max_tokens 2048
+                        :system (str "You are a conversation summarizer. Produce a concise summary of the "
+                                     "conversation below, preserving: key decisions made, files created or "
+                                     "modified, commands run and their outcomes, any unresolved issues or "
+                                     "errors, and the current state of the task. Be factual and terse.")
+                        :messages [{:role "user"
+                                    :content (str "Summarize this conversation:\n\n"
+                                                  (json/generate-string messages))}]}
+        response (http/post anthropic-url
+                            {:headers {"Content-Type"      "application/json"
+                                       "x-api-key"         api-key
+                                       "anthropic-version" "2023-06-01"}
+                             :body (json/generate-string summary-prompt)
+                             :throw false})
+        body (json/parse-string (:body response) true)]
+    (if-let [error (:error body)]
+      (do (println "\n[Compaction Error]:" (:message error))
+          nil)
+      (-> body :content first :text))))
+
+(defn compact-history [messages]
   (if (<= (count messages) max-history)
     messages
-    (loop [msgs (vec (take-last max-history messages))]
-      (if (empty? msgs)
-        messages
-        (let [m (first msgs)]
-          (if (and (= (:role m) "user") (string? (:content m)))
-            msgs
-            (recur (subvec msgs 1))))))))
+    (let [old-msgs  (vec (drop-last compact-keep messages))
+          keep-msgs (vec (take-last compact-keep messages))
+          ;; Ensure keep-msgs starts on a plain user message (valid API sequence)
+          keep-msgs (loop [msgs keep-msgs]
+                      (if (empty? msgs)
+                        keep-msgs
+                        (let [m (first msgs)]
+                          (if (and (= (:role m) "user") (string? (:content m)))
+                            msgs
+                            (recur (subvec msgs 1))))))
+          _       (println "\n[Syl] Compacting context..." (count old-msgs) "messages -> summary")
+          summary (summarize-messages old-msgs)]
+      (if summary
+        (into [{:role "user"
+                :content (str "[Context summary of earlier conversation]\n" summary)}
+               {:role "assistant"
+                :content [{:type "text"
+                           :text "Understood. I have the context from our earlier conversation and will continue from here."}]}]
+              keep-msgs)
+        ;; Fallback: simple trim if summarization fails
+        (do (println "[Syl] Compaction failed, falling back to simple trim.")
+            keep-msgs)))))
 
 (defn call-claude [messages]
   (let [payload {:model model
@@ -248,7 +289,7 @@
                     (println "\nSyl:" (:text llm-response))
                     (conj current-msgs {:role "assistant" :content (:raw-model-content llm-response)})))))]
 
-        (recur (trim-history final-msgs)))))
+        (recur (compact-history final-msgs)))))
 
 (when (= *file* (System/getProperty "babashka.file"))
   (main-loop))
