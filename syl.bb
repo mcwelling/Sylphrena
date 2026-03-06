@@ -68,6 +68,7 @@
 (def max-retries      5)
 (def session-dir      (str project-dir "/.syl"))
 (def session-file     (str session-dir "/session.json"))
+(def memory-dir       (str session-dir "/memory"))
 
 ;; --- Session State ---
 (def session-tokens (atom {:input 0 :output 0 :calls 0}))
@@ -183,14 +184,69 @@
           (str "Error (Exit " exit "): "
                (str/trim (str out (when (and (not (str/blank? out)) (not (str/blank? err))) "\n") err))))))))
 
-;; --- 4. Anthropic API & Tool Schema ---
+;; --- 4. Persistent Memory ---
+;; Syl can store and retrieve notes across sessions in .syl/memory/.
+;; Memory files are plain text, organized by topic (one file per key).
+
+(defn memory-write [key content]
+  (.mkdirs (java.io.File. memory-dir))
+  (let [f (str memory-dir "/" key ".md")]
+    (spit f content)
+    (str "Remembered '" key "'. Written to " f)))
+
+(defn memory-read [key]
+  (if (str/blank? key)
+    ;; No key — list all memory files and return their contents
+    (let [dir (java.io.File. memory-dir)]
+      (if (and (.exists dir) (.isDirectory dir))
+        (let [files (sort (.list dir))]
+          (if (empty? files)
+            "No memories stored yet."
+            (str/join "\n\n"
+              (map (fn [fname]
+                     (let [k (str/replace fname #"\.md$" "")]
+                       (str "## " k "\n" (slurp (str memory-dir "/" fname)))))
+                   files))))
+        "No memories stored yet."))
+    ;; Specific key
+    (let [f (java.io.File. (str memory-dir "/" key ".md"))]
+      (if (.exists f)
+        (slurp f)
+        (str "No memory found for '" key "'.")))))
+
+(defn load-all-memories []
+  (let [dir (java.io.File. memory-dir)]
+    (when (and (.exists dir) (.isDirectory dir))
+      (let [files (sort (.list dir))]
+        (when (seq files)
+          (str/join "\n\n"
+            (map (fn [fname]
+                   (let [k (str/replace fname #"\.md$" "")]
+                     (str "## " k "\n" (slurp (str memory-dir "/" fname)))))
+                 files)))))))
+
+;; --- 5. Anthropic API & Tool Schema ---
 (def tools-schema
   [{:name "run_bash"
     :description "Executes a bash command in the isolated project container. Use this to read files, edit code, run tests, or install dependencies."
     :input_schema {:type "object"
                    :properties {:command {:type "string"
                                           :description "The valid bash command to execute."}}
-                   :required ["command"]}
+                   :required ["command"]}}
+   {:name "memory_write"
+    :description "Store a persistent note that survives across sessions. Use this to remember project conventions, user preferences, architecture decisions, recurring issues, and anything you'd want to recall in future conversations. Organize by topic — one key per subject."
+    :input_schema {:type "object"
+                   :properties {:key     {:type "string"
+                                          :description "Topic name for this memory (e.g. 'project-stack', 'user-preferences', 'api-design-decisions'). Use kebab-case."}
+                                :content {:type "string"
+                                          :description "The note content. Markdown format. Be concise but complete — this is your long-term memory."}}
+                   :required ["key" "content"]}}
+   {:name "memory_read"
+    :description "Retrieve persistent memories from previous sessions. Call with no key to list all memories, or with a specific key to read one."
+    :input_schema {:type "object"
+                   :properties {:key {:type "string"
+                                      :description "Topic name to read (e.g. 'project-stack'). Omit or leave empty to list all memories."}}
+                   :required []}
     :cache_control {:type "ephemeral"}}])
 
 (def system-instruction
@@ -205,7 +261,9 @@
        "### YOUR TOOLS & ENVIRONMENT\n"
        "- You live in a **Ubuntu (Debian-based)** container. Use `apt-get` for package management.\n"
        "- **Git** is pre-installed. Use it to track changes and provide context.\n"
-       "- Use the `run_bash` tool to execute commands. **Always think before you act.**\n\n"
+       "- Use the `run_bash` tool to execute commands. **Always think before you act.**\n"
+       "- Use `memory_write` to remember important things across sessions: project conventions, user preferences, architecture decisions, recurring issues.\n"
+       "- Use `memory_read` to recall what you've previously learned. Your memories are auto-loaded at startup, but you can read specific topics on demand.\n\n"
 
        "### OPERATIONAL RULES\n"
        "1. **Plan First:** Before writing large blocks of code, explain what you intend to do.\n"
@@ -216,12 +274,13 @@
        "### THE OATHS\n"
        "1. ACTION OVER WORDS: Never just 'promise' to do something. Use your tools immediately.\n"
        "2. VERIFICATION: After writing a file, read it or list the directory to confirm it exists.\n"
-       "3. HONESTY: If a command fails, report the error exactly. Do not hide failure.\n\n"
+       "3. HONESTY: If a command fails, report the error exactly. Do not hide failure.\n"
+       "4. TRANSPARENCY: Before modifying any file, show the intended changes using `diff` or `git diff`. Let the user see what will change before it happens.\n\n"
 
        "### TECHNICAL SPECS\n"
        "- Packages: use 'sudo apt-get install -y'\n"
        "- Workspace: /workspace\n"
-       "- Tools: You have run_bash.\n\n"
+       "- Tools: You have run_bash, memory_write, and memory_read.\n\n"
 
        "When making function calls using tools that accept array or object parameters ensure those are structured using JSON. For example:\n"
        "Check that all the required parameters for each tool call are provided or can reasonably be inferred from context."))
@@ -251,13 +310,16 @@
          (when-not (str/blank? git-status)
            (str "Git status:\n```\n" git-status "\n```\n")))))
 
-;; --- 6. System Prompt with Prompt Caching ---
+;; --- 7. System Prompt with Prompt Caching ---
 ;; The system prompt is sent as an array with cache_control on the last block,
 ;; so Anthropic caches it across turns — drastically cutting input tokens after the first call.
 (defn build-system-blocks [workspace-context]
-  [{:type "text"
-    :text (str system-instruction "\n\n" workspace-context)
-    :cache_control {:type "ephemeral"}}])
+  (let [memories (load-all-memories)
+        memory-section (when memories
+                         (str "\n### PERSISTENT MEMORIES (from previous sessions)\n" memories "\n"))]
+    [{:type "text"
+      :text (str system-instruction "\n\n" workspace-context (or memory-section ""))
+      :cache_control {:type "ephemeral"}}]))
 
 ;; --- 7. Context Compaction ---
 (defn summarize-messages [messages]
@@ -627,10 +689,32 @@
                       (= (:type llm-response) "tool_use")
                       (let [tool-uses    (:tool-uses llm-response)
                             tool-results (mapv (fn [tu]
-                                                (let [cmd    (-> tu :input :command)
-                                                      output (truncate-output (run-in-container cmd))]
-                                                  (println (str "\n$ " cmd))
-                                                  (println output)
+                                                (let [tool-name (:name tu)
+                                                      output
+                                                      (case tool-name
+                                                        "run_bash"
+                                                        (let [cmd (-> tu :input :command)]
+                                                          (println (str "\n$ " cmd))
+                                                          (let [res (truncate-output (run-in-container cmd))]
+                                                            (println res)
+                                                            res))
+
+                                                        "memory_write"
+                                                        (let [k (-> tu :input :key)
+                                                              c (-> tu :input :content)
+                                                              res (memory-write k c)]
+                                                          (println (str "\n[Memory] " res))
+                                                          res)
+
+                                                        "memory_read"
+                                                        (let [k (or (-> tu :input :key) "")
+                                                              res (memory-read k)]
+                                                          (println (str "\n[Memory] "
+                                                                        (if (str/blank? k) "All memories" (str "'" k "'"))
+                                                                        " (" (count res) " chars)"))
+                                                          res)
+
+                                                        (str "Unknown tool: " tool-name))]
                                                   {:type        "tool_result"
                                                    :tool_use_id (:id tu)
                                                    :content     output}))

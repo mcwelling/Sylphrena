@@ -26,9 +26,9 @@ Syl is a lightweight AI agent harness written in [Babashka](https://babashka.org
 1. **Container Management** — Syl spins up (or replaces) a Podman container with your project directory mounted at `/workspace`.
 2. **SSH Forwarding** — On startup, Syl bind-mounts your host's `~/.ssh` directory read-only into the container, copies the keys to a clean location (`/tmp/.ssh`) with correct ownership and permissions, and installs an SSH wrapper script so that all SSH calls (including those from git) work seamlessly — even when the host UID differs from the container's root user.
 3. **Git Identity** — Your host's `git config` identity (`user.name`, `user.email`) is read and applied inside the container, so commits are attributed correctly.
-4. **Workspace Context** — At startup, Syl auto-injects a directory listing and `git status` into the system prompt, so she knows the project structure without burning a tool call.
+4. **Workspace Context & Memory** — At startup, Syl auto-injects a directory listing, `git status`, and any persistent memories from previous sessions into the system prompt, so she knows the project and your preferences without burning a tool call.
 5. **Conversation Loop** — You chat with Syl in a terminal REPL. Responses stream in real-time via Server-Sent Events (SSE).
-6. **Tool Execution** — When Claude decides to run commands, Syl executes them inside the sandboxed container and feeds results back into the conversation. Parallel tool calls are supported.
+6. **Tool Execution** — When Claude decides to run commands, Syl executes them inside the sandboxed container and feeds results back into the conversation. Parallel tool calls are supported. In addition to `run_bash`, Syl has `memory_write` and `memory_read` tools for persistent cross-session memory.
 7. **Context Compaction** — When the conversation grows beyond `max-history` messages, Syl asks Claude (via a fast `claude-haiku-4-5` model) to summarize older messages into a compact digest. The most recent `compact-keep` messages are kept verbatim. A role-boundary correction ensures the kept messages always start on a plain `user` message. If summarization fails, a simple trim fallback ensures the conversation continues gracefully.
 8. **Container Health Check** — Before every command execution, Syl checks that the container is still alive. If it has died (OOM, manual removal, etc.), she automatically resummmons and reconfigures it before proceeding.
 9. **Safety** — Your code runs in an isolated, memory-limited (2GB) container. Nothing touches your host system directly. SSH keys are mounted read-only for extra protection.
@@ -157,8 +157,10 @@ The following values can be set at runtime via CLI flags or are hardcoded inline
 - **Prompt Caching** — The system prompt and tools include `cache_control` markers, so Anthropic caches them across turns. After the first call, input tokens drop significantly, reducing cost and rate limit pressure.
 - **Proactive Rate Limit Budgeting** — Tracks input tokens per minute and automatically throttles before hitting the API rate limit, instead of waiting for a 429 error.
 - **Extended Thinking** — Enable Claude's extended thinking with `--thinking <budget>`. Thinking text streams in dim terminal text so you can follow the reasoning process in real-time.
+- **Persistent Memory** — Syl can store and retrieve notes across sessions using `memory_write` and `memory_read` tools. Memories are stored as markdown files in `.syl/memory/`, organized by topic. All memories are auto-loaded into the system prompt at startup, so Syl remembers project conventions, user preferences, and past decisions without being asked.
+- **Diff Preview (Transparency Oath)** — Before modifying any file, Syl is instructed to show the intended changes using `diff` or `git diff`, so you can review what will change before it happens.
 - **Conversation Persistence** — `/save` writes the conversation to `.syl/session.json`. Use `--resume` to pick up where you left off after a crash or restart.
-- **Workspace Context Injection** — At startup, Syl auto-injects a directory listing and `git status` into the system prompt so she knows the project layout without a tool call.
+- **Workspace Context Injection** — At startup, Syl auto-injects a directory listing, `git status`, and persistent memories into the system prompt so she knows the project layout without a tool call.
 - **Graceful Shutdown** — `/exit`, `/quit`, and Ctrl+D trigger clean teardown. A JVM shutdown hook also cleans up the container on Ctrl+C / SIGINT.
 - **Anthropic Claude Integration** — Powered by `claude-sonnet-4-6` (default) via the Anthropic Messages API. Override at runtime with `--model` or the `SYL_MODEL` environment variable.
 - **Slash Commands** — `/help`, `/clear`, `/status`, `/save`, `/exit`, `/quit` for session control without leaving the REPL.
@@ -262,6 +264,24 @@ session-tokens: {:input 0 :output 0 :calls 0}
 
 `record-usage!` is called after every successful API response. The `/status` command displays the running totals.
 
+### Persistent Memory
+
+Syl's long-term memory is stored as plain markdown files in `.syl/memory/`:
+
+```
+.syl/
+├── session.json              # Conversation history (ephemeral)
+└── memory/
+    ├── project-stack.md      # e.g. "Babashka + Podman + Claude API"
+    ├── user-preferences.md   # e.g. "Prefers concise responses, uses zsh"
+    └── api-decisions.md      # e.g. "Chose SSE streaming over polling"
+```
+
+- **`memory_write`** — Syl stores a note by topic key. Overwrites if the key exists.
+- **`memory_read`** — Syl retrieves a specific memory or lists all memories.
+- **Auto-injection** — At startup, all memory files are loaded and injected into the system prompt alongside workspace context, so Syl has full recall from turn one.
+- **Human-readable** — Memory files are plain markdown, easy to inspect, edit, or delete manually.
+
 ### Container Health Check
 
 Before every `run-in-container` call, `ensure-container!` runs `podman inspect` to verify the container is in a running state. If it is not, `start-container` is called to re-summon and reconfigure the environment transparently.
@@ -273,6 +293,7 @@ Syl operates under a strict code of honor:
 1. **Action Over Words** — She uses her tools immediately rather than just describing what she *would* do.
 2. **Verification** — After making changes, she confirms they exist and work.
 3. **Honesty** — If something fails, she reports the error exactly. No hidden failures.
+4. **Transparency** — Before modifying any file, she shows the intended changes using `diff` or `git diff`. No surprise edits.
 
 ## License
 
