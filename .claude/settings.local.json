@@ -1,8 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(bb:*)",
-      "Bash(clj-kondo:*)"
-    ]
-  }
-}
