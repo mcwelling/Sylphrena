@@ -5,20 +5,70 @@
          '[cheshire.core :as json]
          '[clojure.string :as str])
 
+;; --- CLI Argument Parsing ---
+(def cli-args
+  (loop [args (vec *command-line-args*)
+         acc  {}]
+    (if (empty? args)
+      acc
+      (condp = (first args)
+        "--model"      (recur (drop 2 args) (assoc acc :model      (second args)))
+        "--timeout"    (recur (drop 2 args) (assoc acc :timeout    (parse-long (second args))))
+        "--no-banner"  (recur (drop 1 args) (assoc acc :no-banner  true))
+        "--help"       (recur (drop 1 args) (assoc acc :help       true))
+        (recur (drop 1 args) acc)))))
+
+(when (:help cli-args)
+  (println "Usage: ./syl.bb [options]")
+  (println)
+  (println "Options:")
+  (println "  --model <name>     Anthropic model to use (overrides SYL_MODEL env var)")
+  (println "                     Default: claude-sonnet-4-6")
+  (println "  --timeout <secs>   Command execution timeout in seconds")
+  (println "                     Default: 60")
+  (println "  --no-banner        Skip the startup splash banner")
+  (println "  --help             Show this help message")
+  (println)
+  (println "Environment:")
+  (println "  ANTHROPIC_API_KEY  (required) Your Anthropic API key")
+  (println "  SYL_MODEL          Anthropic model override (--model takes precedence)")
+  (println)
+  (println "Slash commands (in REPL):")
+  (println "  /help              Show available slash commands")
+  (println "  /clear             Reset conversation history")
+  (println "  /status            Show session stats (tokens, message count)")
+  (println "  /exit  /quit       Gracefully shut down Syl and remove the container")
+  (System/exit 0))
+
 ;; --- Configuration ---
 (def container-name "syl-agent")
-(def project-dir (System/getProperty "user.dir"))
-(def api-key (System/getenv "ANTHROPIC_API_KEY"))
+(def project-dir    (System/getProperty "user.dir"))
+(def api-key        (System/getenv "ANTHROPIC_API_KEY"))
 
 (when (str/blank? api-key)
   (println "Error: ANTHROPIC_API_KEY environment variable is missing.")
   (System/exit 1))
 
-(def anthropic-url "https://api.anthropic.com/v1/messages")
-(def model "claude-opus-4-6")
-(def max-tool-output 8000) ; chars of tool output stored per result in history
-(def max-history 30)       ; max messages kept in the conversation window
-(def compact-keep 10)      ; recent messages to preserve during compaction
+(def anthropic-url    "https://api.anthropic.com/v1/messages")
+(def model            (or (:model cli-args) (System/getenv "SYL_MODEL") "claude-sonnet-4-6"))
+(def compaction-model "claude-haiku-4-5")   ; fast/cheap model for summarization
+(def max-tool-output  8000)                 ; chars stored per tool result in history
+(def max-history      30)                   ; max messages kept in the conversation window
+(def compact-keep     10)                   ; recent messages preserved during compaction
+(def max-tokens       8096)                 ; max tokens per Claude response
+(def cmd-timeout-ms   (* (or (:timeout cli-args) 60) 1000)) ; command execution timeout
+(def max-retries      5)                    ; API retry attempts on rate-limit
+
+;; --- Session State (token usage) ---
+(def session-tokens (atom {:input 0 :output 0 :calls 0}))
+
+(defn record-usage! [usage]
+  (when usage
+    (swap! session-tokens
+           #(-> %
+                (update :input  + (or (:input_tokens  usage) 0))
+                (update :output + (or (:output_tokens usage) 0))
+                (update :calls  inc)))))
 
 ;; --- 1. Container Management ---
 (defn nuke-container []
@@ -75,22 +125,35 @@
                 "-it mcr.microsoft.com/devcontainers/base:ubuntu /bin/bash")))
   (configure-git-and-ssh))
 
-;; --- 2. The Execution Bridge ---
-(defn run-in-container [cmd]
-  (let [p (process ["podman" "exec" container-name "/bin/bash" "-c" cmd]
-                   {:out :string :err :string})
-        result (deref p 60000 :timeout)]
+;; --- 2. Container Health Check ---
+(defn container-alive? []
+  (let [result (shell {:continue true :out :string :err :string}
+                      (str "podman inspect -f '{{.State.Running}}' " container-name))]
+    (str/includes? (str/trim (:out result)) "true")))
 
+(defn ensure-container! []
+  (when-not (container-alive?)
+    (println "\n[Syl] Container is gone — resummoning...")
+    (start-container)
+    (println "[Syl] Container restored. Continuing.\n")))
+
+;; --- 3. The Execution Bridge ---
+(defn run-in-container [cmd]
+  (ensure-container!)
+  (let [p      (process ["podman" "exec" container-name "/bin/bash" "-c" cmd]
+                        {:out :string :err :string})
+        result (deref p cmd-timeout-ms :timeout)]
     (if (= result :timeout)
       (do
         (.destroy p)
-        "Error: Command timed out after 60 seconds.")
+        (str "Error: Command timed out after " (/ cmd-timeout-ms 1000) " seconds."))
       (let [{:keys [exit out err]} result]
         (if (= 0 exit)
           out
-          (str "Error (Exit " exit "): " (if (str/blank? out) err out)))))))
+          (str "Error (Exit " exit "): "
+               (str/trim (str out (when (and (not (str/blank? out)) (not (str/blank? err))) "\n") err))))))))
 
-;; --- 3. Anthropic API & Tool Schema ---
+;; --- 4. Anthropic API & Tool Schema ---
 (def tools-schema
   [{:name "run_bash"
     :description "Executes a bash command in the isolated project container. Use this to read files, edit code, run tests, or install dependencies."
@@ -127,7 +190,10 @@
        "### TECHNICAL SPECS\n"
        "- Packages: use 'sudo apt-get install -y'\n"
        "- Workspace: /workspace\n"
-       "- Tools: You have run_bash."))
+       "- Tools: You have run_bash.\n\n"
+
+       "When making function calls using tools that accept array or object parameters ensure those are structured using JSON. For example:\n"
+       "Check that all the required parameters for each tool call are provided or can reasonably be inferred from context."))
 
 (defn truncate-output [s]
   (if (> (count s) max-tool-output)
@@ -135,12 +201,12 @@
          "\n... [truncated: " (count s) " total chars]")
     s))
 
-;; --- Context Compaction ---
+;; --- 5. Context Compaction ---
 ;; When the conversation exceeds max-history, summarize older messages via Claude
 ;; and replace them with a single compact summary, keeping the most recent messages intact.
 
 (defn summarize-messages [messages]
-  (let [summary-prompt {:model model
+  (let [summary-prompt {:model compaction-model
                         :max_tokens 2048
                         :system (str "You are a conversation summarizer. Produce a concise summary of the "
                                      "conversation below, preserving: key decisions made, files created or "
@@ -148,28 +214,42 @@
                                      "errors, and the current state of the task. Be factual and terse.")
                         :messages [{:role "user"
                                     :content (str "Summarize this conversation:\n\n"
-                                                  (json/generate-string messages))}]}
-        response (http/post anthropic-url
-                            {:headers {"Content-Type"      "application/json"
-                                       "x-api-key"         api-key
-                                       "anthropic-version" "2023-06-01"}
-                             :body (json/generate-string summary-prompt)
-                             :throw false})
-        body (json/parse-string (:body response) true)]
-    (if-let [error (:error body)]
-      (do (println "\n[Compaction Error]:" (:message error))
-          nil)
-      (-> body :content first :text))))
+                                                  (json/generate-string messages))}]}]
+    (loop [attempt 0]
+      (let [response (http/post anthropic-url
+                                {:headers {"Content-Type"      "application/json"
+                                           "x-api-key"         api-key
+                                           "anthropic-version" "2023-06-01"}
+                                 :body    (json/generate-string summary-prompt)
+                                 :throw   false})
+            status   (:status response)
+            body     (json/parse-string (:body response) true)]
+        (cond
+          (and (or (= status 429) (= status 529)) (< attempt max-retries))
+          (let [retry-after (some-> (get-in response [:headers "retry-after"]) parse-long)
+                wait-secs   (or retry-after (long (* (Math/pow 2 attempt) 2)))]
+            (println (str "\n[Compaction rate limited] Waiting " wait-secs "s before retry "
+                          (inc attempt) "/" max-retries "..."))
+            (Thread/sleep (* wait-secs 1000))
+            (recur (inc attempt)))
+
+          (:error body)
+          (do (println "\n[Compaction Error]:" (-> body :error :message))
+              nil)
+
+          :else
+          (do (record-usage! (:usage body))
+              (-> body :content first :text)))))))
 
 (defn compact-history [messages]
   (if (<= (count messages) max-history)
     messages
     (let [old-msgs  (vec (drop-last compact-keep messages))
           keep-msgs (vec (take-last compact-keep messages))
-          ;; Ensure keep-msgs starts on a plain user message (valid API sequence)
+          ;; Ensure keep-msgs starts on a plain user message (valid API sequence).
           keep-msgs (loop [msgs keep-msgs]
                       (if (empty? msgs)
-                        keep-msgs
+                        []
                         (let [m (first msgs)]
                           (if (and (= (:role m) "user") (string? (:content m)))
                             msgs
@@ -187,39 +267,93 @@
         (do (println "[Syl] Compaction failed, falling back to simple trim.")
             keep-msgs)))))
 
+;; --- 6. Claude API Call ---
 (defn call-claude [messages]
-  (let [payload {:model model
-                 :max_tokens 8096
-                 :system system-instruction
-                 :tools tools-schema
-                 :messages messages}
+  (let [payload {:model      model
+                 :max_tokens max-tokens
+                 :system     system-instruction
+                 :tools      tools-schema
+                 :messages   messages}]
+    (loop [attempt 0]
+      (let [response (http/post anthropic-url
+                                {:headers {"Content-Type"      "application/json"
+                                           "x-api-key"         api-key
+                                           "anthropic-version" "2023-06-01"}
+                                 :body    (json/generate-string payload)
+                                 :throw   false})
+            status   (:status response)
+            body     (json/parse-string (:body response) true)]
 
-        response (http/post anthropic-url
-                            {:headers {"Content-Type"      "application/json"
-                                       "x-api-key"         api-key
-                                       "anthropic-version" "2023-06-01"}
-                             :body (json/generate-string payload)
-                             :throw false})
-        body (json/parse-string (:body response) true)]
+        (if (and (or (= status 429) (= status 529)) (< attempt max-retries))
+          ;; Rate limited or overloaded — back off and retry
+          (let [retry-after (some-> (get-in response [:headers "retry-after"]) parse-long)
+                wait-secs   (or retry-after (long (* (Math/pow 2 attempt) 2)))]
+            (println (str "\n[Rate limited] Waiting " wait-secs "s before retry "
+                          (inc attempt) "/" max-retries "..."))
+            (Thread/sleep (* wait-secs 1000))
+            (recur (inc attempt)))
 
-    (when-let [error (:error body)]
-      (println "\n[API Error]:" (:message error))
-      (System/exit 1))
+          ;; Not retryable — process normally
+          (do
+            (when-let [error (:error body)]
+              (println "\n[API Error]:" (:message error))
+              (System/exit 1))
 
-    (let [content     (:content body)
-          stop-reason (:stop_reason body)
-          text-block  (first (filter #(= (:type %) "text") content))]
+            (record-usage! (:usage body))
 
-      (if (= stop-reason "tool_use")
-        {:type              "tool_use"
-         :tool-uses         (filterv #(= (:type %) "tool_use") content)
-         :raw-model-content content}
+            (let [content     (:content body)
+                  stop-reason (:stop_reason body)
+                  text-block  (first (filter #(= (:type %) "text") content))]
 
-        {:type              "text"
-         :text              (:text text-block)
-         :raw-model-content content}))))
+              (if (= stop-reason "tool_use")
+                {:type              "tool_use"
+                 :tool-uses         (filterv #(= (:type %) "tool_use") content)
+                 :raw-model-content content}
 
-;; --- 4. Splash Banner ---
+                {:type              "text"
+                 :text              (:text text-block)
+                 :raw-model-content content}))))))))
+
+;; --- 7. Slash Commands ---
+(def slash-help-text
+  (str "\n  Available slash commands:\n"
+       "    /help    — Show this message\n"
+       "    /clear   — Reset conversation history (container is preserved)\n"
+       "    /status  — Show session stats (tokens used, message count)\n"
+       "    /exit    — Gracefully shut down Syl and remove the container\n"
+       "    /quit    — Alias for /exit\n"))
+
+(defn handle-slash [input messages]
+  (condp = (str/trim input)
+    "/help"
+    (do (println slash-help-text)
+        {:action :continue :messages messages})
+
+    "/clear"
+    (do (println "\n[Syl] Conversation history cleared. The container lives on.\n")
+        {:action :continue :messages []})
+
+    "/status"
+    (let [{:keys [input output calls]} @session-tokens
+          total (+ input output)]
+      (println (str "\n  Session status:"
+                    "\n    Model:          " model
+                    "\n    Timeout:        " (/ cmd-timeout-ms 1000) "s"
+                    "\n    API calls:      " calls
+                    "\n    Input tokens:   " input
+                    "\n    Output tokens:  " output
+                    "\n    Total tokens:   " total
+                    "\n    Messages:       " (count messages) "\n"))
+      {:action :continue :messages messages})
+
+    "/exit"
+    {:action :exit :messages messages}
+
+    "/quit"
+    {:action :exit :messages messages}
+    nil))
+
+;; --- 8. Splash Banner ---
 (defn print-banner []
   (let [r  "\u001b[0m"
         b  "\u001b[1m"
@@ -249,47 +383,69 @@
     (println)
     (println (str cy "  ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋" r))
     (println (str ye "  ✦ · * · ✦ · * · ✦ · * · ✦ · * · ✦ · * · ✦" r))
+    (println)
+    (println (str "  Model: " wh model r "   Timeout: " wh (/ cmd-timeout-ms 1000) "s" r
+                  "   Type " mg "/help" r " for commands"))
     (println)))
 
-;; --- 5. The Main Agent Loop ---
+;; --- 9. The Main Agent Loop ---
 (defn main-loop []
   (start-container)
-  (print-banner)
+  (when-not (:no-banner cli-args)
+    (print-banner))
 
   (loop [messages []]
     (print "\nYou: ")
     (flush)
-    (let [user-input   (read-line)
-          initial-msgs (conj messages {:role "user" :content user-input})
-          final-msgs
-          (loop [current-msgs initial-msgs]
-              (let [llm-response (call-claude current-msgs)]
+    (let [user-input (read-line)]
 
-                (cond
-                  (= (:type llm-response) "tool_use")
-                  (let [model-content (:raw-model-content llm-response)
-                        tool-results  (mapv (fn [tu]
-                                              (let [cmd (-> tu :input :command)
-                                                    _   (println "\n[Syl Executing] ->" cmd)
-                                                    res (run-in-container cmd)
-                                                    _   (println "[Result]\n"
-                                                                 (subs res 0 (min 500 (count res)))
-                                                                 (if (> (count res) 500) "...\n(Output truncated)" ""))]
+      ;; Handle EOF (Ctrl+D)
+      (when (nil? user-input)
+        (println "\n[Syl] Farewell. Life before death.")
+        (nuke-container)
+        (System/exit 0))
+
+      ;; Handle slash commands
+      (if-let [slash-result (handle-slash user-input messages)]
+        (if (= (:action slash-result) :exit)
+          (do
+            (println "\n[Syl] Removing container and stepping back into the cognitive realm...")
+            (nuke-container)
+            (println "[Syl] Farewell. Life before death.")
+            (System/exit 0))
+          (recur (:messages slash-result)))
+
+        ;; Normal message — send to Claude
+        (let [initial-msgs (conj messages {:role "user" :content user-input})
+              final-msgs
+              (loop [current-msgs initial-msgs]
+                (let [llm-response (call-claude current-msgs)]
+
+                  (cond
+                    ;; Tool use — execute all tool calls (possibly in parallel)
+                    (= (:type llm-response) "tool_use")
+                    (let [tool-uses   (:tool-uses llm-response)
+                          tool-results (mapv (fn [tu]
+                                              (let [cmd    (-> tu :input :command)
+                                                    output (truncate-output (run-in-container cmd))]
+                                                (println (str "\n$ " cmd))
+                                                (println output)
                                                 {:type        "tool_result"
                                                  :tool_use_id (:id tu)
-                                                 :content     (truncate-output res)}))
-                                            (:tool-uses llm-response))
-                        next-msgs (-> current-msgs
-                                      (conj {:role "assistant" :content model-content})
-                                      (conj {:role "user" :content tool-results}))]
-                    (recur next-msgs))
+                                                 :content     output}))
+                                            tool-uses)
+                          next-msgs (conj current-msgs
+                                          {:role "assistant" :content (:raw-model-content llm-response)}
+                                          {:role "user"      :content tool-results})]
+                      (recur next-msgs))
 
-                  :else
-                  (do
-                    (println "\nSyl:" (:text llm-response))
-                    (conj current-msgs {:role "assistant" :content (:raw-model-content llm-response)})))))]
+                    ;; Text response — print and return
+                    :else
+                    (do
+                      (println "\nSyl:" (:text llm-response))
+                      (conj current-msgs {:role "assistant" :content (:raw-model-content llm-response)})))))]
 
-        (recur (compact-history final-msgs)))))
+          (recur (compact-history final-msgs)))))))
 
 (when (= *file* (System/getProperty "babashka.file"))
   (main-loop))

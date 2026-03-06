@@ -28,8 +28,9 @@ Syl is a lightweight AI agent harness written in [Babashka](https://babashka.org
 3. **Git Identity** — Your host's `git config` identity (`user.name`, `user.email`) is read and applied inside the container, so commits are attributed correctly.
 4. **Conversation Loop** — You chat with Syl in a terminal REPL. Your messages are sent to the Claude API.
 5. **Tool Execution** — When Claude decides to run commands, Syl executes them inside the sandboxed container and feeds results back into the conversation. Parallel tool calls are supported — Claude can invoke multiple commands in a single response.
-6. **Context Compaction** — When the conversation grows beyond `max-history` messages, Syl asks Claude to summarize older messages into a compact digest, preserving key decisions, file changes, and errors. The most recent `compact-keep` messages are kept verbatim alongside the summary. A role-boundary correction ensures the kept messages always start on a plain `user` message (not a `tool_result`), so the model never sees an invalid message sequence. If summarization fails, a simple trim fallback ensures the conversation continues gracefully.
-7. **Safety** — Your code runs in an isolated, memory-limited (2GB) container. Nothing touches your host system directly. SSH keys are mounted read-only for extra protection.
+6. **Context Compaction** — When the conversation grows beyond `max-history` messages, Syl asks Claude (via a fast `claude-haiku-4-5` model) to summarize older messages into a compact digest. The most recent `compact-keep` messages are kept verbatim. A role-boundary correction ensures the kept messages always start on a plain `user` message. If summarization fails, a simple trim fallback ensures the conversation continues gracefully.
+7. **Container Health Check** — Before every command execution, Syl checks that the container is still alive. If it has died (OOM, manual removal, etc.), she automatically resummmons and reconfigures it before proceeding.
+8. **Safety** — Your code runs in an isolated, memory-limited (2GB) container. Nothing touches your host system directly. SSH keys are mounted read-only for extra protection.
 
 ## Prerequisites
 
@@ -47,7 +48,7 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 ./syl.bb
 ```
 
-Syl will summon her container, forward your git and SSH configuration, and greet you with a styled banner displaying the First Ideal:
+Syl will summon her container, forward your git and SSH configuration, and greet you with a styled banner:
 
 ```
   ✦ · * · ✦ · * · ✦ · * · ✦ · * · ✦ · * · ✦
@@ -68,41 +69,81 @@ Syl will summon her container, forward your git and SSH configuration, and greet
               S  Y  L
         The Ancient Daughter
 
+  Model: claude-sonnet-4-6   Timeout: 60s   Type /help for commands
+
 You: _
 ```
 
-Ask her anything — read files, write code, run tests, install packages, commit and push. She'll handle it with honor.
+## CLI Options
+
+```
+Usage: ./syl.bb [options]
+
+Options:
+  --model <name>     Anthropic model to use (overrides SYL_MODEL env var)
+                     Default: claude-sonnet-4-6
+  --timeout <secs>   Command execution timeout in seconds
+                     Default: 60
+  --no-banner        Skip the startup splash banner
+  --help             Show this help message
+
+Environment:
+  ANTHROPIC_API_KEY  (required) Your Anthropic API key
+  SYL_MODEL          Anthropic model override (--model takes precedence)
+```
+
+## Slash Commands
+
+Type these at the `You:` prompt during a session:
+
+| Command   | Description                                              |
+|-----------|----------------------------------------------------------|
+| `/help`   | Show available slash commands                            |
+| `/clear`  | Reset conversation history (container is preserved)      |
+| `/status` | Show session stats: model, tokens used, message count    |
+| `/exit`   | Gracefully shut down Syl and remove the container        |
+| `/quit`   | Alias for `/exit`                                        |
 
 ## Configuration
 
 These top-level variables are defined at the top of `syl.bb` and can be adjusted:
 
-| Variable          | Default          | Description                                                 |
-| ----------------- | ---------------- | ----------------------------------------------------------- |
-| `container-name`  | `syl-agent`      | Name of the Podman container                                |
-| `model`           | `claude-sonnet-4-6` | Anthropic model to use. Override at runtime with the `SYL_MODEL` env var |
-| `max-tool-output` | `8000`           | Max characters stored per tool result in history             |
-| `max-history`     | `30`             | Max messages kept in the conversation sliding window         |
-| `compact-keep`    | `10`             | Recent messages preserved verbatim during context compaction |
+| Variable           | Default              | Description                                                   |
+|--------------------|----------------------|---------------------------------------------------------------|
+| `container-name`   | `syl-agent`          | Name of the Podman container                                  |
+| `model`            | `claude-sonnet-4-6`  | Anthropic model. Override with `--model` flag or `SYL_MODEL` env var |
+| `compaction-model` | `claude-haiku-4-5`   | Lighter model used for context summarization                  |
+| `max-tool-output`  | `8000`               | Max characters stored per tool result in history              |
+| `max-history`      | `30`                 | Max messages kept in the conversation sliding window          |
+| `compact-keep`     | `10`                 | Recent messages preserved verbatim during context compaction  |
+| `max-tokens`       | `8096`               | Max tokens per Claude response                                |
+| `max-retries`      | `5`                  | API retry attempts on rate-limit (429/529)                    |
 
-The following values are currently hardcoded inline and can be changed directly in the source:
+The following values can be set at runtime via CLI flags or are hardcoded inline:
 
-| Value             | Location              | Default                                        | Description                   |
-| ----------------- | --------------------- | ---------------------------------------------- | ----------------------------- |
-| `max_tokens`      | `call-claude`         | `8096`                                         | Max tokens per Claude response|
-| `memory`          | `start-container`     | `2g`                                           | Container memory limit        |
-| `image`           | `start-container`     | `mcr.microsoft.com/devcontainers/base:ubuntu`  | Container base image          |
+| Value          | How to change              | Default | Description                   |
+|----------------|----------------------------|---------|-------------------------------|
+| `cmd-timeout-ms` | `--timeout <secs>` flag  | `60s`   | Command execution timeout     |
+| `memory`       | Edit `start-container`     | `2g`    | Container memory limit        |
+| `image`        | Edit `start-container`     | `mcr.microsoft.com/devcontainers/base:ubuntu` | Container base image |
 
 ## Features
 
-- **Anthropic Claude Integration** — Powered by `claude-sonnet-4-6` (default) via the Anthropic Messages API. The model can be overridden at runtime by setting the `SYL_MODEL` environment variable.
-- **Splash Banner** — On startup, Syl displays a styled ASCII art banner featuring the First Ideal and a Shardblade glyph, rendered with ANSI color codes (cyan, gold, magenta).
-- **Read-Only SSH Mount with Wrapper** — Your host `~/.ssh` is bind-mounted read-only into the container. On startup, keys are copied to `/tmp/.ssh` with corrected ownership (`root:root`) and permissions (`700`/`600`), and a lightweight wrapper script is installed at `/usr/local/bin/ssh` that forces all SSH invocations (including git-over-SSH) to use the clean copy. This solves the common UID mismatch problem on macOS where the host user's UID (e.g. 501) differs from the container's root.
-- **Git Identity Forwarding** — Your host's `user.name` and `user.email` are applied inside the container via proper argument passing (no shell string interpolation).
-- **Parallel Tool Execution** — Claude can issue multiple `run_bash` calls in a single response, and Syl executes them all, returning results together.
-- **Graceful Timeouts** — Commands that exceed 60 seconds are terminated cleanly and reported as timed out.
-- **Tool Output Truncation** — Long command outputs are automatically truncated to `max-tool-output` characters to keep the conversation context lean and prevent token bloat.
-- **Context Compaction** — When the conversation exceeds `max-history` messages, older messages are summarized by Claude into a concise digest (preserving key decisions, file changes, and errors). The most recent `compact-keep` messages are kept verbatim, with a role-boundary correction that scans forward to ensure the kept window starts on a plain `user` message (not a `tool_result`). This prevents invalid message sequences in the API payload. If summarization fails, a simple trim fallback ensures the conversation continues gracefully.
+- **Anthropic Claude Integration** — Powered by `claude-sonnet-4-6` (default) via the Anthropic Messages API. Override at runtime with `--model` or the `SYL_MODEL` environment variable.
+- **CLI Argument Parsing** — Supports `--model`, `--timeout`, `--no-banner`, and `--help` flags.
+- **Slash Commands** — `/help`, `/clear`, `/status`, `/exit`, `/quit` for session control without leaving the REPL.
+- **Token Usage Tracking** — Every API call's input/output tokens are accumulated. View totals at any time with `/status`.
+- **Graceful Shutdown** — `/exit` and `/quit` cleanly remove the container before exiting. Ctrl+D (EOF) also triggers graceful teardown.
+- **Container Health Check** — Before each command, Syl verifies the container is running. If it has died, she automatically resummmons and reconfigures it.
+- **Configurable Timeout** — Command execution timeout defaults to 60s but can be set with `--timeout <secs>`. The timeout value is reflected in error messages and `/status`.
+- **Improved Error Output** — When a command fails, both stdout and stderr are included in the error report (no more dropped signal).
+- **Splash Banner** — On startup, Syl displays a styled ASCII art banner featuring the First Ideal and a Shardblade glyph, with the active model and timeout shown. Suppress with `--no-banner`.
+- **Read-Only SSH Mount with Wrapper** — Your host `~/.ssh` is bind-mounted read-only. Keys are copied to `/tmp/.ssh` with corrected ownership and permissions, and a wrapper script ensures all SSH invocations (including `git push/pull`) use the corrected keys.
+- **Git Identity Forwarding** — Your host's `user.name` and `user.email` are applied inside the container.
+- **Parallel Tool Execution** — Claude can issue multiple `run_bash` calls in a single response; Syl executes them all and returns results together.
+- **Rate-Limit Retry with Backoff** — Both the main API call and compaction calls retry on 429/529 responses with exponential backoff and `retry-after` header support.
+- **Tool Output Truncation** — Long command outputs are automatically truncated to `max-tool-output` characters.
+- **Context Compaction** — When the conversation exceeds `max-history` messages, older messages are summarized by `claude-haiku-4-5` into a concise digest. The most recent `compact-keep` messages are kept verbatim with role-boundary correction.
 - **Rich System Prompt** — Syl's personality, oaths, and operational rules are baked into the system instruction for consistent behavior.
 
 ## Architecture Notes
@@ -123,7 +164,7 @@ Host (~/.ssh, UID 501) ──read-only mount──▶ Container (/root/.ssh, UID
                                             -o UserKnownHostsFile=...)
 ```
 
-SSH refuses to use key files it doesn't own. By mounting read-only and copying to a root-owned location, we get secure key access without modifying the host's files. The wrapper script ensures both direct `ssh` and `git push/pull` use the corrected keys transparently.
+SSH refuses to use key files it doesn't own. By mounting read-only and copying to a root-owned location, we get secure key access without modifying the host's files.
 
 ### Context Compaction Strategy
 
@@ -133,7 +174,7 @@ Long conversations are managed through intelligent summarization rather than nai
 [msg 1] [msg 2] ... [msg 20] [msg 21] ... [msg 30]
  \_________________________/  \____________________/
           │                          │
-    Summarized by Claude      Kept verbatim (compact-keep)
+    Summarized by claude-haiku  Kept verbatim (compact-keep)
           │                          │
           ▼                          ▼
   [summary message]           Role-boundary correction:
@@ -147,12 +188,26 @@ Long conversations are managed through intelligent summarization rather than nai
 
 When `max-history` is exceeded:
 
-1. The message list is split: everything except the last `compact-keep` messages becomes the "old" batch, and the final `compact-keep` messages are the "keep" batch.
-2. **Role-boundary correction** — The keep batch is scanned forward from its start, skipping any messages until a plain `user` message (with string content, not a `tool_result` array) is found. This ensures the kept window begins with a valid user turn, preventing malformed API payloads that would occur if a `tool_result` appeared without a preceding `assistant` tool-use message.
-3. The old batch is sent to Claude with a summarization prompt that extracts key decisions, file modifications, command outcomes, and unresolved issues.
-4. The summary replaces those messages as a synthetic `[Context summary]` user message, followed by an assistant acknowledgment, then the corrected keep batch — forming a coherent, role-alternating conversation for the API.
+1. The message list is split: everything except the last `compact-keep` messages becomes the "old" batch.
+2. **Role-boundary correction** — the keep batch is scanned forward, skipping messages until a plain `user` message (with string content, not a `tool_result`) is found.
+3. The old batch is sent to `claude-haiku-4-5` with a summarization prompt.
+4. The summary replaces those messages as a synthetic `[Context summary]` user message, followed by an assistant acknowledgment, then the keep batch.
 
-If the summarization API call fails, the fallback simply uses the trimmed keep batch so the conversation can continue without interruption.
+If summarization fails, the fallback trims to the keep batch so the conversation continues uninterrupted.
+
+### Token Usage Tracking
+
+An atom accumulates token counts across all API calls (both main calls and compaction calls):
+
+```
+session-tokens: {:input 0 :output 0 :calls 0}
+```
+
+`record-usage!` is called after every successful API response. The `/status` command displays the running totals.
+
+### Container Health Check
+
+Before every `run-in-container` call, `ensure-container!` runs `podman inspect` to verify the container is in a running state. If it is not, `start-container` is called to re-summon and reconfigure the environment transparently.
 
 ## The Oaths
 
