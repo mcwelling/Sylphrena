@@ -758,7 +758,7 @@
        (let [result-blocks (mapv (fn [[_ block]]
                                    (if (= (:type block) "tool_use")
                                      (-> block
-                                         (assoc :input (json/parse-string (:input-str block) true))
+                                         (assoc :input (or (json/parse-string (:input-str block) true) {}))
                                          (dissoc :input-str))
                                      block))
                                  @blocks)
@@ -971,7 +971,7 @@
   (.addShutdownHook (Runtime/getRuntime)
     (Thread. (fn []
       (println "\n[Syl] Cleaning up container...")
-      (nuke-container)))))
+      (try (nuke-container) (catch Exception _))))))
 
 ;; --- 14. The Main Agent Loop ---
 (defn main-loop []
