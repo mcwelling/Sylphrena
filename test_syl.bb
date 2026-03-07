@@ -565,6 +565,139 @@
         (alter-var-root #'memory-dir (constantly (str project-dir "/.syl/memory")))))))
 
 ;; ============================================================
+;; 12. Bedrock Backend
+;; ============================================================
+
+(deftest test-parse-cli-args-backend
+  (is (= {:backend "bedrock"}
+         (parse-cli-args ["--backend" "bedrock"])))
+  (is (= {:backend "bedrock" :model "claude-opus-4-6"}
+         (parse-cli-args ["--backend" "bedrock" "--model" "claude-opus-4-6"]))))
+
+(deftest test-bedrock-model-id-known
+  (is (= "anthropic.claude-sonnet-4-6-20250514-v1:0" (bedrock-model-id "claude-sonnet-4-6")))
+  (is (= "anthropic.claude-haiku-4-5-20251001-v1:0"  (bedrock-model-id "claude-haiku-4-5")))
+  (is (= "anthropic.claude-opus-4-6-20250514-v1:0"   (bedrock-model-id "claude-opus-4-6"))))
+
+(deftest test-bedrock-model-id-passthrough
+  (testing "unknown model names pass through unchanged"
+    (is (= "anthropic.claude-sonnet-4-6-20250514-v1:0"
+           (bedrock-model-id "anthropic.claude-sonnet-4-6-20250514-v1:0")))
+    (is (= "some-custom-model" (bedrock-model-id "some-custom-model")))))
+
+(deftest test-sha256-hex
+  (testing "SHA-256 of empty string matches known value"
+    (is (= "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+           (sha256-hex "")))))
+
+(deftest test-hmac-sha256
+  (testing "HMAC-SHA256 produces 32-byte output"
+    (let [result (hmac-sha256 (.getBytes "key" "UTF-8") "data")]
+      (is (= 32 (count result)))
+      (is (bytes? result)))))
+
+(deftest test-sign-bedrock-request
+  (let [headers (sign-bedrock-request {:method "POST"
+                                       :uri "/model/test/invoke"
+                                       :body "{\"test\":true}"
+                                       :region "us-east-1"
+                                       :access-key "AKIAIOSFODNN7EXAMPLE"
+                                       :secret-key "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+                                       :session-token nil})]
+    (testing "returns authorization header"
+      (is (contains? headers "authorization"))
+      (is (str/starts-with? (get headers "authorization") "AWS4-HMAC-SHA256")))
+    (testing "includes required headers"
+      (is (contains? headers "x-amz-date"))
+      (is (contains? headers "x-amz-content-sha256"))
+      (is (contains? headers "host"))
+      (is (str/includes? (get headers "host") "bedrock-runtime")))))
+
+(deftest test-sign-bedrock-request-with-session-token
+  (let [headers (sign-bedrock-request {:method "POST"
+                                       :uri "/model/test/invoke"
+                                       :body "{}"
+                                       :region "us-west-2"
+                                       :access-key "AKID"
+                                       :secret-key "SECRET"
+                                       :session-token "SESSION123"})]
+    (testing "includes security token when provided"
+      (is (= "SESSION123" (get headers "x-amz-security-token")))
+      (is (str/includes? (get headers "authorization") "x-amz-security-token")))))
+
+(deftest test-parse-eventstream-headers
+  (testing "parses string headers (type 7)"
+    (let [;; Build a header: name=":event-type", type=7, value="chunk"
+          baos (java.io.ByteArrayOutputStream.)
+          dos  (java.io.DataOutputStream. baos)
+          name-bytes (.getBytes ":event-type" "UTF-8")
+          val-bytes  (.getBytes "chunk" "UTF-8")]
+      (.writeByte dos (count name-bytes))
+      (.write dos name-bytes)
+      (.writeByte dos 7) ;; string type
+      (.writeShort dos (count val-bytes))
+      (.write dos val-bytes)
+      (let [headers (parse-eventstream-headers (.toByteArray baos))]
+        (is (= "chunk" (get headers ":event-type"))))))
+
+  (testing "returns empty map for empty bytes"
+    (is (= {} (parse-eventstream-headers (byte-array 0))))))
+
+(deftest test-parse-bedrock-stream
+  (testing "parses EventStream frames and extracts Anthropic events"
+    (let [events (atom [])
+          ;; Build a single EventStream frame with a "chunk" event
+          anthropic-event (json/generate-string {:type "message_start"
+                                                  :message {:usage {:input_tokens 100}}})
+          b64-event (.encodeToString (java.util.Base64/getEncoder)
+                                     (.getBytes anthropic-event "UTF-8"))
+          payload-json (json/generate-string {:bytes b64-event})
+          payload-bytes (.getBytes payload-json "UTF-8")
+          ;; Build headers: :message-type=event, :event-type=chunk
+          hdr-baos (java.io.ByteArrayOutputStream.)
+          hdr-dos  (java.io.DataOutputStream. hdr-baos)]
+      ;; Header 1: :message-type = "event"
+      (let [n (.getBytes ":message-type" "UTF-8")
+            v (.getBytes "event" "UTF-8")]
+        (.writeByte hdr-dos (count n)) (.write hdr-dos n)
+        (.writeByte hdr-dos 7) (.writeShort hdr-dos (count v)) (.write hdr-dos v))
+      ;; Header 2: :event-type = "chunk"
+      (let [n (.getBytes ":event-type" "UTF-8")
+            v (.getBytes "chunk" "UTF-8")]
+        (.writeByte hdr-dos (count n)) (.write hdr-dos n)
+        (.writeByte hdr-dos 7) (.writeShort hdr-dos (count v)) (.write hdr-dos v))
+      (let [header-bytes (.toByteArray hdr-baos)
+            total-len (+ 16 (count header-bytes) (count payload-bytes))
+            frame-baos (java.io.ByteArrayOutputStream.)
+            frame-dos  (java.io.DataOutputStream. frame-baos)]
+        (.writeInt frame-dos total-len)
+        (.writeInt frame-dos (count header-bytes))
+        (.writeInt frame-dos 0)  ;; prelude CRC
+        (.write frame-dos header-bytes)
+        (.write frame-dos payload-bytes)
+        (.writeInt frame-dos 0)  ;; message CRC
+        (parse-bedrock-stream (ByteArrayInputStream. (.toByteArray frame-baos))
+                              (fn [data] (swap! events conj data)))
+        (is (= 1 (count @events)))
+        (is (= "message_start" (:type (first @events))))
+        (is (= 100 (-> @events first :message :usage :input_tokens)))))))
+
+(deftest test-make-stream-handler
+  (let [{:keys [on-event build-result]} (make-stream-handler)]
+    (testing "handles message_start"
+      (on-event {:type "message_start" :message {:usage {:input_tokens 50 :output_tokens 0}}}))
+    (testing "handles text content block"
+      (on-event {:type "content_block_start" :index 0 :content_block {:type "text" :text ""}})
+      (on-event {:type "content_block_delta" :index 0 :delta {:type "text_delta" :text "Hello"}})
+      (on-event {:type "content_block_delta" :index 0 :delta {:type "text_delta" :text " world"}})
+      (on-event {:type "content_block_stop" :index 0})
+      (on-event {:type "message_delta" :delta {:stop_reason "end_turn"} :usage {:output_tokens 10}}))
+    (let [result (build-result)]
+      (is (= "text" (:type result)))
+      (is (= "Hello world" (:text result)))
+      (is (= 1 (count (:raw-model-content result)))))))
+
+;; ============================================================
 ;; Run all tests
 ;; ============================================================
 

@@ -42,10 +42,24 @@ Syl is a lightweight AI agent harness written in [Babashka](https://babashka.org
 ## Quick Start
 
 ```bash
-# 1. Set your API key
-export ANTHROPIC_API_KEY="sk-ant-..."
+# 1. Run the setup script to check dependencies and configure your API key
+./setup.sh
 
 # 2. Run Syl from your project directory
+./syl.bb
+```
+
+The setup script will:
+- Check for Babashka, Podman, and Git (with install instructions if missing)
+- Verify Podman machine status (macOS)
+- Help you set your `ANTHROPIC_API_KEY` (optionally adding it to your shell config)
+- Pre-pull the container image for a faster first run
+- Make `syl.bb` executable
+
+You can also set up manually:
+
+```bash
+export ANTHROPIC_API_KEY="sk-ant-..."
 ./syl.bb
 ```
 
@@ -181,6 +195,7 @@ The following values can be set at runtime via CLI flags or are hardcoded inline
 ### 🔄 Workflow Automation
 
 - **Pipeline Definitions** — Define multi-step workflows as markdown files in `.syl/workflows/`. Each step is a list item with a label and a backtick-enclosed bash command.
+- **Conversational Management** — Ask Syl to create, edit, or delete workflows through natural conversation. She uses dedicated `workflow_write` and `workflow_delete` tools with uniqueness enforcement — no accidental overwrites.
 - **Sequential Execution** — `/workflow <name>` runs steps one by one inside the container. Each step's command and output are displayed in real-time.
 - **Fail-Fast** — If any step fails, the workflow stops immediately and reports which step failed.
 - **Built-in Workflows** — Syl ships with example workflows: `ship` (test → stage → commit → push) and `check` (test → status → log).
@@ -206,6 +221,7 @@ Test, commit, and push changes to remote.
 - **Slash Commands** — `/help`, `/clear`, `/status`, `/save`, `/workflow`, `/exit`, `/quit` for session control without leaving the REPL.
 - **Graceful Shutdown** — `/exit`, `/quit`, and Ctrl+D trigger clean teardown. A JVM shutdown hook also handles Ctrl+C / SIGINT.
 - **Splash Banner** — A styled ASCII art banner displays the First Ideal and active session config on startup. Suppress with `--no-banner`.
+- **Setup Script** — `./setup.sh` checks for all dependencies (Babashka, Podman, Git), helps configure `ANTHROPIC_API_KEY`, pre-pulls the container image, and reports any issues with install instructions.
 
 ## Architecture Notes
 
