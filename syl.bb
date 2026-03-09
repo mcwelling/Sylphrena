@@ -8,7 +8,9 @@
 (import '[java.io BufferedReader InputStreamReader DataInputStream ByteArrayInputStream]
         '[java.security MessageDigest]
         '[javax.crypto Mac]
-        '[javax.crypto.spec SecretKeySpec])
+        '[javax.crypto.spec SecretKeySpec]
+        '[org.jline.terminal TerminalBuilder]
+        '[org.jline.reader LineReaderBuilder EndOfFileException UserInterruptException])
 
 ;; --- CLI Argument Parsing ---
 (defn parse-cli-args [args]
@@ -979,22 +981,26 @@
   (when-not (:no-banner cli-args)
     (print-banner))
 
-  ;; Gather workspace context once at startup for the system prompt
-  (let [workspace-ctx  (gather-workspace-context)
-        system-blocks  (build-system-blocks workspace-ctx)
-        initial-msgs   (if (:resume cli-args)
-                         (or (load-session) [])
-                         [])]
+  (let [terminal    (-> (TerminalBuilder/builder) (.system true) (.build))
+        line-reader (-> (LineReaderBuilder/builder) (.terminal terminal) (.build))]
 
-    (loop [messages initial-msgs]
-      (print "\nYou: ")
-      (flush)
-      (let [user-input (read-line)]
+    ;; Gather workspace context once at startup for the system prompt
+    (let [workspace-ctx  (gather-workspace-context)
+          system-blocks  (build-system-blocks workspace-ctx)
+          initial-msgs   (if (:resume cli-args)
+                           (or (load-session) [])
+                           [])]
 
-        ;; Handle EOF (Ctrl+D)
-        (when (nil? user-input)
-          (println "\n[Syl] Farewell. Life before death.")
-          (System/exit 0))
+      (loop [messages initial-msgs]
+        (let [user-input (try
+                           (.readLine line-reader "\nYou: ")
+                           (catch EndOfFileException _  nil)
+                           (catch UserInterruptException _ nil))]
+
+          ;; Handle EOF (Ctrl+D) or Ctrl+C
+          (when (nil? user-input)
+            (println "\n[Syl] Farewell. Life before death.")
+            (System/exit 0))
 
         ;; Handle slash commands
         (if-let [slash-result (handle-slash user-input messages)]
@@ -1068,7 +1074,7 @@
                       :else
                       (conj current-msgs {:role "assistant" :content (:raw-model-content llm-response)}))))]
 
-            (recur (compact-history final-msgs))))))))
+            (recur (compact-history final-msgs)))))))))
 
 (when *main-script*
   (main-loop))
