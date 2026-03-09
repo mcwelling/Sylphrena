@@ -2,17 +2,17 @@
 
 **An honorspren for your codebase.**
 
-Syl is a lightweight AI agent harness written in [Babashka](https://babashka.org/) (Clojure). She summons a containerized Ubuntu environment via [Podman](https://podman.io/), connects to [Anthropic's Claude API](https://docs.anthropic.com/) with streaming responses, and provides an interactive REPL where an AI assistant can read, write, and execute code safely inside an isolated container.
+Syl is a lightweight AI agent harness written in [Babashka](https://babashka.org/) (Clojure). She summons a containerized Ubuntu environment via [Podman](https://podman.io/), connects to Claude via the [Anthropic API](https://docs.anthropic.com/) or [AWS Bedrock](https://aws.amazon.com/bedrock/) with streaming responses, and provides an interactive REPL where an AI assistant can read, write, and execute code safely inside an isolated container.
 
 > *"I'm not a pet. I'm a honorspren. There's a difference."*
 
 ## How It Works
 
 ```
-┌──────────────┐       ┌──────────────────┐  streaming  ┌──────────────────────┐
-│  You (REPL)  │ ───▶  │  syl.bb (Agent)  │ ◀═══════▶  │  Claude API          │
-│              │ ◀───  │                  │    SSE      │  (claude-sonnet-4-6) │
-└──────────────┘       └────────┬─────────┘             └──────────────────────┘
+┌──────────────┐       ┌──────────────────┐  streaming  ┌──────────────────────────┐
+│  You (REPL)  │ ───▶  │  syl.bb (Agent)  │ ◀═══════▶  │  Claude API              │
+│              │ ◀───  │                  │  SSE/ES     │  (Anthropic or Bedrock)  │
+└──────────────┘       └────────┬─────────┘             └──────────────────────────┘
                                 │
                                 │ tool calls
                                 ▼
@@ -27,17 +27,18 @@ Syl is a lightweight AI agent harness written in [Babashka](https://babashka.org
 2. **SSH Forwarding** — On startup, Syl bind-mounts your host's `~/.ssh` directory read-only into the container, copies the keys to a clean location (`/tmp/.ssh`) with correct ownership and permissions, and installs an SSH wrapper script so that all SSH calls (including those from git) work seamlessly — even when the host UID differs from the container's root user.
 3. **Git Identity** — Your host's `git config` identity (`user.name`, `user.email`) is read and applied inside the container, so commits are attributed correctly.
 4. **Workspace Context & Memory** — At startup, Syl auto-injects a directory listing, `git status`, and any persistent memories from previous sessions into the system prompt, so she knows the project and your preferences without burning a tool call.
-5. **Conversation Loop** — You chat with Syl in a terminal REPL. Responses stream in real-time via Server-Sent Events (SSE).
-6. **Tool Execution** — When Claude decides to run commands, Syl executes them inside the sandboxed container and feeds results back into the conversation. Parallel tool calls are supported. In addition to `run_bash`, Syl has `memory_write` and `memory_read` tools for persistent cross-session memory.
+5. **Conversation Loop** — You chat with Syl in a terminal REPL. Responses stream in real-time — via Server-Sent Events (SSE) on the Anthropic backend, or binary EventStream on the Bedrock backend.
+6. **Tool Execution** — When Claude decides to run commands, Syl executes them inside the sandboxed container and feeds results back into the conversation. Parallel tool calls are supported. Syl has five built-in tools: `run_bash`, `memory_write`, `memory_read`, `workflow_write`, and `workflow_delete`.
 7. **Context Compaction** — When the conversation grows beyond `max-history` messages, Syl asks Claude (via a fast `claude-haiku-4-5` model) to summarize older messages into a compact digest. The most recent `compact-keep` messages are kept verbatim. A role-boundary correction ensures the kept messages always start on a plain `user` message. If summarization fails, a simple trim fallback ensures the conversation continues gracefully.
-8. **Container Health Check** — Before every command execution, Syl checks that the container is still alive. If it has died (OOM, manual removal, etc.), she automatically resummmons and reconfigures it before proceeding.
+8. **Container Health Check** — Before every command execution, Syl checks that the container is still alive. If it has died (OOM, manual removal, etc.), she automatically resummons and reconfigures it before proceeding.
 9. **Safety** — Your code runs in an isolated, memory-limited (2GB) container. Nothing touches your host system directly. SSH keys are mounted read-only for extra protection.
 
 ## Prerequisites
 
 - [Babashka](https://babashka.org/) (bb)
 - [Podman](https://podman.io/)
-- An [Anthropic API key](https://console.anthropic.com/)
+- **For the Anthropic backend (default):** An [Anthropic API key](https://console.anthropic.com/)
+- **For the Bedrock backend:** AWS credentials with Bedrock access (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and optionally `AWS_REGION`)
 
 ## Quick Start
 
@@ -95,8 +96,9 @@ You: _
 Usage: ./syl.bb [options]
 
 Options:
-  --model <name>       Anthropic model (overrides SYL_MODEL env var)
+  --model <name>       Model name (overrides SYL_MODEL env var)
                        Default: claude-sonnet-4-6
+  --backend <name>     API backend: 'anthropic' (default) or 'bedrock'
   --timeout <secs>     Command execution timeout in seconds (default: 60)
   --thinking <budget>  Enable extended thinking with given token budget
   --resume             Resume previous conversation session
@@ -104,18 +106,28 @@ Options:
   --help               Show this help message
 
 Environment:
-  ANTHROPIC_API_KEY    (required) Your Anthropic API key
-  SYL_MODEL            Anthropic model override (--model takes precedence)
+  ANTHROPIC_API_KEY    (required for anthropic backend) Your Anthropic API key
+  SYL_MODEL            Model override (--model takes precedence)
+  SYL_BACKEND          Backend override: 'anthropic' or 'bedrock' (--backend takes precedence)
+
+  AWS (required for bedrock backend):
+  AWS_ACCESS_KEY_ID      Your AWS access key
+  AWS_SECRET_ACCESS_KEY  Your AWS secret key
+  AWS_REGION             AWS region (default: us-east-1)
+  AWS_SESSION_TOKEN      (optional) For temporary/session credentials
 ```
 
 ### Examples
 
 ```bash
-# Standard session
+# Standard session (Anthropic backend)
 ./syl.bb
 
 # Use a different model
 ./syl.bb --model claude-opus-4-6
+
+# Use AWS Bedrock instead of Anthropic
+./syl.bb --backend bedrock --model claude-sonnet-4-6
 
 # Enable extended thinking with a 4000-token budget
 ./syl.bb --thinking 4000
@@ -135,7 +147,7 @@ Type these at the `You:` prompt during a session:
 |----------------------|----------------------------------------------------------|
 | `/help`              | Show available slash commands                            |
 | `/clear`             | Reset conversation history (container is preserved)      |
-| `/status`            | Show session stats: model, tokens used, message count    |
+| `/status`            | Show session stats: model, backend, tokens used, message count |
 | `/save`              | Save conversation to `.syl/session.json` for later `--resume` |
 | `/workflow`          | List available workflow pipelines                        |
 | `/workflow <name>`   | Run a named workflow pipeline                            |
@@ -149,7 +161,7 @@ These top-level variables are defined at the top of `syl.bb` and can be adjusted
 | Variable           | Default              | Description                                                   |
 |--------------------|----------------------|---------------------------------------------------------------|
 | `container-name`   | `syl-agent`          | Name of the Podman container                                  |
-| `model`            | `claude-sonnet-4-6`  | Anthropic model. Override with `--model` flag or `SYL_MODEL` env var |
+| `model`            | `claude-sonnet-4-6`  | Claude model. Override with `--model` flag or `SYL_MODEL` env var |
 | `compaction-model` | `claude-haiku-4-5`   | Lighter model used for context summarization                  |
 | `max-tool-output`  | `8000`               | Max characters stored per tool result in history              |
 | `max-history`      | `30`                 | Max messages kept in the conversation sliding window          |
@@ -158,94 +170,57 @@ These top-level variables are defined at the top of `syl.bb` and can be adjusted
 | `max-retries`      | `5`                  | API retry attempts on rate-limit (429/529)                    |
 | `rate-limit-budget` | `30000`             | Input tokens per minute budget for proactive throttling       |
 
-The following values can be set at runtime via CLI flags or are hardcoded inline:
+The following values can be set at runtime via CLI flags or environment variables:
 
-| Value          | How to change              | Default | Description                   |
-|----------------|----------------------------|---------|-------------------------------|
-| `cmd-timeout-ms` | `--timeout <secs>` flag  | `60s`   | Command execution timeout     |
-| `thinking-budget` | `--thinking <budget>` flag | `nil` (disabled) | Extended thinking token budget |
-| `memory`       | Edit `start-container`     | `2g`    | Container memory limit        |
-| `image`        | Edit `start-container`     | `mcr.microsoft.com/devcontainers/base:ubuntu` | Container base image |
+| Value          | How to change                                                              |
+|----------------|---------------------------------------------------------------------------|
+| Model          | `--model <name>` flag or `SYL_MODEL` env var                              |
+| Backend        | `--backend <name>` flag or `SYL_BACKEND` env var (`anthropic` or `bedrock`) |
+| Timeout        | `--timeout <secs>` flag                                                   |
+| Thinking budget | `--thinking <tokens>` flag                                               |
 
-## Features
+## Under the Hood
 
-### 🤖 AI & Conversation
+### Dual Backend Architecture
 
-- **Streaming Responses** — Text streams word-by-word via SSE as Claude generates it. Tool use and text are parsed incrementally from the event stream.
-- **Extended Thinking** — Enable Claude's extended thinking with `--thinking <budget>`. Thinking streams in dim terminal text so you can follow the reasoning in real-time.
-- **Context Compaction** — When the conversation exceeds `max-history` messages, older messages are summarized by `claude-haiku-4-5` into a concise digest. The most recent `compact-keep` messages are kept verbatim with role-boundary correction.
-- **Token Usage Tracking** — Every API call's input/output tokens are accumulated. View totals at any time with `/status`.
-- **Parallel Tool Execution** — Claude can issue multiple `run_bash` calls in a single response; Syl executes them all and returns results together.
+Syl supports two API backends, selectable at runtime:
 
-### 🛡️ Safety & Isolation
+| Backend      | Transport         | Auth                          | Notes                                    |
+|--------------|-------------------|-------------------------------|------------------------------------------|
+| `anthropic`  | HTTPS + SSE       | `ANTHROPIC_API_KEY`           | Default. Direct Anthropic API.           |
+| `bedrock`    | HTTPS + EventStream (binary) | AWS Sig V4 credentials | Routes through AWS Bedrock. Useful for enterprise/VPC setups. |
 
-- **Containerized Execution** — All commands run inside an isolated, memory-limited (2GB) Podman container. Nothing touches your host system directly.
-- **Container Health Check** — Before each command, Syl verifies the container is running. If it has died, she automatically re-summons and reconfigures it.
-- **Read-Only SSH Mount** — Your host `~/.ssh` is bind-mounted read-only. Keys are copied to `/tmp/.ssh` with corrected ownership and permissions, and a wrapper script ensures all SSH invocations (including `git push/pull`) use them correctly.
-- **Tool Output Truncation** — Long command outputs are automatically truncated to `max-tool-output` characters to keep the context window healthy.
-- **Configurable Timeout** — Command execution timeout defaults to 60s but can be set with `--timeout <secs>`.
+Both backends support streaming, tool use, extended thinking, and context compaction. The Bedrock backend implements AWS Signature Version 4 request signing and parses the binary EventStream framing format natively — no AWS SDK required.
 
-### 🧠 Memory & Context
+**Supported Bedrock model IDs:**
 
-- **Persistent Memory** — Syl stores and retrieves notes across sessions using `memory_write` and `memory_read` tools. Memories are markdown files in `.syl/memory/`, organized by topic key.
-- **Auto-Injected Context** — At startup, Syl injects a directory listing, `git status`, and all saved memories into the system prompt — no tool call needed.
-- **Conversation Persistence** — `/save` writes the conversation to `.syl/session.json`. Use `--resume` to pick up where you left off after a crash or restart.
-- **Diff Preview (Transparency Oath)** — Before modifying any file, Syl shows the intended changes using `diff` or `git diff` so you can review before anything is applied.
+| Friendly name          | Bedrock model ID                                        |
+|------------------------|---------------------------------------------------------|
+| `claude-sonnet-4-6`    | `anthropic.claude-sonnet-4-6-20250514-v1:0`             |
+| `claude-haiku-4-5`     | `anthropic.claude-haiku-4-5-20251001-v1:0`              |
+| `claude-opus-4-6`      | `anthropic.claude-opus-4-6-20250514-v1:0`               |
 
-### 🔄 Workflow Automation
-
-- **Pipeline Definitions** — Define multi-step workflows as markdown files in `.syl/workflows/`. Each step is a list item with a label and a backtick-enclosed bash command.
-- **Conversational Management** — Ask Syl to create, edit, or delete workflows through natural conversation. She uses dedicated `workflow_write` and `workflow_delete` tools with uniqueness enforcement — no accidental overwrites.
-- **Sequential Execution** — `/workflow <name>` runs steps one by one inside the container. Each step's command and output are displayed in real-time.
-- **Fail-Fast** — If any step fails, the workflow stops immediately and reports which step failed.
-- **Built-in Workflows** — Syl ships with example workflows: `ship` (test → stage → commit → push) and `check` (test → status → log).
-
-**Example workflow** (`.syl/workflows/ship.md`):
-
-```markdown
-# Ship
-Test, commit, and push changes to remote.
-
-- Run tests: `bb test`
-- Stage all changes: `git add -A`
-- Commit changes: `git commit -m "update"`
-- Push to remote: `git push`
-```
-
-### 🛠️ Developer Experience
-
-- **Anthropic Claude Integration** — Powered by `claude-sonnet-4-6` (default) via the Anthropic Messages API. Override with `--model` or `SYL_MODEL`.
-- **Prompt Caching** — The system prompt and tools include `cache_control` markers so Anthropic caches them across turns, reducing cost and rate limit pressure.
-- **Rate-Limit Resilience** — Three layers of defense: proactive token-per-minute budgeting, exponential backoff retry on 429/529 errors, and `retry-after` header support.
-- **Git Identity Forwarding** — Your host's `user.name` and `user.email` are applied inside the container so commits are attributed correctly.
-- **Slash Commands** — `/help`, `/clear`, `/status`, `/save`, `/workflow`, `/exit`, `/quit` for session control without leaving the REPL.
-- **Graceful Shutdown** — `/exit`, `/quit`, and Ctrl+D trigger clean teardown. A JVM shutdown hook also handles Ctrl+C / SIGINT.
-- **Splash Banner** — A styled ASCII art banner displays the First Ideal and active session config on startup. Suppress with `--no-banner`.
-- **Setup Script** — `./setup.sh` checks for all dependencies (Babashka, Podman, Git), helps configure `ANTHROPIC_API_KEY`, pre-pulls the container image, and reports any issues with install instructions.
-
-## Architecture Notes
-
-### SSH Forwarding Strategy
-
-The SSH setup solves a cross-platform ownership problem:
+### SSH Key Forwarding
 
 ```
-Host (~/.ssh, UID 501) ──read-only mount──▶ Container (/root/.ssh, UID 0)
-                                                  │
-                                           copy to /tmp/.ssh
-                                           chown root:root
-                                           chmod 700 (dir) / 600 (keys)
-                                                  │
-                                           /usr/local/bin/ssh wrapper
-                                           (uses -F /tmp/.ssh/config
-                                            -o UserKnownHostsFile=...)
+Host ~/.ssh/  (read-only mount)
+       │
+       ▼
+  /tmp/.ssh/  (copied inside container)
+       │      chown root:root
+       │      chmod 700 (dir) / 600 (keys)
+       │
+       ▼
+  /usr/local/bin/ssh wrapper
+  (uses -F /tmp/.ssh/config
+   -o UserKnownHostsFile=...)
 ```
 
 SSH refuses to use key files it doesn't own. By mounting read-only and copying to a root-owned location, we get secure key access without modifying the host's files.
 
 ### Streaming Architecture
 
-Syl uses the Anthropic streaming API with Server-Sent Events (SSE):
+**Anthropic backend** uses Server-Sent Events (SSE):
 
 ```
 HTTP POST (stream: true)
@@ -261,6 +236,22 @@ HTTP POST (stream: true)
   │  message_delta ──▶ capture stop_reason + final usage
   │  [DONE] ─────────▶ build result map
   └─────────────────┘
+```
+
+**Bedrock backend** uses binary EventStream framing (parsed natively, no SDK):
+
+```
+HTTP POST (binary response body)
+         │
+         ▼
+  ┌──────────────────────────┐
+  │  EventStream Frame Loop  │
+  │                          │
+  │  Read 12-byte prelude ───▶ total_len + headers_len + prelude_crc
+  │  Read headers ───────────▶ :event-type (e.g. "chunk")
+  │  Read payload ───────────▶ JSON with "bytes" field (base64)
+  │  Decode + dispatch ──────▶ same SSE event handler as Anthropic
+  └──────────────────────────┘
 ```
 
 Text deltas are printed immediately for a responsive feel. Tool use JSON is accumulated and parsed at block completion. Thinking deltas render in dim terminal text.
@@ -333,6 +324,31 @@ Syl's long-term memory is stored as plain markdown files in `.syl/memory/`:
 - **Auto-injection** — At startup, all memory files are loaded and injected into the system prompt alongside workspace context, so Syl has full recall from turn one.
 - **Human-readable** — Memory files are plain markdown, easy to inspect, edit, or delete manually.
 
+### Workflows
+
+Workflows are multi-step pipelines defined as markdown files in `.syl/workflows/`. Syl can create, list, run, and delete them through conversation using the `workflow_write` and `workflow_delete` tools, or you can author them manually.
+
+**Format:**
+
+```markdown
+# Ship
+Test and push to origin.
+
+- Run tests: `bb test`
+- Stage changes: `git add -A`
+- Commit: `git commit -m "chore: release"`
+- Push: `git push`
+```
+
+**Slash commands:**
+
+```
+/workflow          — list all workflows
+/workflow ship     — run the "ship" workflow
+```
+
+Each step runs sequentially inside the container. Output is printed as steps complete.
+
 ### Container Health Check
 
 Before every `run-in-container` call, `ensure-container!` runs `podman inspect` to verify the container is in a running state. If it is not, `start-container` is called to re-summon and reconfigure the environment transparently.
@@ -348,7 +364,7 @@ Syl operates under a strict code of honor:
 
 ## License
 
-This project is provided as-is. Use it with honor.
+MIT License — Copyright (c) 2025 mcwellingtodman
 
 ---
 
