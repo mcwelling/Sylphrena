@@ -101,6 +101,9 @@ Options:
   --backend <name>     API backend: 'anthropic' (default) or 'bedrock'
   --timeout <secs>     Command execution timeout in seconds (default: 60)
   --thinking <budget>  Enable extended thinking with given token budget
+  --rate-limit <tpm>   Input tokens-per-minute budget (default: 30000)
+                       Raise if your Anthropic tier allows more (e.g. 80000 for Tier 2)
+                       Tip: use --backend bedrock to bypass Anthropic rate limits entirely
   --resume             Resume previous conversation session
   --no-banner          Skip the startup splash banner
   --help               Show this help message
@@ -109,6 +112,7 @@ Environment:
   ANTHROPIC_API_KEY    (required for anthropic backend) Your Anthropic API key
   SYL_MODEL            Model override (--model takes precedence)
   SYL_BACKEND          Backend override: 'anthropic' or 'bedrock' (--backend takes precedence)
+  SYL_RATE_LIMIT       Token-per-minute budget override (--rate-limit takes precedence)
 
   AWS (required for bedrock backend):
   AWS_ACCESS_KEY_ID      Your AWS access key
@@ -178,6 +182,7 @@ The following values can be set at runtime via CLI flags or environment variable
 | Backend        | `--backend <name>` flag or `SYL_BACKEND` env var (`anthropic` or `bedrock`) |
 | Timeout        | `--timeout <secs>` flag                                                   |
 | Thinking budget | `--thinking <tokens>` flag                                               |
+| Rate limit      | `--rate-limit <tpm>` flag or `SYL_RATE_LIMIT` env var                   |
 
 ## Under the Hood
 
