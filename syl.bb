@@ -22,6 +22,7 @@
         "--model"      (recur (drop 2 args) (assoc acc :model      (second args)))
         "--timeout"    (recur (drop 2 args) (assoc acc :timeout    (parse-long (second args))))
         "--thinking"   (recur (drop 2 args) (assoc acc :thinking   (parse-long (second args))))
+        "--rate-limit" (recur (drop 2 args) (assoc acc :rate-limit (parse-long (second args))))
         "--backend"    (recur (drop 2 args) (assoc acc :backend   (second args)))
         "--resume"     (recur (drop 1 args) (assoc acc :resume     true))
         "--no-banner"  (recur (drop 1 args) (assoc acc :no-banner  true))
@@ -41,6 +42,9 @@
   (println "  --backend <name>     API backend: 'anthropic' (default) or 'bedrock'")
   (println "  --timeout <secs>     Command execution timeout in seconds (default: 60)")
   (println "  --thinking <budget>  Enable extended thinking with given token budget")
+  (println "  --rate-limit <tpm>   Input tokens-per-minute budget (default: 30000)")
+  (println "                       Raise this if your Anthropic tier allows more (e.g. 80000 for Tier 2)")
+  (println "                       Tip: use --backend bedrock to bypass Anthropic rate limits entirely")
   (println "  --resume             Resume previous conversation session")
   (println "  --no-banner          Skip the startup splash banner")
   (println "  --help               Show this help message")
@@ -49,6 +53,7 @@
   (println "  ANTHROPIC_API_KEY    (required for anthropic backend) Your Anthropic API key")
   (println "  SYL_MODEL            Model override (--model takes precedence)")
   (println "  SYL_BACKEND          Backend override: 'anthropic' or 'bedrock' (--backend takes precedence)")
+  (println "  SYL_RATE_LIMIT       Token-per-minute budget override (--rate-limit takes precedence)")
   (println)
   (println "  AWS (required for bedrock backend):")
   (println "  AWS_ACCESS_KEY_ID      Your AWS access key")
@@ -220,7 +225,9 @@
 
 ;; --- Rate Limit Budgeting ---
 ;; Track input tokens per minute and proactively throttle before hitting the limit.
-(def rate-limit-budget 30000)
+(def rate-limit-budget (or (:rate-limit cli-args)
+                           (some-> (System/getenv "SYL_RATE_LIMIT") parse-long)
+                           30000))
 (def rate-window-ms    60000)
 (def recent-api-calls  (atom []))
 
@@ -586,7 +593,28 @@
       :text (str system-instruction "\n\n" workspace-context (or memory-section ""))
       :cache_control {:type "ephemeral"}}]))
 
-;; --- 7. Context Compaction ---
+;; --- 7. Per-Turn Message Caching ---
+;; Anthropic allows up to 4 cache breakpoints per request. The system prompt uses 1.
+;; We use up to 2 more on the most recent stable assistant turns, so only the newest
+;; messages are "fresh" on each call — cutting effective input tokens by 50-80%.
+(defn attach-cache-breakpoints [messages]
+  (let [eligible-idxs (->> (map-indexed vector messages)
+                           (filter (fn [[_ m]]
+                                     (and (= (:role m) "assistant")
+                                          (vector? (:content m)))))
+                           (map first)
+                           (take-last 2))]
+    (reduce (fn [msgs idx]
+              (update-in msgs [idx :content]
+                (fn [blocks]
+                  (mapv #(if (= (:type %) "text")
+                           (assoc % :cache_control {:type "ephemeral"})
+                           %)
+                        blocks))))
+            (vec messages)
+            eligible-idxs)))
+
+;; --- 8. Context Compaction ---
 (defn summarize-messages [messages]
   (let [sys-text (str "You are a conversation summarizer. Produce a concise summary of the "
                       "conversation below, preserving: key decisions made, files created or "
@@ -773,11 +801,12 @@
 
 ;; --- 9. Claude API Call (Streaming) ---
 (defn call-anthropic-once [messages system-blocks]
-  (let [payload (cond-> {:model      model
-                         :max_tokens effective-max-tokens
-                         :system     system-blocks
-                         :tools      tools-schema
-                         :messages   messages
+  (let [messages (attach-cache-breakpoints messages)
+        payload  (cond-> {:model      model
+                          :max_tokens effective-max-tokens
+                          :system     system-blocks
+                          :tools      tools-schema
+                          :messages   messages
                          :stream     true}
                   thinking-budget
                   (assoc :thinking {:type "enabled" :budget_tokens thinking-budget}))
@@ -799,7 +828,8 @@
         (build-result)))))
 
 (defn call-bedrock-once [messages system-blocks]
-  (let [br-model (bedrock-model-id model)
+  (let [messages (attach-cache-breakpoints messages)
+        br-model (bedrock-model-id model)
         path     (str "/model/" br-model "/invoke-with-response-stream")
         host     (str "bedrock-runtime." aws-region ".amazonaws.com")
         url      (str "https://" host path)
@@ -892,6 +922,7 @@
                       "\n    Backend:        " backend
                       (when thinking-budget (str "\n    Thinking:       " thinking-budget " token budget"))
                       "\n    Timeout:        " (/ cmd-timeout-ms 1000) "s"
+                      "\n    Rate limit:     " rate-limit-budget " TPM"
                       "\n    API calls:      " calls
                       "\n    Input tokens:   " input
                       "\n    Output tokens:  " output

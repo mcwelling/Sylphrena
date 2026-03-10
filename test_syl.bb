@@ -698,6 +698,64 @@
       (is (= 1 (count (:raw-model-content result)))))))
 
 ;; ============================================================
+;; 13. Rate Limit Budget and Cache Breakpoints
+;; ============================================================
+
+(deftest test-parse-cli-args-rate-limit
+  (is (= {:rate-limit 80000}
+         (parse-cli-args ["--rate-limit" "80000"])))
+  (is (= {:model "claude-sonnet-4-6" :rate-limit 50000}
+         (parse-cli-args ["--model" "claude-sonnet-4-6" "--rate-limit" "50000"]))))
+
+(deftest test-attach-cache-breakpoints-no-eligible
+  ;; No assistant messages with vector content → messages unchanged
+  (let [messages [{:role "user" :content "hello"}
+                  {:role "assistant" :content "world"}]]
+    (is (= messages (attach-cache-breakpoints messages)))))
+
+(deftest test-attach-cache-breakpoints-one-turn
+  ;; Single assistant turn with vector content → cache_control added to text block
+  (let [messages [{:role "user" :content "hi"}
+                  {:role "assistant"
+                   :content [{:type "text" :text "hello"}]}]
+        result (attach-cache-breakpoints messages)]
+    (is (= {:type "ephemeral"}
+           (get-in result [1 :content 0 :cache_control])))))
+
+(deftest test-attach-cache-breakpoints-two-turns
+  ;; Two eligible assistant turns → both get cache_control
+  (let [messages [{:role "user" :content "first"}
+                  {:role "assistant" :content [{:type "text" :text "reply 1"}]}
+                  {:role "user" :content "second"}
+                  {:role "assistant" :content [{:type "text" :text "reply 2"}]}]
+        result (attach-cache-breakpoints messages)]
+    (is (= {:type "ephemeral"} (get-in result [1 :content 0 :cache_control])))
+    (is (= {:type "ephemeral"} (get-in result [3 :content 0 :cache_control])))))
+
+(deftest test-attach-cache-breakpoints-only-last-two
+  ;; Three eligible turns → only the last two get cache_control
+  (let [messages [{:role "user" :content "a"}
+                  {:role "assistant" :content [{:type "text" :text "1"}]}
+                  {:role "user" :content "b"}
+                  {:role "assistant" :content [{:type "text" :text "2"}]}
+                  {:role "user" :content "c"}
+                  {:role "assistant" :content [{:type "text" :text "3"}]}]
+        result (attach-cache-breakpoints messages)]
+    (is (nil? (get-in result [1 :content 0 :cache_control])))
+    (is (= {:type "ephemeral"} (get-in result [3 :content 0 :cache_control])))
+    (is (= {:type "ephemeral"} (get-in result [5 :content 0 :cache_control])))))
+
+(deftest test-attach-cache-breakpoints-skips-tool-use-blocks
+  ;; Only text blocks get cache_control; tool_use blocks are left alone
+  (let [messages [{:role "user" :content "run it"}
+                  {:role "assistant"
+                   :content [{:type "tool_use" :id "x" :name "run_bash" :input {}}
+                              {:type "text" :text "done"}]}]
+        result (attach-cache-breakpoints messages)]
+    (is (nil? (get-in result [1 :content 0 :cache_control])))
+    (is (= {:type "ephemeral"} (get-in result [1 :content 1 :cache_control])))))
+
+;; ============================================================
 ;; Run all tests
 ;; ============================================================
 

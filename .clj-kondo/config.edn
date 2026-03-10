@@ -1,0 +1,43 @@
+{;; Suppress warnings for Babashka-specific globals and patterns
+ :linters
+ {:invalid-arity         {:level :error}
+  :unresolved-symbol     {:level :warning
+                          :exclude [;; Babashka sci globals
+                                    *command-line-args*
+                                    *input*
+                                    bb/edn
+                                    ;; Custom dynamic var defined in syl.bb
+                                    *main-script*]}
+  :unresolved-namespace  {:level :warning}
+  :unused-binding        {:level :warning
+                          :exclude-when-used-in-bindings [_]}
+  :unused-private-var    {:level :warning}
+  :redundant-do          {:level :warning}
+  :redundant-let         {:level :warning}
+  :type-mismatch         {:level :off}   ;; too many false positives with Java interop
+
+  ;; Warn on shadowed vars (e.g. (let [input ...] inside a fn named input))
+  :shadowed-var          {:level :warning}
+
+  ;; Warn when a namespace alias is declared but never used
+  :unused-namespace      {:level :warning}
+
+  ;; Warn on mismatched :require/:use
+  :misplaced-docstring   {:level :warning}}
+
+ ;; Java interop classes used in syl.bb — suppress unresolved-var warnings
+ :lint-as
+ {babashka.process/shell clojure.core/identity
+  babashka.process/process clojure.core/identity}
+
+ ;; Tell clj-kondo about commonly used Babashka-provided namespaces
+ ;; so it doesn't complain about them being unresolved
+ :skip-comments true
+
+ ;; Hooks — none currently, placeholder for future custom hooks
+ :hooks {}
+
+ ;; Config for specific namespace aliases used in the project
+ :ns-groups
+ [{:langs [:clj :bb]
+   :ns-pattern "user"}]}
