@@ -8,7 +8,7 @@ Syl is a lightweight AI agent harness written in [Babashka](https://babashka.org
 
 ## How It Works
 
-```
+```markdown
 ┌──────────────┐       ┌──────────────────┐  streaming  ┌──────────────────────────┐
 │  You (REPL)  │ ───▶  │  syl.bb (Agent)  │ ◀═══════▶  │  Claude API              │
 │              │ ◀───  │                  │  SSE/ES     │  (Anthropic or Bedrock)  │
@@ -66,7 +66,7 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 
 Syl will summon her container, forward your git and SSH configuration, and greet you with a styled banner. Two status bars are pinned to the top and bottom of the terminal — the banner and all conversation output scroll between them:
 
-```
+```markdown
 Sylphrena ─ ↑ 0  ↓ 0  ·  0 calls ─── TPM ░░░░░░░░ 0% ─── 0 msgs ────────────────
 ≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋
 ✦ · * · ✦ · * · ✦ · * · ✦ · * · ✦ · * · ✦ · * · ✦ · * · ✦ · * · ✦ · * · ✦ · * ·
@@ -105,7 +105,7 @@ You: _
 
 ## CLI Options
 
-```
+```markdown
 Usage: ./syl.bb [options]
 
 Options:
@@ -220,7 +220,7 @@ Both backends support streaming, tool use, extended thinking, and context compac
 
 ### SSH Key Forwarding
 
-```
+```markdown
 Host ~/.ssh/  (read-only mount)
        │
        ▼
@@ -240,7 +240,7 @@ SSH refuses to use key files it doesn't own. By mounting read-only and copying t
 
 **Anthropic backend** uses Server-Sent Events (SSE):
 
-```
+```markdown
 HTTP POST (stream: true)
          │
          ▼
@@ -258,7 +258,7 @@ HTTP POST (stream: true)
 
 **Bedrock backend** uses binary EventStream framing (parsed natively, no SDK):
 
-```
+```markdown
 HTTP POST (binary response body)
          │
          ▼
@@ -286,7 +286,7 @@ Three layers of defense against rate limits:
 
 Long conversations are managed through intelligent summarization rather than naive truncation:
 
-```
+```markdown
 [msg 1] [msg 2] ... [msg 20] [msg 21] ... [msg 30]
  \_________________________/  \____________________/
           │                          │
@@ -315,7 +315,7 @@ If summarization fails, the fallback trims to the keep batch so the conversation
 
 An atom accumulates token counts across all API calls (both main calls and compaction calls):
 
-```
+```markdown
 session-tokens: {:input 0 :output 0 :calls 0}
 ```
 
@@ -325,7 +325,7 @@ session-tokens: {:input 0 :output 0 :calls 0}
 
 Syl's long-term memory is stored as plain markdown files in `.syl/memory/`:
 
-```
+```markdown
 .syl/
 ├── session.json              # Conversation history (ephemeral)
 ├── memory/
@@ -360,7 +360,7 @@ Test and push to origin.
 
 **Slash commands:**
 
-```
+```markdown
 /workflow          — list all workflows
 /workflow ship     — run the "ship" workflow
 ```
