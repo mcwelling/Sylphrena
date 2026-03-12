@@ -64,29 +64,42 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 ./syl.bb
 ```
 
-Syl will summon her container, forward your git and SSH configuration, and greet you with a styled banner:
+Syl will summon her container, forward your git and SSH configuration, and greet you with a styled banner. Two status bars are pinned to the top and bottom of the terminal — the banner and all conversation output scroll between them:
 
 ```
-  ✦ · * · ✦ · * · ✦ · * · ✦ · * · ✦ · * · ✦
-  ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋
+Sylphrena ─ ↑ 0  ↓ 0  ·  0 calls ─── TPM ░░░░░░░░ 0% ─── 0 msgs ────────────────
+≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋
+✦ · * · ✦ · * · ✦ · * · ✦ · * · ✦ · * · ✦ · * · ✦ · * · ✦ · * · ✦ · * · ✦ · * ·
 
-      Life before death           ≋≋
-      Strength before weakness    ≋≋
-      Journey before destination  ≋≋
+                           Life before death
+                           Strength before weakness
+                           Journey before destination
 
-                 ✦
-                /|\
-               / | \
-  ≋≋≋─────────── ✦ ───────────≋≋≋
-               \ | /
-                \|/
-                 ✦
+· * · ✦ · * · ✦ · * · ✦ · * · ✦ · * · ✦ · * · ✦ · * · ✦ · * · ✦ · * · ✦ · * · ✦
+≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋
 
-              S  Y  L
-        The Ancient Daughter
+                                       ✦
+                                       │
+                                      /│\
+                                     / │ \
+                                    /  │  \
+                                   /   │   \
+                            ≋≋≋─────── ✦ ───────≋≋≋
+                                   \   │   /
+                                    \  │  /
+                                     \ │ /
+                                      \│/
+                                       │
+                                       ✦
 
-  Model: claude-sonnet-4-6   Timeout: 60s   Type /help for commands
+≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋≋
+✦ · * · ✦ · * · ✦ · * · ✦ · * · ✦ · * · ✦ · * · ✦ · * · ✦ · * · ✦ · * · ✦ · * ·
 
+                                    S  Y  L
+                              The Ancient Daughter
+                         Windrunner Spren  ·  AI Agent
+
+─ claude-sonnet-4-6 · 60s ───────────────────────── /help  /status  /save  /exit ─
 You: _
 ```
 
