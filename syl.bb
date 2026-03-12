@@ -33,6 +33,14 @@
 
 (def ^:dynamic *main-script* (= *file* (System/getProperty "babashka.file")))
 
+(def terminal
+  (when *main-script*
+    (-> (TerminalBuilder/builder) (.system true) (.build))))
+
+(def line-reader
+  (when (and *main-script* terminal)
+    (-> (LineReaderBuilder/builder) (.terminal terminal) (.build))))
+
 (when (and *main-script* (:help cli-args))
   (println "Usage: ./syl.bb [options]")
   (println)
@@ -230,6 +238,33 @@
                            30000))
 (def rate-window-ms    60000)
 (def recent-api-calls  (atom []))
+(def container-stats   (atom nil))  ; {:cpu "0.05%" :mem "2.7MB" :cpu-pct 0.05 :mem-pct 0.13}
+
+(defn poll-container-stats! []
+  (try
+    (let [result (shell {:continue true :out :string :err :string}
+                        (str "podman stats --no-stream --format json " container-name))
+          data   (-> result :out str/trim json/parse-string first)]
+      (when data
+        (let [cpu-s    (get data "cpu_percent" "0%")
+              mem-s    (get data "mem_usage" "")
+              mem-pct-s (get data "mem_percent" "0%")
+              cpu-pct  (parse-double (str/replace cpu-s "%" ""))
+              mem-pct  (parse-double (str/replace mem-pct-s "%" ""))
+              mem-used (first (str/split mem-s #" / "))]
+          (reset! container-stats {:cpu cpu-s :mem mem-used
+                                   :cpu-pct (or cpu-pct 0.0)
+                                   :mem-pct (or mem-pct 0.0)}))))
+    (catch Exception _ nil)))
+
+(defn start-stats-poller! []
+  (doto (Thread. (fn []
+                   (loop []
+                     (poll-container-stats!)
+                     (Thread/sleep 5000)
+                     (recur))))
+    (.setDaemon true)
+    (.start)))
 
 (defn prune-old-calls! []
   (let [cutoff (- (System/currentTimeMillis) rate-window-ms)]
@@ -563,6 +598,11 @@
          "\n... [truncated: " (count s) " total chars]")
     s))
 
+(defn fmt-num [n]
+  (cond (>= n 1000000) (str (quot n 1000000) "M")
+        (>= n 1000)    (str (quot n 1000) "k")
+        :else          (str n)))
+
 ;; --- 5. Workspace Context ---
 ;; Auto-inject project structure and git status so Syl knows what she's working with.
 (defn gather-workspace-context []
@@ -892,6 +932,75 @@
       (println "[Syl] Resuming previous session...")
       (vec (json/parse-string (slurp f) true)))))
 
+(defn move-to-scroll! []
+  ;; Move cursor to the last row of the scroll region so println output
+  ;; scrolls within the content area rather than landing below the bottom bar.
+  (when terminal
+    (let [h (.getHeight terminal)]
+      (when (pos? h)
+        (doto (.writer terminal)
+          (.print (str "\u001b[" (- h 3) ";1H\r\n"))
+          (.flush))))))
+
+;; --- 11a. Thinking Animation ---
+;; A windspren (≋) sweeps across the input row with a trailing wake (·) while
+;; Syl is working, replacing the user's submitted text with something alive.
+
+(defn- make-wind-frames [w]
+  (let [trail 5]
+    (vec
+      (concat
+        (for [pos (range (+ w trail))]
+          (apply str
+            (for [col (range w)]
+              (let [dist (- pos col)]
+                (cond
+                  (= dist 0)                       "≋"
+                  (and (> dist 0) (<= dist trail))  "·"
+                  :else                             " ")))))
+        ;; brief pause between sweeps
+        (repeat 5 (apply str (repeat w " ")))))))
+
+(defonce ^:private anim-stop (atom nil))
+
+(defn start-thinking-animation! []
+  (when terminal
+    (let [stop? (atom false)
+          h     (.getHeight terminal)
+          row   (dec h)
+          w     (max 10 (min 50 (.getWidth terminal)))
+          frames (make-wind-frames w)]
+      (reset! anim-stop stop?)
+      (doto (Thread.
+              (fn []
+                (loop [i 0]
+                  (when-not @stop?
+                    (doto (.writer terminal)
+                      (.print (str "\u001b7"
+                                   "\u001b[" row ";1H"
+                                   "\u001b[2K"
+                                   (nth frames (mod i (count frames)))
+                                   "\u001b8"))
+                      (.flush))
+                    (Thread/sleep 80)
+                    (recur (inc i))))))
+        (.setDaemon true)
+        (.start)))))
+
+(defn stop-thinking-animation! []
+  (when-let [s @anim-stop]
+    (reset! s true)
+    (reset! anim-stop nil))
+  (when terminal
+    (let [h (.getHeight terminal)]
+      (when (pos? h)
+        (doto (.writer terminal)
+          (.print (str "\u001b7"
+                       "\u001b[" (dec h) ";1H"
+                       "\u001b[2K"
+                       "\u001b8"))
+          (.flush))))))
+
 ;; --- 11. Slash Commands ---
 (def slash-help-text
   (str "\n  Available slash commands:\n"
@@ -905,6 +1014,7 @@
 
 (defn handle-slash [input messages]
   (let [trimmed (str/trim input)]
+    (move-to-scroll!)
     (cond
       (= trimmed "/help")
       (do (println slash-help-text)
@@ -964,67 +1074,211 @@
 
 ;; --- 12. Splash Banner ---
 (defn print-banner []
-  (let [r  "\u001b[0m"
-        b  "\u001b[1m"
-        cy "\u001b[96m"
-        ye "\u001b[93m"
-        wh "\u001b[97m"
-        mg "\u001b[95m"]
-    (println (str ye "  ✦ · * · ✦ · * · ✦ · * · ✦ · * · ✦ · * · ✦" r))
-    (println (str cy "  ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋" r))
+  (let [tw   (max 60 (if terminal (.getWidth terminal) 80))
+        r    "\u001b[0m"
+        b    "\u001b[1m"
+        cy   "\u001b[96m"
+        ye   "\u001b[93m"
+        wh   "\u001b[97m"
+        mg   "\u001b[95m"
+        dim  "\u001b[2m"
+        ;; Tile a pattern to exactly tw visible chars
+        tile (fn [pat]
+               (let [n (count pat) reps (quot tw n) extra (rem tw n)]
+                 (str (apply str (repeat reps pat))
+                      (when (pos? extra) (subs pat 0 extra)))))
+        ;; Left-pad to center content of given visible width
+        cpad (fn [vlen] (apply str (repeat (max 0 (quot (- tw vlen) 2)) " ")))
+        ;; Print a centered line
+        ln   (fn [s vlen] (println (str (cpad vlen) s)))]
+
+    (println (str cy (apply str (repeat tw "≋")) r))
+    (println (str ye (tile "✦ · * · ") r))
     (println)
-    (println (str "      " b wh "Life before death" r "           " cy "≋≋" r))
-    (println (str "      " wh "Strength before weakness" r "    " cy "≋≋" r))
-    (println (str "      " wh "Journey before destination" r "  " cy "≋≋" r))
+    ;; First Ideal — block-centered on longest line (26 chars)
+    (let [indent (cpad 26)]
+      (println (str indent b wh "Life before death" r))
+      (println (str indent wh "Strength before weakness" r))
+      (println (str indent wh "Journey before destination" r)))
     (println)
-    (println (str cy "  ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋" r))
+    (println (str ye (tile "· * · ✦ ") r))
+    (println (str cy (apply str (repeat tw "≋")) r))
     (println)
-    (println (str "                 " ye b "✦" r))
-    (println (str "                " wh "/|\\" r))
-    (println (str "               " wh "/ | \\" r))
-    (println (str "  " cy "≋≋≋" r wh "─────────── " ye b "✦" r wh " ───────────" r cy "≋≋≋" r))
-    (println (str "               " wh "\\ | /" r))
-    (println (str "                " wh "\\|/" r))
-    (println (str "                 " ye b "✦" r))
+    ;; Shardblade glyph — tapers 1→3→5→7→9 chars, wide crossguard, mirrors below
+    (ln (str ye b "✦" r)                                                        1)
+    (ln (str wh "│" r)                                                           1)
+    (ln (str wh "/│\\" r)                                                        3)
+    (ln (str wh "/ │ \\" r)                                                      5)
+    (ln (str wh "/  │  \\" r)                                                    7)
+    (ln (str wh "/   │   \\" r)                                                  9)
+    (ln (str cy "≋≋≋" r wh "───────" r ye b " ✦ " r wh "───────" r cy "≋≋≋" r) 23)
+    (ln (str wh "\\   │   /" r)                                                  9)
+    (ln (str wh "\\  │  /" r)                                                    7)
+    (ln (str wh "\\ │ /" r)                                                      5)
+    (ln (str wh "\\│/" r)                                                        3)
+    (ln (str wh "│" r)                                                           1)
+    (ln (str ye b "✦" r)                                                         1)
     (println)
-    (println (str "              " mg b "S  Y  L" r))
-    (println (str "        " wh "The Ancient Daughter" r))
+    (println (str cy (apply str (repeat tw "≋")) r))
+    (println (str ye (tile "✦ · * · ") r))
     (println)
-    (println (str cy "  ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋ ≋" r))
-    (println (str ye "  ✦ · * · ✦ · * · ✦ · * · ✦ · * · ✦ · * · ✦" r))
+    (ln (str mg b "S  Y  L" r)                                                   7)
+    (ln (str wh "The Ancient Daughter" r)                                        20)
+    (ln (str dim "Windrunner Spren  ·  AI Agent" r)                             29)
     (println)
-    (println (str "  Model: " wh model r "   Timeout: " wh (/ cmd-timeout-ms 1000) "s" r
-                  (when (not= backend "anthropic") (str "   Backend: " wh backend r))
-                  (when thinking-budget (str "   Thinking: " wh thinking-budget r))
-                  "   Type " mg "/help" r " for commands"))
     (println)))
 
 ;; --- 13. Shutdown Hook ---
-(when *main-script*
-  (.addShutdownHook (Runtime/getRuntime)
-    (Thread. (fn []
-      (println "\n[Syl] Cleaning up container...")
-      (try (nuke-container) (catch Exception _))))))
 
-;; --- 14. The Main Agent Loop ---
+;; --- 14. Status Bars ---
+
+(defn make-top-bar [messages]
+  ;; Token telemetry: ↑ in  ↓ out  · N calls ─── TPM bar P% ─── M msgs ─── cpu C% mem M ──────
+  (let [{:keys [input output calls]} @session-tokens
+        used-tpm  (do (prune-old-calls!)
+                      (reduce + 0 (map :tokens @recent-api-calls)))
+        pct       (int (min 100 (* 100 (/ (double used-tpm) rate-limit-budget))))
+        cstats    @container-stats
+        width     (max 60 (if terminal (.getWidth terminal) 80))
+        r         "\u001b[0m"
+        dim       "\u001b[2m"
+        wh        "\u001b[97m"
+        lb        "\u001b[1;94m"  ; bold light blue
+        tpm-color (cond (>= pct 80) "\u001b[91m"
+                        (>= pct 50) "\u001b[93m"
+                        :else       "\u001b[92m")
+        cpu-color (when cstats
+                    (cond (>= (:cpu-pct cstats) 80) "\u001b[91m"
+                          (>= (:cpu-pct cstats) 50) "\u001b[93m"
+                          :else                      "\u001b[92m"))
+        bar-w     8
+        filled    (int (* (/ pct 100.0) bar-w))
+        bar       (str tpm-color
+                       (apply str (repeat filled "█"))
+                       dim
+                       (apply str (repeat (- bar-w filled) "░"))
+                       r)
+        in-s      (fmt-num input)
+        out-s     (fmt-num output)
+        calls-s   (str calls)
+        pct-s     (str pct)
+        msgs-s    (str (count messages))
+        cpu-s     (when cstats (:cpu cstats))
+        mem-s     (when cstats (:mem cstats))
+        cstats-vis (if cstats (+ 5 (count cpu-s) 5 (count mem-s) 4) 0)
+                               ; " ─── " + cpu + " cpu " + mem + " mem"
+        visible   (+ 11                                ; "Sylphrena "
+                     2                                 ; "─ "
+                     2 (count in-s)                   ; "↑ " + in
+                     4 (count out-s)                  ; "  ↓ " + out
+                     5                                ; "  ·  "
+                     (count calls-s) 6                ; calls + " calls"
+                     5                                ; " ─── "
+                     4 bar-w 2 (count pct-s) 1        ; "TPM " + bar + " " + pct + "%"
+                     5                                ; " ─── "
+                     (count msgs-s) 5                 ; msgs + " msgs"
+                     cstats-vis
+                     1)                               ; " " before fill
+        fill      (str dim (apply str (repeat (max 0 (- width visible)) "─")) r)]
+    (str lb "Sylphrena" r
+         " " dim "─" r
+         " ↑ " wh in-s r
+         "  ↓ " wh out-s r
+         "  " dim "·" r "  "
+         wh calls-s r " calls"
+         " " dim "───" r " "
+         "TPM " bar " " tpm-color pct-s "%" r
+         " " dim "───" r " "
+         dim msgs-s r " msgs"
+         (when cstats
+           (str " " dim "───" r " "
+                cpu-color cpu-s r " cpu "
+                wh mem-s r " mem"))
+         " " fill)))
+
+(defn make-bottom-bar []
+  ;; Identity + shortcuts: ─ model · backend · Xs ───────────── /help /status /save /exit ─
+  (let [width     (max 60 (if terminal (.getWidth terminal) 80))
+        r         "\u001b[0m"
+        dim       "\u001b[2m"
+        cy        "\u001b[96m"
+        wh        "\u001b[97m"
+        mg        "\u001b[95m"
+        timeout-s (str (/ cmd-timeout-ms 1000) "s")
+        model-seg (str cy model r
+                       (when (not= backend "anthropic")
+                         (str dim " · " r wh backend r))
+                       dim " · " r wh timeout-s r)
+        model-vis (+ (count model)
+                     (if (not= backend "anthropic") (+ 3 (count backend)) 0)
+                     3 (count timeout-s))             ; " · " + timeout
+        right-vis 32  ; " /help  /status  /save  /exit ─" = 32 visible chars
+        left-vis  (+ 2 model-vis 1)                  ; "─ " + model-seg + " " before fill
+        fill      (str dim (apply str (repeat (max 0 (- width left-vis right-vis)) "─")) r)]
+    (str dim "─" r " " model-seg " " fill
+         " " mg "/help" r "  " mg "/status" r "  " mg "/save" r "  " mg "/exit" r " " dim "─" r)))
+
+;; --- 15. Persistent Status Bars (ANSI scroll region) ---
+;; Row 1        = top bar     (token telemetry)
+;; Rows 2..h-3  = scroll region (conversation content)
+;; Row h-2      = bottom bar  (model identity + shortcuts)
+;; Row h-1      = input prompt (JLine3 readLine)
+;; Row h        = overflow buffer (long input wraps here safely)
+
+(defn term-write! [s]
+  (when terminal
+    (doto (.writer terminal) (.print s) (.flush))))
+
+(defn setup-scroll-region! []
+  (let [h (if terminal (.getHeight terminal) 0)]
+    (when (pos? h)
+      (term-write! (str "\u001b[2;" (- h 3) "r"      ; scroll region = rows 2..h-3
+                        "\u001b[" (dec h) ";1H")))))  ; cursor to input row (h-1)
+
+(defn draw-status-bar! [messages]
+  (let [h (if terminal (.getHeight terminal) 0)]
+    (when (pos? h)
+      (term-write!
+        (str "\u001b7"                               ; save cursor
+             "\u001b[1;1H"  "\u001b[2K"             ; row 1:   top bar
+             (make-top-bar messages)
+             "\u001b[" (- h 2) ";1H" "\u001b[2K"    ; row h-2: bottom bar
+             (make-bottom-bar)
+             "\u001b8"                               ; restore cursor
+             "\u001b[" (dec h) ";1H")))))            ; then move to input row (h-1)
+
+(defn teardown-scroll-region! []
+  (let [h (if terminal (.getHeight terminal) 0)]
+    (when (pos? h)
+      (term-write!
+        (str "\u001b[r"                              ; reset scroll region
+             "\u001b[1;1H"  "\u001b[2K"             ; clear row 1
+             "\u001b[" (- h 2) ";1H" "\u001b[2K"    ; clear row h-2
+             "\u001b[" (dec h) ";1H" "\u001b[2K"    ; clear row h-1
+             "\u001b[" h ";1H" "\u001b[2K")))))
+
+;; --- 16. The Main Agent Loop ---
 (defn main-loop []
   (start-container)
+  (start-stats-poller!)
   (when-not (:no-banner cli-args)
     (print-banner))
 
-  (let [terminal    (-> (TerminalBuilder/builder) (.system true) (.build))
-        line-reader (-> (LineReaderBuilder/builder) (.terminal terminal) (.build))]
+  (setup-scroll-region!)
+  (draw-status-bar! [])
 
-    ;; Gather workspace context once at startup for the system prompt
-    (let [workspace-ctx  (gather-workspace-context)
+  ;; Gather workspace context once at startup for the system prompt
+  (let [workspace-ctx  (gather-workspace-context)
           system-blocks  (build-system-blocks workspace-ctx)
           initial-msgs   (if (:resume cli-args)
                            (or (load-session) [])
                            [])]
 
       (loop [messages initial-msgs]
+        (stop-thinking-animation!)
         (let [user-input (try
-                           (.readLine line-reader "\nYou: ")
+                           (do (draw-status-bar! messages)
+                               (.readLine line-reader "You: "))
                            (catch EndOfFileException _  nil)
                            (catch UserInterruptException _ nil))]
 
@@ -1032,6 +1286,8 @@
           (when (nil? user-input)
             (println "\n[Syl] Farewell. Life before death.")
             (System/exit 0))
+
+          (start-thinking-animation!)
 
         ;; Handle slash commands
         (if-let [slash-result (handle-slash user-input messages)]
@@ -1054,6 +1310,7 @@
                       (let [tool-uses    (:tool-uses llm-response)
                             tool-results (mapv (fn [tu]
                                                 (let [tool-name (:name tu)
+                                                      _ (move-to-scroll!)
                                                       output
                                                       (case tool-name
                                                         "run_bash"
@@ -1105,7 +1362,12 @@
                       :else
                       (conj current-msgs {:role "assistant" :content (:raw-model-content llm-response)}))))]
 
-            (recur (compact-history final-msgs)))))))))
+            (recur (compact-history final-msgs))))))))
 
 (when *main-script*
+  (.addShutdownHook (Runtime/getRuntime)
+    (Thread. (fn []
+      (try (teardown-scroll-region!) (catch Exception _))
+      (println "\n[Syl] Cleaning up container...")
+      (try (nuke-container) (catch Exception _)))))
   (main-loop))

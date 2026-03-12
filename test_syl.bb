@@ -756,6 +756,27 @@
     (is (= {:type "ephemeral"} (get-in result [1 :content 1 :cache_control])))))
 
 ;; ============================================================
+;; 14. fmt-num
+;; ============================================================
+
+(deftest test-fmt-num-zero
+  (is (= "0" (fmt-num 0))))
+
+(deftest test-fmt-num-small
+  (is (= "42"  (fmt-num 42)))
+  (is (= "999" (fmt-num 999))))
+
+(deftest test-fmt-num-thousands
+  (is (= "1k"   (fmt-num 1000)))
+  (is (= "1k"   (fmt-num 1999)))
+  (is (= "12k"  (fmt-num 12345)))
+  (is (= "999k" (fmt-num 999999))))
+
+(deftest test-fmt-num-millions
+  (is (= "1M" (fmt-num 1000000)))
+  (is (= "5M" (fmt-num 5500000))))
+
+;; ============================================================
 ;; Run all tests
 ;; ============================================================
 
