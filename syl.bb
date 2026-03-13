@@ -90,7 +90,9 @@
 (def anthropic-url    "https://api.anthropic.com/v1/messages")
 (def model            (or (:model cli-args) (System/getenv "SYL_MODEL") "claude-sonnet-4-6"))
 (def compaction-model "claude-haiku-4-5")
-(def max-tool-output  8000)
+(def max-tool-output        8000)
+(def extraction-threshold   3000)  ;; chars — trigger Haiku extraction above this
+(def extraction-input-limit 20000) ;; max chars fed to Haiku for extraction
 (def max-history      30)
 (def compact-keep     10)
 (def max-tokens       8096)
@@ -320,6 +322,13 @@
       (exec-setup "git" "config" "--global" "user.name"  git-name)
       (exec-setup "git" "config" "--global" "user.email" git-email))))
 
+(defn setup-tools []
+  (println "[Syl Setup] Installing base tools (python3, perl, jq, yq)...")
+  (exec-setup "bash" "-c"
+              (str "apt-get update -qq"
+                   " && apt-get install -y --no-install-recommends python3 perl jq yq"
+                   " && apt-get clean && rm -rf /var/lib/apt/lists/*")))
+
 (defn start-container []
   (nuke-container)
   (let [home    (System/getProperty "user.home")
@@ -333,7 +342,8 @@
                   "")
                 "--workdir /workspace "
                 "-it mcr.microsoft.com/devcontainers/base:ubuntu /bin/bash")))
-  (configure-git-and-ssh))
+  (configure-git-and-ssh)
+  (setup-tools))
 
 ;; --- 2. Container Health Check ---
 (defn container-alive? []
@@ -576,7 +586,8 @@
        "1. **Plan First:** Before writing large blocks of code, explain what you intend to do.\n"
        "2. **Verify:** After running a command, check the output. If it fails, acknowledge it and try a different approach.\n"
        "3. **Persistence:** Your workspace is mounted to `/workspace`. This is where the user's project lives.\n"
-       "4. **Conciseness:** Keep your text responses helpful but brief. Let the code speak when possible.\n\n"
+       "4. **Conciseness:** Keep your text responses helpful but brief. Let the code speak when possible.\n"
+       "5. **Structured Output:** When running commands that may produce large output (curl, cat, SELECT *, log reads), always pipe through filtering tools (jq, grep, awk, head, tail) to return only what you need. Never dump raw HTML or full database tables into your context.\n\n"
 
        "### THE OATHS\n"
        "1. ACTION OVER WORDS: Never just 'promise' to do something. Use your tools immediately.\n"
@@ -587,7 +598,8 @@
        "### TECHNICAL SPECS\n"
        "- Packages: use 'sudo apt-get install -y'\n"
        "- Workspace: /workspace\n"
-       "- Tools: You have run_bash, memory_write, memory_read, workflow_write, and workflow_delete.\n\n"
+       "- Tools: You have run_bash, memory_write, memory_read, workflow_write, and workflow_delete.\n"
+       "- Output discipline: prefer 'jq .field' for JSON APIs, 'grep PATTERN' for logs, 'head -N' for file previews, 'psql -t -A -F\",\"' for compact SQL.\n\n"
 
        "When making function calls using tools that accept array or object parameters ensure those are structured using JSON. For example:\n"
        "Check that all the required parameters for each tool call are provided or can reasonably be inferred from context."))
@@ -597,6 +609,15 @@
     (str (subs s 0 max-tool-output)
          "\n... [truncated: " (count s) " total chars]")
     s))
+
+(defn html-output? [s]
+  (let [prefix (str/lower-case (subs s 0 (min 500 (count s))))]
+    (or (str/includes? prefix "<!doctype")
+        (str/includes? prefix "<html"))))
+
+(defn extraction-needed? [raw]
+  (or (> (count raw) extraction-threshold)
+      (html-output? raw)))
 
 (defn fmt-num [n]
   (cond (>= n 1000000) (str (quot n 1000000) "M")
@@ -706,6 +727,64 @@
           :else
           (do (record-usage! (:usage body))
               (-> body :content first :text)))))))
+
+(defn extract-with-haiku [raw cmd]
+  (let [sys-text "You are a data extraction assistant. Given raw command output and the command that produced it, extract ONLY the relevant information. Return plain text or compact JSON — never HTML. Be concise."
+        user-msg [{:role "user"
+                   :content (str "Command: " cmd "\n\nRaw output:\n"
+                                 (subs raw 0 (min extraction-input-limit (count raw))))}]]
+    (loop [attempt 0]
+      (let [response
+            (if (= backend "bedrock")
+              (let [br-model (bedrock-model-id compaction-model)
+                    path     (str "/model/" br-model "/invoke")
+                    host     (str "bedrock-runtime." aws-region ".amazonaws.com")
+                    url      (str "https://" host path)
+                    body-map {:anthropic_version "bedrock-2023-05-31"
+                              :max_tokens 1024 :system sys-text :messages user-msg}
+                    body-str (json/generate-string body-map)
+                    headers  (sign-bedrock-request {:method "POST" :uri path :body body-str
+                                                    :region aws-region :access-key aws-access-key
+                                                    :secret-key aws-secret-key
+                                                    :session-token aws-session-token})]
+                (http/post url {:headers headers :body body-str :throw false}))
+              (http/post anthropic-url
+                         {:headers {"Content-Type"      "application/json"
+                                    "x-api-key"         api-key
+                                    "anthropic-version" "2023-06-01"}
+                          :body    (json/generate-string
+                                    {:model compaction-model :max_tokens 1024
+                                     :system sys-text :messages user-msg})
+                          :throw   false}))
+            status (:status response)
+            body   (json/parse-string (:body response) true)]
+        (cond
+          (and (or (= status 429) (= status 529)) (< attempt max-retries))
+          (let [retry-after (some-> (get-in response [:headers "retry-after"]) parse-long)
+                wait-secs   (or retry-after (long (* (Math/pow 2 attempt) 2)))]
+            (println (str "\n[Extraction rate limited] Waiting " wait-secs "s before retry "
+                          (inc attempt) "/" max-retries "..."))
+            (Thread/sleep (* wait-secs 1000))
+            (recur (inc attempt)))
+
+          (:error body)
+          (do (println "\n[Extraction Error]:" (-> body :error :message))
+              nil)
+
+          :else
+          (do (record-usage! (:usage body))
+              (-> body :content first :text)))))))
+
+(defn process-tool-output [raw cmd]
+  (if (extraction-needed? raw)
+    (do
+      (println "\n[Extraction] Large/HTML output — extracting with Haiku...")
+      (if-let [extracted (extract-with-haiku raw cmd)]
+        (truncate-output (str "[Extracted summary]\n" extracted))
+        (do
+          (println "[Extraction] Haiku failed, falling back to truncation")
+          (truncate-output raw))))
+    (truncate-output raw)))
 
 (defn find-valid-start
   "Drop leading messages until we find a plain user message (string content, not tool_result).
@@ -1316,7 +1395,8 @@
                                                         "run_bash"
                                                         (let [cmd (-> tu :input :command)]
                                                           (println (str "\n$ " cmd))
-                                                          (let [res (truncate-output (run-in-container cmd))]
+                                                          (let [raw (run-in-container cmd)
+                                                                res (process-tool-output raw cmd)]
                                                             (println res)
                                                             res))
 
