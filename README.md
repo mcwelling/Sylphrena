@@ -311,7 +311,7 @@ When `max-history` is exceeded:
 
 If summarization fails, the fallback trims to the keep batch so the conversation continues uninterrupted.
 
-### Token Usage Tracking
+### Token Usage Tracking & Status Bars
 
 An atom accumulates token counts across all API calls (both main calls and compaction calls):
 
@@ -320,6 +320,39 @@ session-tokens: {:input 0 :output 0 :calls 0}
 ```
 
 `record-usage!` is called after every successful API response. The `/status` command displays the running totals.
+
+Two status bars are pinned to the top and bottom of the terminal at all times, updating live after every API response:
+
+```
+Sylphrena ─ ↑ 1024  ↓ 512  ·  3 calls ─── TPM ████░░░░ 42% ─── 6 msgs ───────────
+```
+
+| Field | Description |
+|---|---|
+| `↑ N` | Cumulative input tokens sent to the API |
+| `↓ N` | Cumulative output tokens received |
+| `N calls` | Total API calls made this session |
+| `TPM ████░░ N%` | Real-time token-per-minute utilisation vs. the `--rate-limit` budget |
+| `N msgs` | Number of messages in the active conversation history |
+
+The TPM bar is **colour-coded** by utilisation:
+- **Green** — below 50% of budget
+- **Yellow** — 50–80% of budget  
+- **Red** — 80% or above (proactive throttling kicks in here)
+
+A background daemon thread polls the container for **CPU and memory stats** every 5 seconds and injects them into the bottom status bar, giving live telemetry without blocking the conversation loop.
+
+### Thinking Animation
+
+When extended thinking is enabled (`--thinking <budget>`), a windspren animation runs in the bottom status bar while Claude's extended thinking block is being processed. An animated `≋` character drifts across a trail of `·` dots at 80 ms per frame, visually indicating that deep reasoning is in progress. The animation stops and the bar is cleared the moment the thinking block ends and the text response begins.
+
+### Output Extraction & Truncation
+
+Raw tool output is filtered through two layers before being stored in conversation history:
+
+1. **`max-tool-output` truncation** — Any tool result longer than `max-tool-output` characters (default: `8000`) is hard-truncated. This keeps the context window from ballooning on verbose commands.
+
+2. **Haiku-based extraction** — When a command returns output that is large or contains HTML (e.g. a `curl` returning a webpage), Syl calls `claude-haiku-4-5` with a focused extraction prompt: *"Given this raw output and the command that produced it, extract ONLY the relevant information. Return plain text or compact JSON — never HTML."* The extracted summary replaces the raw output in history. This uses the same retry/backoff logic as the main API loop and supports both Anthropic and Bedrock backends.
 
 ### Persistent Memory
 
