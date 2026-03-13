@@ -373,7 +373,20 @@
           (str "Error (Exit " exit "): "
                (str/trim (str out (when (and (not (str/blank? out)) (not (str/blank? err))) "\n") err))))))))
 
-;; --- 4. Persistent Memory ---
+;; --- 4. File Pagination ---
+(defn read-file-paged [path start-line end-line]
+  (let [abs-path (if (str/starts-with? path "/") path (str "/workspace/" path))
+        start    (max 1 (or start-line 1))
+        end      (or end-line (+ start 99))
+        cmd      (str/join "; "
+                           [(str "f='" abs-path "'")
+                            "if [ ! -f \"$f\" ]; then echo \"Error: file not found: $f\"; exit 1; fi"
+                            "total=$(wc -l < \"$f\")"
+                            (str "echo \"[File: $f — $total lines total, showing " start "-" end "]\"")
+                            (str "awk 'NR>=" start "{printf \"%5d: %s\\n\", NR, $0} NR>" end "{exit}' \"$f\"")])]
+    (run-in-container cmd)))
+
+;; --- 5. Persistent Memory ---
 ;; Syl can store and retrieve notes across sessions in .syl/memory/.
 ;; Memory files are plain text, organized by topic (one file per key).
 
@@ -561,7 +574,17 @@
     :input_schema {:type "object"
                    :properties {:name {:type "string"
                                        :description "The workflow name to delete (e.g. 'ship')."}}
-                   :required ["name"]}
+                   :required ["name"]}}
+   {:name "read_file"
+    :description "Read a specific range of lines from a file with line numbers. Use this to navigate large files precisely — find a section, inspect it, then make targeted edits. Prefer this over 'cat' for any file larger than a few hundred lines."
+    :input_schema {:type "object"
+                   :properties {:path       {:type "string"
+                                             :description "Absolute path or path relative to /workspace (e.g. 'src/main.clj')."}
+                                :start_line {:type "integer"
+                                             :description "First line to read (1-indexed). Defaults to 1."}
+                                :end_line   {:type "integer"
+                                             :description "Last line to read (inclusive). Defaults to start_line + 99 (100-line window)."}}
+                   :required ["path"]}
     :cache_control {:type "ephemeral"}}])
 
 (def system-instruction
@@ -598,8 +621,9 @@
        "### TECHNICAL SPECS\n"
        "- Packages: use 'sudo apt-get install -y'\n"
        "- Workspace: /workspace\n"
-       "- Tools: You have run_bash, memory_write, memory_read, workflow_write, and workflow_delete.\n"
-       "- Output discipline: prefer 'jq .field' for JSON APIs, 'grep PATTERN' for logs, 'head -N' for file previews, 'psql -t -A -F\",\"' for compact SQL.\n\n"
+       "- Tools: You have run_bash, read_file, memory_write, memory_read, workflow_write, and workflow_delete.\n"
+       "- Output discipline: prefer 'jq .field' for JSON APIs, 'grep PATTERN' for logs, 'head -N' for file previews, 'psql -t -A -F\",\"' for compact SQL.\n"
+       "- Large file navigation: use read_file with start_line/end_line to read files in 100-line windows. Never cat a large file — paginate instead. Use grep to find the right line range first, then read_file to inspect it.\n\n"
 
        "When making function calls using tools that accept array or object parameters ensure those are structured using JSON. For example:\n"
        "Check that all the required parameters for each tool call are provided or can reasonably be inferred from context."))
@@ -615,9 +639,15 @@
     (or (str/includes? prefix "<!doctype")
         (str/includes? prefix "<html"))))
 
-(defn extraction-needed? [raw]
-  (or (> (count raw) extraction-threshold)
-      (html-output? raw)))
+(defn page-output [raw]
+  (let [lines    (str/split-lines raw)
+        total    (count lines)
+        page-sz  100
+        shown    (take page-sz lines)
+        numbered (map-indexed (fn [i l] (format "%5d: %s" (inc i) l)) shown)]
+    (str "[Output paged: " total " lines total, showing lines 1-" (min total page-sz) "]\n"
+         "[Use read_file for file content, or narrow with head/grep/sed for command output]\n\n"
+         (str/join "\n" numbered))))
 
 (defn fmt-num [n]
   (cond (>= n 1000000) (str (quot n 1000000) "M")
@@ -776,14 +806,22 @@
               (-> body :content first :text)))))))
 
 (defn process-tool-output [raw cmd]
-  (if (extraction-needed? raw)
+  (cond
+    (html-output? raw)
     (do
-      (println "\n[Extraction] Large/HTML output — extracting with Haiku...")
+      (println "\n[Extraction] HTML output — extracting with Haiku...")
       (if-let [extracted (extract-with-haiku raw cmd)]
         (truncate-output (str "[Extracted summary]\n" extracted))
         (do
           (println "[Extraction] Haiku failed, falling back to truncation")
           (truncate-output raw))))
+
+    (> (count raw) extraction-threshold)
+    (do
+      (println (str "\n[Paged] Output large (" (count (str/split-lines raw)) " lines) — showing first 100"))
+      (page-output raw))
+
+    :else
     (truncate-output raw)))
 
 (defn find-valid-start
@@ -1426,6 +1464,16 @@
                                                         (let [n (-> tu :input :name)
                                                               res (workflow-delete n)]
                                                           (println (str "\n[Workflow] " res))
+                                                          res)
+
+                                                        "read_file"
+                                                        (let [path  (-> tu :input :path)
+                                                              start (-> tu :input :start_line)
+                                                              end   (-> tu :input :end_line)
+                                                              res   (read-file-paged path start end)]
+                                                          (println (str "\n[Read] " path
+                                                                        (when start (str " :" start))
+                                                                        (when end   (str "-" end))))
                                                           res)
 
                                                         (str "Unknown tool: " tool-name))]
