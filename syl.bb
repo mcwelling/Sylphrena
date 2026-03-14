@@ -26,6 +26,7 @@
         "--backend"    (recur (drop 2 args) (assoc acc :backend   (second args)))
         "--resume"     (recur (drop 1 args) (assoc acc :resume     true))
         "--no-banner"  (recur (drop 1 args) (assoc acc :no-banner  true))
+        "--light"      (recur (drop 1 args) (assoc acc :light      true))
         "--help"       (recur (drop 1 args) (assoc acc :help       true))
         (recur (drop 1 args) acc)))))
 
@@ -55,6 +56,8 @@
   (println "                       Tip: use --backend bedrock to bypass Anthropic rate limits entirely")
   (println "  --resume             Resume previous conversation session")
   (println "  --no-banner          Skip the startup splash banner")
+  (println "  --light              Use dark-color palette for light terminal backgrounds")
+  (println "                       (also: SYL_THEME=light)")
   (println "  --help               Show this help message")
   (println)
   (println "Environment:")
@@ -62,6 +65,7 @@
   (println "  SYL_MODEL            Model override (--model takes precedence)")
   (println "  SYL_BACKEND          Backend override: 'anthropic' or 'bedrock' (--backend takes precedence)")
   (println "  SYL_RATE_LIMIT       Token-per-minute budget override (--rate-limit takes precedence)")
+  (println "  SYL_THEME            Set to 'light' to use dark-color palette (--light takes precedence)")
   (println)
   (println "  AWS (required for bedrock backend):")
   (println "  AWS_ACCESS_KEY_ID      Your AWS access key")
@@ -1339,16 +1343,28 @@
 
       :else nil)))
 
+;; --- 12. Color Palette ---
+(def light-mode? (or (:light cli-args)
+                     (= (System/getenv "SYL_THEME") "light")))
+
+(def dark-palette
+  {:cy  "\u001b[96m"   :ye  "\u001b[93m"  :wh  "\u001b[97m"
+   :mg  "\u001b[95m"   :lb  "\u001b[1;94m" :dim "\u001b[2m"
+   :b   "\u001b[1m"    :r   "\u001b[0m"
+   :ur  "\u001b[91m"   :uy  "\u001b[93m"   :ug  "\u001b[92m"})
+
+(def light-palette
+  {:cy  "\u001b[34m"   :ye  "\u001b[33m"  :wh  "\u001b[0m"
+   :mg  "\u001b[35m"   :lb  "\u001b[1;34m" :dim "\u001b[0m"
+   :b   "\u001b[1m"    :r   "\u001b[0m"
+   :ur  "\u001b[31m"   :uy  "\u001b[33m"   :ug  "\u001b[32m"})
+
+(def palette (if light-mode? light-palette dark-palette))
+
 ;; --- 12. Splash Banner ---
 (defn print-banner []
   (let [tw   (max 60 (if terminal (.getWidth terminal) 80))
-        r    "\u001b[0m"
-        b    "\u001b[1m"
-        cy   "\u001b[96m"
-        ye   "\u001b[93m"
-        wh   "\u001b[97m"
-        mg   "\u001b[95m"
-        dim  "\u001b[2m"
+        {:keys [r b cy ye wh mg dim]} palette
         ;; Tile a pattern to exactly tw visible chars
         tile (fn [pat]
                (let [n (count pat) reps (quot tw n) extra (rem tw n)]
@@ -1407,17 +1423,14 @@
         pct       (int (min 100 (* 100 (/ (double used-tpm) rate-limit-budget))))
         cstats    @container-stats
         width     (max 60 (if terminal (.getWidth terminal) 80))
-        r         "\u001b[0m"
-        dim       "\u001b[2m"
-        wh        "\u001b[97m"
-        lb        "\u001b[1;94m"  ; bold light blue
-        tpm-color (cond (>= pct 80) "\u001b[91m"
-                        (>= pct 50) "\u001b[93m"
-                        :else       "\u001b[92m")
+        {:keys [r dim wh lb ur uy ug]} palette
+        tpm-color (cond (>= pct 80) ur
+                        (>= pct 50) uy
+                        :else       ug)
         cpu-color (when cstats
-                    (cond (>= (:cpu-pct cstats) 80) "\u001b[91m"
-                          (>= (:cpu-pct cstats) 50) "\u001b[93m"
-                          :else                      "\u001b[92m"))
+                    (cond (>= (:cpu-pct cstats) 80) ur
+                          (>= (:cpu-pct cstats) 50) uy
+                          :else                      ug))
         bar-w     8
         filled    (int (* (/ pct 100.0) bar-w))
         bar       (str tpm-color
@@ -1466,11 +1479,7 @@
 (defn make-bottom-bar []
   ;; Identity + shortcuts: ─ model · backend · Xs ───────────── /help /status /save /exit ─
   (let [width     (max 60 (if terminal (.getWidth terminal) 80))
-        r         "\u001b[0m"
-        dim       "\u001b[2m"
-        cy        "\u001b[96m"
-        wh        "\u001b[97m"
-        mg        "\u001b[95m"
+        {:keys [r dim cy wh mg]} palette
         timeout-s (str (/ cmd-timeout-ms 1000) "s")
         model-seg (str cy model r
                        (when (not= backend "anthropic")
