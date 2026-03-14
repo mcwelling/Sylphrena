@@ -15,3 +15,6 @@
 
 # Backup files
 *.bak
+
+# Local docs (not for remote)
+docs/
