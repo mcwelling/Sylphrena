@@ -323,10 +323,10 @@
       (exec-setup "git" "config" "--global" "user.email" git-email))))
 
 (defn setup-tools []
-  (println "[Syl Setup] Installing base tools (python3, perl, jq, yq)...")
+  (println "[Syl Setup] Installing base tools (python3, perl, jq, yq, poppler-utils)...")
   (exec-setup "bash" "-c"
               (str "apt-get update -qq"
-                   " && apt-get install -y --no-install-recommends python3 perl jq yq"
+                   " && apt-get install -y --no-install-recommends python3 perl jq yq poppler-utils"
                    " && apt-get clean && rm -rf /var/lib/apt/lists/*")))
 
 (defn start-container []
@@ -584,7 +584,23 @@
                                              :description "First line to read (1-indexed). Defaults to 1."}
                                 :end_line   {:type "integer"
                                              :description "Last line to read (inclusive). Defaults to start_line + 99 (100-line window)."}}
-                   :required ["path"]}
+                   :required ["path"]}}
+   {:name "dispatch_agent"
+    :description "Delegate a read-only remote task to a scoped sub-agent. Use for fetching, summarising, or extracting data from URLs where the raw content would be large or noisy. The agent retrieves the source, applies your focus instruction, and returns only a clean bounded result — protecting your context window."
+    :input_schema {:type "object"
+                   :properties {:task          {:type "string"
+                                                :enum ["fetch" "summarize" "extract"]
+                                                :description "fetch: return relevant excerpt. summarize: return summary + key_points. extract: return structured data."}
+                                :source        {:type "string"
+                                                :description "URL to retrieve (HTTP/HTTPS). PDF URLs supported."}
+                                :focus         {:type "string"
+                                                :description "Tightly scoped instruction: what to find or return from the source."}
+                                :output_format {:type "string"
+                                                :enum ["text" "json" "list"]
+                                                :description "text: plain prose. json: JSON object. list: JSON array."}
+                                :max_length    {:type "integer"
+                                                :description "Token budget (max_tokens). Use ~400 for summaries, ~200 for fetches, ~150 for list extractions."}}
+                   :required ["task" "source" "focus" "output_format" "max_length"]}
     :cache_control {:type "ephemeral"}}])
 
 (def system-instruction
@@ -621,9 +637,10 @@
        "### TECHNICAL SPECS\n"
        "- Packages: use 'sudo apt-get install -y'\n"
        "- Workspace: /workspace\n"
-       "- Tools: You have run_bash, read_file, memory_write, memory_read, workflow_write, and workflow_delete.\n"
+       "- Tools: You have run_bash, read_file, dispatch_agent, memory_write, memory_read, workflow_write, and workflow_delete.\n"
        "- Output discipline: prefer 'jq .field' for JSON APIs, 'grep PATTERN' for logs, 'head -N' for file previews, 'psql -t -A -F\",\"' for compact SQL.\n"
-       "- Large file navigation: use read_file with start_line/end_line to read files in 100-line windows. Never cat a large file — paginate instead. Use grep to find the right line range first, then read_file to inspect it.\n\n"
+       "- Large file navigation: use read_file with start_line/end_line to read files in 100-line windows. Never cat a large file — paginate instead. Use grep to find the right line range first, then read_file to inspect it.\n"
+       "- dispatch_agent: use for read-only remote tasks (fetch/summarize/extract from URLs). Always set a tight max_length. Do not dispatch when the task needs workspace context or when you must reason over the full source yourself.\n\n"
 
        "When making function calls using tools that accept array or object parameters ensure those are structured using JSON. For example:\n"
        "Check that all the required parameters for each tool call are provided or can reasonably be inferred from context."))
@@ -823,6 +840,139 @@
 
     :else
     (truncate-output raw)))
+
+;; --- Dispatch Agent ---
+
+(defn dispatch-system-prompt [task output-format strict?]
+  (str "You are a precise information extraction assistant. "
+       "Given content retrieved from a URL, your job is to "
+       (case task
+         "fetch"     "extract ONLY the section most relevant to the user's focus. Return clean prose, no HTML markup."
+         "summarize" "produce a structured summary scoped exactly to the user's focus."
+         "extract"   "extract the specific structured data described in the user's focus."
+         (str "perform a " task " operation"))
+       "\n\n"
+       (if strict?
+         (case output-format
+           "json" "CRITICAL: Respond with valid JSON ONLY. No prose, no markdown fences. Your entire response must start with { or [."
+           "list" "CRITICAL: Respond with a valid JSON array ONLY. Start with [. No prose."
+           "text" "Respond with plain text only. No HTML, no markdown.")
+         (case output-format
+           "json" "Respond with valid JSON only. No prose, no markdown fences — raw JSON."
+           "list" "Respond with a valid JSON array only. Raw JSON array, no prose."
+           "text" "Respond with plain text only. No HTML, no markdown."))
+       "\n\n"
+       "If the content does not contain information relevant to the focus, return exactly: "
+       "{\"error\":\"Content not found\",\"reason\":\"<brief explanation>\",\"source_url\":\"<url>\"}"))
+
+(defn strip-html [s]
+  (-> s
+      (str/replace #"(?s)<style[^>]*>.*?</style>" " ")
+      (str/replace #"(?s)<script[^>]*>.*?</script>" " ")
+      (str/replace #"<[^>]+>" " ")
+      (str/replace #"&nbsp;" " ")
+      (str/replace #"&amp;"  "&")
+      (str/replace #"&lt;"   "<")
+      (str/replace #"&gt;"   ">")
+      (str/replace #"&quot;" "\"")
+      (str/replace #"\s+"    " ")
+      str/trim))
+
+(defn strip-code-fences [s]
+  (let [s (str/trim s)]
+    (if (str/starts-with? s "```")
+      (-> s
+          (str/replace #"^```[a-zA-Z]*\n?" "")
+          (str/replace #"\n?```$" "")
+          str/trim)
+      s)))
+
+(defn valid-format? [text output-format]
+  (case output-format
+    "text" (string? text)
+    "json" (try (json/parse-string text) true (catch Exception _ false))
+    "list" (try (vector? (json/parse-string text)) true (catch Exception _ false))
+    true))
+
+(defn call-dispatch-haiku [task source focus output-format max-length raw-content strict?]
+  (let [sys-text (dispatch-system-prompt task output-format strict?)
+        user-msg [{:role "user"
+                   :content (str "Source URL: " source "\n"
+                                 "Focus: " focus "\n\n"
+                                 "Content:\n"
+                                 (subs raw-content 0 (min extraction-input-limit (count raw-content))))}]]
+    (loop [attempt 0]
+      (let [response
+            (if (= backend "bedrock")
+              (let [br-model (bedrock-model-id compaction-model)
+                    path     (str "/model/" br-model "/invoke")
+                    host     (str "bedrock-runtime." aws-region ".amazonaws.com")
+                    url      (str "https://" host path)
+                    body-map {:anthropic_version "bedrock-2023-05-31"
+                              :max_tokens max-length :system sys-text :messages user-msg}
+                    body-str (json/generate-string body-map)
+                    headers  (sign-bedrock-request {:method "POST" :uri path :body body-str
+                                                    :region aws-region :access-key aws-access-key
+                                                    :secret-key aws-secret-key
+                                                    :session-token aws-session-token})]
+                (http/post url {:headers headers :body body-str :throw false}))
+              (http/post anthropic-url
+                         {:headers {"Content-Type"      "application/json"
+                                    "x-api-key"         api-key
+                                    "anthropic-version" "2023-06-01"}
+                          :body    (json/generate-string
+                                    {:model compaction-model :max_tokens max-length
+                                     :system sys-text :messages user-msg})
+                          :throw   false}))
+            status (:status response)
+            body   (json/parse-string (:body response) true)]
+        (cond
+          (and (or (= status 429) (= status 529)) (< attempt max-retries))
+          (let [retry-after (some-> (get-in response [:headers "retry-after"]) parse-long)
+                wait-secs   (or retry-after (long (* (Math/pow 2 attempt) 2)))]
+            (println (str "\n[Dispatch rate limited] Waiting " wait-secs "s before retry "
+                          (inc attempt) "/" max-retries "..."))
+            (Thread/sleep (* wait-secs 1000))
+            (recur (inc attempt)))
+
+          (:error body)
+          (do (println "\n[Dispatch Error]:" (-> body :error :message))
+              (json/generate-string {:error "Model API error"
+                                     :reason (-> body :error :message)
+                                     :source_url source}))
+
+          :else
+          (do (record-usage! (:usage body))
+              (let [stop-reason (-> body :stop_reason)
+                    text        (-> body :content first :text)]
+                (if (= stop-reason "max_tokens")
+                  (json/generate-string {:error   "Response truncated"
+                                         :reason  "max_tokens budget reached before completion"
+                                         :source_url source})
+                  (strip-code-fences text)))))))))
+
+(defn dispatch-agent [task source focus output-format max-length]
+  (let [is-pdf    (str/ends-with? (str/lower-case source) ".pdf")
+        fetch-cmd (if is-pdf
+                    (str "ts=$(date +%s%N); f=/tmp/syl_dp_$ts.pdf; "
+                         "curl -sL -A 'Mozilla/5.0' --max-time 30 '" source "' -o \"$f\" "
+                         "&& pdftotext \"$f\" - && rm -f \"$f\"")
+                    (str "curl -sL -A 'Mozilla/5.0' --max-time 30 '" source "'"))
+        raw-content (run-in-container fetch-cmd)]
+    (if (or (str/blank? raw-content) (str/starts-with? raw-content "Error"))
+      (json/generate-string {:error      "Content retrieval failed"
+                             :reason     (if (str/blank? raw-content) "Empty response" raw-content)
+                             :source_url source})
+      (let [content-for-model (if (html-output? raw-content) (strip-html raw-content) raw-content)
+            result (call-dispatch-haiku task source focus output-format max-length content-for-model false)]
+        (if (valid-format? result output-format)
+          result
+          (let [retry (call-dispatch-haiku task source focus output-format max-length content-for-model true)]
+            (if (valid-format? retry output-format)
+              retry
+              (json/generate-string {:error      "Output format validation failed"
+                                     :reason     (str "Model returned invalid " output-format " after retry")
+                                     :source_url source}))))))))
 
 (defn find-valid-start
   "Drop leading messages until we find a plain user message (string content, not tool_result).
@@ -1474,6 +1624,16 @@
                                                           (println (str "\n[Read] " path
                                                                         (when start (str " :" start))
                                                                         (when end   (str "-" end))))
+                                                          res)
+
+                                                        "dispatch_agent"
+                                                        (let [task   (-> tu :input :task)
+                                                              source (-> tu :input :source)
+                                                              focus  (-> tu :input :focus)
+                                                              fmt    (-> tu :input :output_format)
+                                                              maxl   (-> tu :input :max_length)
+                                                              res    (dispatch-agent task source focus fmt maxl)]
+                                                          (println (str "\n[Dispatch:" task "] " source))
                                                           res)
 
                                                         (str "Unknown tool: " tool-name))]
