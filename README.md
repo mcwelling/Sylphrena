@@ -119,6 +119,8 @@ Options:
                        Tip: use --backend bedrock to bypass Anthropic rate limits entirely
   --resume             Resume previous conversation session
   --no-banner          Skip the startup splash banner
+  --light               Use dark-color palette for light terminal backgrounds
+                         (also: SYL_THEME=light)
   --help               Show this help message
 
 Environment:
@@ -126,6 +128,7 @@ Environment:
   SYL_MODEL            Model override (--model takes precedence)
   SYL_BACKEND          Backend override: 'anthropic' or 'bedrock' (--backend takes precedence)
   SYL_RATE_LIMIT       Token-per-minute budget override (--rate-limit takes precedence)
+  SYL_THEME             Set to 'light' to use dark-color palette (--light takes precedence)
 
   AWS (required for bedrock backend):
   AWS_ACCESS_KEY_ID      Your AWS access key
@@ -154,6 +157,9 @@ Environment:
 
 # Quick session with no banner and a longer timeout
 ./syl.bb --no-banner --timeout 120
+
+# Use light mode palette for light terminal backgrounds
+./syl.bb --light
 ```
 
 ## Slash Commands
@@ -196,6 +202,7 @@ The following values can be set at runtime via CLI flags or environment variable
 | Timeout        | `--timeout <secs>` flag                                                   |
 | Thinking budget | `--thinking <tokens>` flag                                               |
 | Rate limit      | `--rate-limit <tpm>` flag or `SYL_RATE_LIMIT` env var                   |
+| Theme           | `--light` flag or `SYL_THEME=light` env var                               |
 
 ## Under the Hood
 
