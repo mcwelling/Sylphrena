@@ -25,6 +25,7 @@
         "--rate-limit" (recur (drop 2 args) (assoc acc :rate-limit (parse-long (second args))))
         "--backend"    (recur (drop 2 args) (assoc acc :backend   (second args)))
         "--resume"     (recur (drop 1 args) (assoc acc :resume     true))
+        "--fresh"      (recur (drop 1 args) (assoc acc :fresh      true))
         "--no-banner"  (recur (drop 1 args) (assoc acc :no-banner  true))
         "--light"      (recur (drop 1 args) (assoc acc :light      true))
         "--image"      (recur (drop 2 args) (assoc acc :image      (second args)))
@@ -56,6 +57,7 @@
   (println "                       Raise this if your Anthropic tier allows more (e.g. 80000 for Tier 2)")
   (println "                       Tip: use --backend bedrock to bypass Anthropic rate limits entirely")
   (println "  --resume             Resume previous conversation session")
+  (println "  --fresh              Force full container rebuild (skip warm-start cache)")
   (println "  --no-banner          Skip the startup splash banner")
   (println "  --light              Use dark-color palette for light terminal backgrounds")
   (println "                       (also: SYL_THEME=light)")
@@ -108,10 +110,11 @@
 (def effective-max-tokens (if thinking-budget (+ max-tokens thinking-budget) max-tokens))
 (def cmd-timeout-ms   (* (or (:timeout cli-args) 60) 1000))
 (def max-retries      5)
-(def session-dir      (str project-dir "/.syl"))
-(def session-file     (str session-dir "/session.json"))
-(def memory-dir       (str session-dir "/memory"))
-(def workflow-dir     (str session-dir "/workflows"))
+(def session-dir           (str project-dir "/.syl"))
+(def session-file          (str session-dir "/session.json"))
+(def memory-dir            (str session-dir "/memory"))
+(def workflow-dir          (str session-dir "/workflows"))
+(def container-ready-file  (str session-dir "/container-ready"))
 
 ;; --- AWS Bedrock Configuration ---
 (def aws-region        (or (System/getenv "AWS_REGION") (System/getenv "AWS_DEFAULT_REGION") "us-east-1"))
@@ -370,8 +373,17 @@
                      "PYEOF\n"
                      "chmod +x /usr/local/bin/syl-img-pixels"))))
 
-(defn start-container []
-  (nuke-container)
+(defn read-container-marker []
+  (when (.exists (java.io.File. container-ready-file))
+    (str/trim (slurp container-ready-file))))
+
+(defn write-container-marker []
+  (.mkdirs (java.io.File. session-dir))
+  (let [id (:out (shell {:out :string :err :string :continue true}
+                        (str "podman inspect --format '{{.Id}}' " container-name)))]
+    (spit container-ready-file (str/trim id))))
+
+(defn cold-start-container []
   (let [home    (System/getProperty "user.home")
         ssh-dir (str home "/.ssh")]
     (println "Summoning a more powerful Syl in:" project-dir)
@@ -385,7 +397,22 @@
                 "--workdir /workspace "
                 "-it mcr.microsoft.com/devcontainers/base:ubuntu /bin/bash")))
   (configure-git-and-ssh)
-  (setup-tools))
+  (setup-tools)
+  (write-container-marker))
+
+(defn start-or-resume-container []
+  (let [saved-id (read-container-marker)
+        fresh?   (:fresh cli-args)
+        live-id  (when (and saved-id (not fresh?))
+                   (str/trim (:out (shell {:out :string :err :string :continue true}
+                                          (str "podman inspect --format '{{.Id}}' " container-name)))))]
+    (if (and (not fresh?) saved-id (not (str/blank? live-id)) (= saved-id live-id))
+      (do (println "Resuming container...")
+          (shell {:continue true :out :string :err :string}
+                 (str "podman start " container-name))
+          (configure-git-and-ssh))
+      (do (nuke-container)
+          (cold-start-container)))))
 
 ;; --- 2. Container Health Check ---
 (defn container-alive? []
@@ -396,7 +423,7 @@
 (defn ensure-container! []
   (when-not (container-alive?)
     (println "\n[Syl] Container is gone — resummoning...")
-    (start-container)
+    (start-or-resume-container)
     (println "[Syl] Container restored. Continuing.\n")))
 
 ;; --- 3. The Execution Bridge ---
@@ -1241,8 +1268,7 @@
 ;; --- 10. Conversation Persistence ---
 (defn save-session! [messages]
   (.mkdirs (java.io.File. session-dir))
-  (spit session-file (json/generate-string messages {:pretty true}))
-  (println "[Syl] Session saved to" session-file))
+  (spit session-file (json/generate-string messages {:pretty true})))
 
 (defn load-session []
   (let [f (java.io.File. session-file)]
@@ -1360,6 +1386,7 @@
 
       (= trimmed "/save")
       (do (save-session! messages)
+          (println "[Syl] Session saved to" session-file)
           {:action :continue :messages messages})
 
       (or (= trimmed "/workflow") (str/starts-with? trimmed "/workflow "))
@@ -1795,7 +1822,11 @@
           ;;   3. Write raw bytes (no JLine3 charset roundtrip)
           ;;   4. Restore scroll region
           ;;   5. Redraw status bars (image may have overwritten them)
-          (let [img-start (max 2 (- (- h 3) (dec rows)))
+          (let [;; Scroll content upward within the still-active scroll region,
+                ;; vacating the bottom `rows` rows before we suspend it.
+                _         (term-write! (str "\u001b[" (- h 3) ";1H"
+                                            (apply str (repeat rows "\n"))))
+                img-start (max 2 (- (- h 3) (dec rows)))
                 raw       (if (bytes? output) output (.getBytes ^String output "UTF-8"))
                 prefix    (.getBytes (str "\033[r\033[" img-start ";1H") "UTF-8")
                 suffix    (.getBytes (str "\033[2;" (- h 3) "r") "UTF-8")
@@ -1806,8 +1837,10 @@
             (term-write-bytes! (.toByteArray buf))
             (draw-status-bar! []))                       ; repaint status bars
 
-          ;; Text art (symbols/halfblock): ANSI escapes work in scroll region.
-          (do (move-to-scroll!)
+          ;; Text art (symbols/halfblock): reserve space then render.
+          (do (term-write! (str "\u001b[" (- h 3) ";1H"
+                                (apply str (repeat rows "\n"))))
+              (move-to-scroll!)
               (term-write! (if (bytes? output) (String. ^bytes output "UTF-8") output))))
         (when (seq caption)
           (let [{:keys [dim r]} palette
@@ -1816,8 +1849,10 @@
 
 ;; --- 16. The Main Agent Loop ---
 (defn main-loop []
-  (start-container)
-  (def image-protocol (detect-image-protocol))
+  ;; Terminal probe has no container dependency — start it immediately.
+  (let [proto-future (future (detect-image-protocol))]
+    (start-or-resume-container)                     ; blocks; probe runs concurrently
+    (def image-protocol (deref proto-future)))      ; result is ready or near-ready
   (start-stats-poller!)
   (when-not (:no-banner cli-args)
     (print-banner))
@@ -1842,6 +1877,7 @@
 
           ;; Handle EOF (Ctrl+D) or Ctrl+C
           (when (nil? user-input)
+            (save-session! messages)
             (println "\n[Syl] Farewell. Life before death.")
             (System/exit 0))
 
@@ -1851,6 +1887,7 @@
         (if-let [slash-result (handle-slash user-input messages)]
           (if (= (:action slash-result) :exit)
             (do
+              (save-session! messages)
               (println "\n[Syl] Stepping back into the cognitive realm...")
               (println "[Syl] Farewell. Life before death.")
               (System/exit 0))
@@ -1947,7 +1984,9 @@
                       :else
                       (conj current-msgs {:role "assistant" :content (:raw-model-content llm-response)}))))]
 
-            (recur (compact-history final-msgs))))))))
+            (let [next-msgs (compact-history final-msgs)]
+              (save-session! next-msgs)
+              (recur next-msgs))))))))
 
 (when *main-script*
   (.addShutdownHook (Runtime/getRuntime)
