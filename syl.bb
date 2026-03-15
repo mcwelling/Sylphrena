@@ -84,6 +84,7 @@
   (println "  /clear               Reset conversation history")
   (println "  /status              Show session stats (tokens, message count)")
   (println "  /save                Save conversation to disk")
+  (println "  /log                 Show last 20 lines of debug log (.syl/syl.log)")
   (println "  /exit  /quit         Gracefully shut down Syl and remove the container")
   (System/exit 0))
 
@@ -207,6 +208,16 @@
                   (recur headers)))))))
     (catch Exception _ {})))
 
+;; --- Debug Log ---
+(defn log! [& parts]
+  (let [ts  (.format (java.time.LocalDateTime/now)
+                     (java.time.format.DateTimeFormatter/ofPattern "yyyy-MM-dd'T'HH:mm:ss"))
+        msg (str ts " " (str/join " " parts) "\n")]
+    (try
+      (.mkdirs (java.io.File. session-dir))
+      (spit (str session-dir "/syl.log") msg :append true)
+      (catch Exception _))))
+
 (defn parse-bedrock-stream [input-stream on-event]
   (let [dis (DataInputStream. input-stream)]
     (try
@@ -231,7 +242,9 @@
           (recur)))
       (catch java.io.EOFException _)
       (catch Exception e
-        (println (str "\n[Stream Error]: " (.getMessage e)))))))
+        (let [msg (str "\n[Stream Error]: " (.getMessage e))]
+          (println msg)
+          (log! "[Stream Error]:" (.getMessage e)))))))
 
 ;; --- Session State ---
 (def session-tokens (atom {:input 0 :output 0 :calls 0}))
@@ -423,6 +436,7 @@
 (defn ensure-container! []
   (when-not (container-alive?)
     (println "\n[Syl] Container is gone — resummoning...")
+    (log! "[Syl] Container is gone — resummoning...")
     (start-or-resume-container)
     (println "[Syl] Container restored. Continuing.\n")))
 
@@ -847,6 +861,7 @@
 
           (:error body)
           (do (println "\n[Compaction Error]:" (-> body :error :message))
+              (log! "[Compaction Error]:" (-> body :error :message))
               nil)
 
           :else
@@ -894,6 +909,7 @@
 
           (:error body)
           (do (println "\n[Extraction Error]:" (-> body :error :message))
+              (log! "[Extraction Error]:" (-> body :error :message))
               nil)
 
           :else
@@ -1015,6 +1031,7 @@
 
           (:error body)
           (do (println "\n[Dispatch Error]:" (-> body :error :message))
+              (log! "[Dispatch Error]:" (-> body :error :message))
               (json/generate-string {:error "Model API error"
                                      :reason (-> body :error :message)
                                      :source_url source}))
@@ -1086,7 +1103,8 @@
           _         (println "\n[Syl] Compacting context..." (count old-msgs) "messages -> summary")
           summary   (summarize-messages old-msgs)]
       (when-not summary
-        (println "[Syl] Compaction failed, falling back to simple trim."))
+        (do (println "[Syl] Compaction failed, falling back to simple trim.")
+            (log! "[Syl] Compaction failed, falling back to simple trim.")))
       (build-compacted-messages summary keep-msgs))))
 
 ;; --- 8. Streaming SSE Parser ---
@@ -1111,7 +1129,9 @@
             :else
             (recur event-type))))
       (catch Exception e
-        (println (str "\n[Stream Error]: " (.getMessage e)))))))
+        (let [msg (str "\n[Stream Error]: " (.getMessage e))]
+          (println msg)
+          (log! "[Stream Error]:" (.getMessage e)))))))
 
 ;; --- Stream Event Handler (shared by Anthropic SSE and Bedrock EventStream) ---
 (defn make-stream-handler []
@@ -1262,6 +1282,7 @@
               (recur (inc attempt)))
             (do
               (println "\n[API Error]:" (-> body :error :message))
+              (log! "[API Error]:" (-> body :error :message))
               (System/exit 1))))
         result))))
 
@@ -1352,6 +1373,7 @@
        "    /clear              — Reset conversation history (container is preserved)\n"
        "    /status             — Show session stats (tokens used, message count)\n"
        "    /save               — Save conversation to disk for later --resume\n"
+       "    /log                — Show the last 20 lines of the debug log (.syl/syl.log)\n"
        "    /workflow <name>    — Run a workflow pipeline (or list available workflows)\n"
        "    /exit               — Gracefully shut down Syl and remove the container\n"
        "    /quit               — Alias for /exit\n"))
@@ -1388,6 +1410,16 @@
       (do (save-session! messages)
           (println "[Syl] Session saved to" session-file)
           {:action :continue :messages messages})
+
+      (= trimmed "/log")
+      (let [f (java.io.File. (str session-dir "/syl.log"))]
+        (move-to-scroll!)
+        (if (.exists f)
+          (let [lines (str/split-lines (slurp f))
+                tail  (str/join "\n" (take-last 20 lines))]
+            (println tail))
+          (println "[Syl] No log file yet."))
+        {:action :continue :messages messages})
 
       (or (= trimmed "/workflow") (str/starts-with? trimmed "/workflow "))
       (let [wf-name (str/trim (subs trimmed (count "/workflow")))]
@@ -1853,6 +1885,7 @@
   (let [proto-future (future (detect-image-protocol))]
     (start-or-resume-container)                     ; blocks; probe runs concurrently
     (def image-protocol (deref proto-future)))      ; result is ready or near-ready
+  (log! "── session start ──────────────────────────")
   (start-stats-poller!)
   (when-not (:no-banner cli-args)
     (print-banner))
@@ -1993,5 +2026,6 @@
     (Thread. (fn []
       (try (teardown-scroll-region!) (catch Exception _))
       (println "\n[Syl] Cleaning up container...")
+      (log! "[Syl] Cleaning up container...")
       (try (nuke-container) (catch Exception _)))))
   (main-loop))
