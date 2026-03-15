@@ -27,6 +27,7 @@
         "--resume"     (recur (drop 1 args) (assoc acc :resume     true))
         "--no-banner"  (recur (drop 1 args) (assoc acc :no-banner  true))
         "--light"      (recur (drop 1 args) (assoc acc :light      true))
+        "--image"      (recur (drop 2 args) (assoc acc :image      (second args)))
         "--help"       (recur (drop 1 args) (assoc acc :help       true))
         (recur (drop 1 args) acc)))))
 
@@ -58,6 +59,8 @@
   (println "  --no-banner          Skip the startup splash banner")
   (println "  --light              Use dark-color palette for light terminal backgrounds")
   (println "                       (also: SYL_THEME=light)")
+  (println "  --image <protocol>   Image rendering: auto (default), kitty, iterm2, sixel, symbols, none")
+  (println "                       (also: SYL_IMAGE=<protocol>)")
   (println "  --help               Show this help message")
   (println)
   (println "Environment:")
@@ -66,6 +69,7 @@
   (println "  SYL_BACKEND          Backend override: 'anthropic' or 'bedrock' (--backend takes precedence)")
   (println "  SYL_RATE_LIMIT       Token-per-minute budget override (--rate-limit takes precedence)")
   (println "  SYL_THEME            Set to 'light' to use dark-color palette (--light takes precedence)")
+  (println "  SYL_IMAGE            Image protocol override (--image takes precedence)")
   (println)
   (println "  AWS (required for bedrock backend):")
   (println "  AWS_ACCESS_KEY_ID      Your AWS access key")
@@ -327,11 +331,44 @@
       (exec-setup "git" "config" "--global" "user.email" git-email))))
 
 (defn setup-tools []
-  (println "[Syl Setup] Installing base tools (python3, perl, jq, yq, poppler-utils)...")
+  (println "[Syl Setup] Installing base tools (python3, perl, jq, yq, poppler-utils, chafa, python3-pil)...")
   (exec-setup "bash" "-c"
               (str "apt-get update -qq"
-                   " && apt-get install -y --no-install-recommends python3 perl jq yq poppler-utils"
-                   " && apt-get clean && rm -rf /var/lib/apt/lists/*")))
+                   " && apt-get install -y --no-install-recommends python3 perl jq yq poppler-utils chafa python3-pil"
+                   " && apt-get clean && rm -rf /var/lib/apt/lists/*"))
+  (println "[Syl Setup] Installing timg (optional pixel renderer)...")
+  (exec-setup "bash" "-c"
+              (str "apt-get update -qq"
+                   " && apt-get install -y --no-install-recommends timg"
+                   " && apt-get clean && rm -rf /var/lib/apt/lists/*"
+                   " || echo '[Syl Setup] timg not available in repos, skipping'"))
+  (println "[Syl Setup] Installing pixel bridge (syl-img-pixels)...")
+  (let [script (str "#!/usr/bin/env python3\n"
+                    "import sys\n"
+                    "from PIL import Image\n"
+                    "\n"
+                    "def main():\n"
+                    "    path = sys.argv[1]\n"
+                    "    mode = sys.argv[sys.argv.index('--mode') + 1]\n"
+                    "    img = Image.open(path).convert('RGB')\n"
+                    "    if mode == 'info':\n"
+                    "        sys.stdout.write(f\"{img.width} {img.height}\\n\")\n"
+                    "        return\n"
+                    "    w = int(sys.argv[sys.argv.index('--width') + 1])\n"
+                    "    h = int(sys.argv[sys.argv.index('--height') + 1])\n"
+                    "    img = img.resize((w, h), Image.LANCZOS)\n"
+                    "    if mode == 'pixels':\n"
+                    "        sys.stdout.buffer.write(img.tobytes())\n"
+                    "    elif mode == 'png':\n"
+                    "        img.save(sys.stdout.buffer, format='PNG')\n"
+                    "\n"
+                    "if __name__ == '__main__':\n"
+                    "    main()\n")]
+    (exec-setup "bash" "-c"
+                (str "cat > /usr/local/bin/syl-img-pixels << 'PYEOF'\n"
+                     script
+                     "PYEOF\n"
+                     "chmod +x /usr/local/bin/syl-img-pixels"))))
 
 (defn start-container []
   (nuke-container)
@@ -340,6 +377,7 @@
     (println "Summoning a more powerful Syl in:" project-dir)
     (shell (str "podman run -d --name " container-name " "
                 "--memory=2g "
+                "-e TERM_PROGRAM=" (System/getenv "TERM_PROGRAM") " "
                 "-v " project-dir ":/workspace:rw "
                 (if (.exists (java.io.File. ssh-dir))
                   (str "-v " ssh-dir ":/root/.ssh:ro ")
@@ -604,7 +642,15 @@
                                                 :description "text: plain prose. json: JSON object. list: JSON array."}
                                 :max_length    {:type "integer"
                                                 :description "Token budget (max_tokens). Use ~400 for summaries, ~200 for fetches, ~150 for list extractions."}}
-                   :required ["task" "source" "focus" "output_format" "max_length"]}
+                   :required ["task" "source" "focus" "output_format" "max_length"]}}
+   {:name "show_image"
+    :description "Display an image file in the user's terminal. Use after generating charts, diagrams, screenshots, or any visual artifact. The image renders inline in the conversation. Supports PNG, JPEG, GIF, BMP, WebP, SVG, and TIFF files located in the container filesystem."
+    :input_schema {:type "object"
+                   :properties {:path    {:type "string"
+                                          :description "Absolute path to the image file inside the container (e.g. /workspace/chart.png)."}
+                                :caption {:type "string"
+                                          :description "Optional short caption displayed below the image."}}
+                   :required ["path"]}
     :cache_control {:type "ephemeral"}}])
 
 (def system-instruction
@@ -641,10 +687,11 @@
        "### TECHNICAL SPECS\n"
        "- Packages: use 'sudo apt-get install -y'\n"
        "- Workspace: /workspace\n"
-       "- Tools: You have run_bash, read_file, dispatch_agent, memory_write, memory_read, workflow_write, and workflow_delete.\n"
+       "- Tools: You have run_bash, read_file, dispatch_agent, show_image, memory_write, memory_read, workflow_write, and workflow_delete.\n"
        "- Output discipline: prefer 'jq .field' for JSON APIs, 'grep PATTERN' for logs, 'head -N' for file previews, 'psql -t -A -F\",\"' for compact SQL.\n"
        "- Large file navigation: use read_file with start_line/end_line to read files in 100-line windows. Never cat a large file — paginate instead. Use grep to find the right line range first, then read_file to inspect it.\n"
-       "- dispatch_agent: use for read-only remote tasks (fetch/summarize/extract from URLs). Always set a tight max_length. Do not dispatch when the task needs workspace context or when you must reason over the full source yourself.\n\n"
+       "- dispatch_agent: use for read-only remote tasks (fetch/summarize/extract from URLs). Always set a tight max_length. Do not dispatch when the task needs workspace context or when you must reason over the full source yourself.\n"
+       "- show_image: display images (PNG, JPEG, GIF, BMP, WebP, SVG, TIFF) from the container in the user's terminal. The image renders inline in the conversation. Use after generating charts, diagrams, or screenshots. Output quality ranges from full pixel resolution (Kitty, iTerm2) to high-quality character art (other terminals).\n\n"
 
        "When making function calls using tools that accept array or object parameters ensure those are structured using JSON. For example:\n"
        "Check that all the required parameters for each tool call are provided or can reasonably be inferred from context."))
@@ -1505,6 +1552,17 @@
   (when terminal
     (doto (.writer terminal) (.print s) (.flush))))
 
+(defn term-write-bytes!
+  "Write raw bytes directly to the terminal's OutputStream, bypassing JLine3's
+   character-encoding layer. Required for Kitty/Sixel/iTerm2 graphics sequences
+   whose APC/DCS payloads must reach the terminal as exact bytes."
+  [^bytes b]
+  (when terminal
+    (.flush (.writer terminal))
+    (let [out (.output terminal)]
+      (.write out b 0 (alength b))
+      (.flush out))))
+
 (defn setup-scroll-region! []
   (let [h (if terminal (.getHeight terminal) 0)]
     (when (pos? h)
@@ -1533,9 +1591,233 @@
              "\u001b[" (dec h) ";1H" "\u001b[2K"    ; clear row h-1
              "\u001b[" h ";1H" "\u001b[2K")))))
 
+;; --- Image Rendering ---
+
+(defn extract-pixels
+  "Call the container-side pixel bridge. Returns a flat byte array of
+   RGB triples (3 bytes per pixel, row-major), scaled to target dimensions."
+  [container-path target-w target-h]
+  (:out @(process ["podman" "exec" container-name
+                   "syl-img-pixels" container-path
+                   "--mode" "pixels"
+                   "--width" (str target-w)
+                   "--height" (str target-h)]
+                  {:out :bytes})))
+
+;; chafa-installed? is a delay — probed once on first image render, not at startup.
+(def chafa-installed?
+  (delay
+    (let [r @(process ["podman" "exec" container-name "which" "chafa"]
+                      {:out :string :err :string :continue true})]
+      (zero? (:exit r)))))
+
+(defn chafa-available? [] @chafa-installed?)
+
+(defn render-with-chafa
+  "Render an image via chafa inside the container.
+   Returns raw byte array (all formats) or nil on failure.
+   TERM=xterm-kitty + COLORTERM=truecolor are injected so that chafa's
+   auto-detection agrees on Kitty protocol even if it doesn't recognise
+   TERM_PROGRAM=ghostty.  --format=kitty is kept as an explicit override."
+  [container-path format cols rows]
+  (let [format-flag (case format
+                      :kitty   "--format=kitty"
+                      :iterm2  "--format=iterm2"
+                      :sixel   "--format=sixel"
+                      :symbols "--format=symbols")
+        r @(process ["podman" "exec"
+                     "--env" "TERM=xterm-kitty"
+                     "--env" "COLORTERM=truecolor"
+                     container-name
+                     "chafa"
+                     format-flag
+                     (str "--size=" cols "x" rows)
+                     "--animate=off"
+                     "--color-space=din99d"
+                     "--dither=diffusion"
+                     "--dither-intensity=1.0"
+                     container-path]
+                    {:out :bytes :err :string :continue true})]
+    (when (zero? (:exit r))
+      (:out r))))
+
+;; timg-installed? is a delay — probed once on first image render, not at startup.
+(def timg-installed?
+  (delay
+    (let [r @(process ["podman" "exec" container-name "which" "timg"]
+                      {:out :string :err :string :continue true})]
+      (zero? (:exit r)))))
+
+(defn timg-available? [] @timg-installed?)
+
+(defn render-with-timg
+  "Render an image via timg inside the container. Returns raw byte array or nil.
+   format is :kitty, :iterm2, or :sixel — passed as --protocol to suppress
+   timg's auto-detection, which selects the wrong protocol in non-TTY/pipe
+   contexts (podman exec stdout is a pipe with no terminal env vars)."
+  [container-path format cols rows]
+  (let [protocol-flag (case format
+                        :kitty  "--protocol=kitty"
+                        :iterm2 "--protocol=iterm2"
+                        :sixel  "--protocol=sixel"
+                        "--protocol=kitty")
+        r @(process ["podman" "exec" container-name
+                     "timg"
+                     protocol-flag
+                     "--compress"
+                     (str "-g" cols "x" rows)
+                     container-path]
+                    {:out :bytes :err :string :continue true})]
+    (when (zero? (:exit r))
+      (:out r))))
+
+(defn render-halfblock-fallback
+  "Emergency fallback when chafa is missing. Lower quality than chafa symbols."
+  [container-path cols rows]
+  (let [pixel-rows (* rows 2)
+        pixels     (extract-pixels container-path cols pixel-rows)]
+    (when (and pixels (= (alength pixels) (* cols pixel-rows 3)))
+      (let [sb (StringBuilder.)]
+        (doseq [row (range 0 pixel-rows 2)]
+          (doseq [col (range cols)]
+            (let [top-off (* (+ (* row cols) col) 3)
+                  bot-off (* (+ (* (inc row) cols) col) 3)
+                  ;; Mask to unsigned: JVM bytes are signed (-128..127)
+                  tr (bit-and (aget pixels top-off)       0xFF)
+                  tg (bit-and (aget pixels (+ top-off 1)) 0xFF)
+                  tb (bit-and (aget pixels (+ top-off 2)) 0xFF)
+                  br (bit-and (aget pixels bot-off)       0xFF)
+                  bg (bit-and (aget pixels (+ bot-off 1)) 0xFF)
+                  bb (bit-and (aget pixels (+ bot-off 2)) 0xFF)]
+              (.append sb (str "\u001b[38;2;" tr ";" tg ";" tb "m"
+                               "\u001b[48;2;" br ";" bg ";" bb "m▀"))))
+          (.append sb "\u001b[0m\n"))
+        (.toString sb)))))
+
+(defn- probe-terminal-response
+  "Write probe-seq to terminal in raw mode, read until stop-char or timeout-ms.
+   Returns the response string. Safe to call with nil terminal."
+  [probe-seq timeout-ms stop-char]
+  (if-not terminal
+    ""
+    (let [saved (.getAttributes terminal)]
+      (try
+        (.enterRawMode terminal)
+        (doto (.writer terminal) (.print probe-seq) (.flush))
+        (let [reader   (.reader terminal)
+              sb       (StringBuilder.)
+              deadline (+ (System/currentTimeMillis) timeout-ms)]
+          (loop []
+            (let [remaining (- deadline (System/currentTimeMillis))]
+              (when (pos? remaining)
+                (let [ch (.read reader (min remaining 50))]
+                  (when (>= ch 0)
+                    (.append sb (char ch))
+                    (when (and (< (.length sb) 256) (not= (char ch) stop-char))
+                      (recur)))))))
+          (.toString sb))
+        (catch Exception _ "")
+        (finally (.setAttributes terminal saved))))))
+
+(defn kitty-probe?
+  "Returns true if terminal responds to a Kitty graphics protocol probe."
+  []
+  (str/includes?
+    (probe-terminal-response "\u001b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\u001b\\" 200 \\)
+    "OK"))
+
+(defn sixel-probe?
+  "Returns true if terminal reports Sixel support via DA1 response."
+  []
+  (let [resp (probe-terminal-response "\u001b[c" 200 \c)]
+    ;; DA1 response: \033[?<params>c — look for capability code 4 (Sixel)
+    (boolean (re-find #"\?[0-9;]*4[;c]" resp))))
+
+(defn detect-image-protocol
+  "Detect the best image rendering protocol for the current terminal.
+   Checks CLI flag, SYL_IMAGE env var, TERM_PROGRAM, then active probes."
+  []
+  (let [override     (or (:image cli-args) (System/getenv "SYL_IMAGE"))
+        term-program (or (System/getenv "TERM_PROGRAM") "")
+        lc-terminal  (or (System/getenv "LC_TERMINAL") "")]
+    (cond
+      ;; Explicit override
+      (= override "none")    :none
+      (= override "kitty")   :kitty
+      (= override "iterm2")  :iterm2
+      (= override "sixel")   :sixel
+      (= override "symbols") :symbols
+      ;; Tier 1: Kitty — env var (fast, no probe)
+      (contains? #{"kitty" "WezTerm" "ghostty"} term-program) :kitty
+      ;; Tier 1b: iTerm2
+      (or (= term-program "iTerm.app") (= lc-terminal "iTerm2")) :iterm2
+      ;; Tier 1: Kitty — active probe (terminals without TERM_PROGRAM)
+      (kitty-probe?) :kitty
+      ;; Tier 2: Sixel
+      (sixel-probe?) :sixel
+      ;; Tier 3: Universal symbols fallback
+      :else :symbols)))
+
+;; Default until main-loop calls detect-image-protocol.
+(def image-protocol :symbols)
+
+(defn render-image-to-terminal
+  "Render a container-side image file in the terminal scroll region."
+  [container-path {:keys [max-width max-height caption]}]
+  (when-not (= image-protocol :none)
+    (let [h      (if terminal (.getHeight terminal) 24)
+          cols   (or max-width  (- (if terminal (.getWidth terminal) 80) 2))
+          rows   (or max-height (quot (- h 6) 2))
+          ;; Pixel protocols: prefer timg (with explicit --protocol flag to avoid
+          ;; auto-detection failure in non-TTY/pipe contexts inside the container);
+          ;; fall back to chafa (with TERM=xterm-kitty + explicit --format flag).
+          ;; Symbols: chafa only (timg doesn't do character art).
+          pixel? (contains? #{:kitty :iterm2 :sixel} image-protocol)
+          output (or
+                   (when (and pixel? (timg-available?))
+                     (render-with-timg container-path image-protocol cols rows))
+                   (when (chafa-available?)
+                     (render-with-chafa container-path image-protocol cols rows)))
+          output (or output
+                     (do (move-to-scroll!)
+                         (term-write! (str "[syl] image renderer unavailable"
+                                          " (timg=" (timg-available?) " chafa=" (chafa-available?)
+                                          " protocol=" image-protocol ") — using halfblock fallback\n"))
+                         (render-halfblock-fallback container-path cols rows)))]
+      (when output
+        (if pixel?
+          ;; Pixel graphics (Kitty/Sixel/iTerm2): suspend the scroll region.
+          ;; Ghostty (and Kitty-capable terminals generally) refuse to render
+          ;; graphics while a scroll region is active — the APC payload displays
+          ;; as literal base64 text instead. Steps:
+          ;;   1. Reset scroll region → full screen
+          ;;   2. Move cursor so image (height=rows) ends at row h-3
+          ;;   3. Write raw bytes (no JLine3 charset roundtrip)
+          ;;   4. Restore scroll region
+          ;;   5. Redraw status bars (image may have overwritten them)
+          (let [img-start (max 2 (- (- h 3) (dec rows)))
+                raw       (if (bytes? output) output (.getBytes ^String output "UTF-8"))
+                prefix    (.getBytes (str "\033[r\033[" img-start ";1H") "UTF-8")
+                suffix    (.getBytes (str "\033[2;" (- h 3) "r") "UTF-8")
+                buf       (java.io.ByteArrayOutputStream.)]
+            (.write buf prefix 0 (alength prefix))
+            (.write buf raw   0 (alength raw))
+            (.write buf suffix 0 (alength suffix))
+            (term-write-bytes! (.toByteArray buf))
+            (draw-status-bar! []))                       ; repaint status bars
+
+          ;; Text art (symbols/halfblock): ANSI escapes work in scroll region.
+          (do (move-to-scroll!)
+              (term-write! (if (bytes? output) (String. ^bytes output "UTF-8") output))))
+        (when (seq caption)
+          (let [{:keys [dim r]} palette
+                pad (apply str (repeat (max 0 (quot (- cols (count caption)) 2)) " "))]
+            (term-write! (str "\n" dim pad caption r "\n"))))))))
+
 ;; --- 16. The Main Agent Loop ---
 (defn main-loop []
   (start-container)
+  (def image-protocol (detect-image-protocol))
   (start-stats-poller!)
   (when-not (:no-banner cli-args)
     (print-banner))
@@ -1644,6 +1926,12 @@
                                                               res    (dispatch-agent task source focus fmt maxl)]
                                                           (println (str "\n[Dispatch:" task "] " source))
                                                           res)
+
+                                                        "show_image"
+                                                        (let [path    (-> tu :input :path)
+                                                              caption (-> tu :input :caption)]
+                                                          (render-image-to-terminal path {:caption caption})
+                                                          (str "Image displayed: " path))
 
                                                         (str "Unknown tool: " tool-name))]
                                                   {:type        "tool_result"

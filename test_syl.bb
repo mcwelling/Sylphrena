@@ -777,6 +777,32 @@
   (is (= "5M" (fmt-num 5500000))))
 
 ;; ============================================================
+;; 15. Image rendering (render-halfblock-fallback)
+;; ============================================================
+
+(deftest image-rendering
+  (testing "render-halfblock-fallback produces correct ANSI escapes for known pixel data"
+    (let [;; 2×2 image: top-left=red, top-right=green, bot-left=blue, bot-right=yellow
+          pixels (byte-array [(unchecked-byte 255) (unchecked-byte 0)   (unchecked-byte 0)    ; top-left  R
+                              (unchecked-byte 0)   (unchecked-byte 255) (unchecked-byte 0)    ; top-right G
+                              (unchecked-byte 0)   (unchecked-byte 0)   (unchecked-byte 255)  ; bot-left  B
+                              (unchecked-byte 255) (unchecked-byte 255) (unchecked-byte 0)])] ; bot-right Y
+      (with-redefs [extract-pixels (fn [_ _ _] pixels)]
+        (let [result (render-halfblock-fallback "/fake/path.png" 2 1)]
+          (is (str/includes? result "\u001b[38;2;255;0;0m\u001b[48;2;0;0;255m▀"))
+          (is (str/includes? result "\u001b[38;2;0;255;0m\u001b[48;2;255;255;0m▀"))
+          (is (str/ends-with? (str/trim result) "\u001b[0m"))))))
+
+  (testing "render-halfblock-fallback handles high byte values without sign extension"
+    (let [;; Single 1×2 image: both rows are rgb(200,200,200) — would be -56 as signed byte
+          pixels (byte-array [(unchecked-byte 200) (unchecked-byte 200) (unchecked-byte 200)
+                              (unchecked-byte 200) (unchecked-byte 200) (unchecked-byte 200)])]
+      (with-redefs [extract-pixels (fn [_ _ _] pixels)]
+        (let [result (render-halfblock-fallback "/fake/path.png" 1 1)]
+          (is (str/includes? result "200"))
+          (is (not (str/includes? result "-56"))))))))
+
+;; ============================================================
 ;; Run all tests
 ;; ============================================================
 
