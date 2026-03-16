@@ -10,6 +10,7 @@
         '[javax.crypto Mac]
         '[javax.crypto.spec SecretKeySpec]
         '[org.jline.terminal TerminalBuilder]
+        '[sun.misc Signal SignalHandler]
         '[org.jline.reader LineReader LineReaderBuilder EndOfFileException UserInterruptException])
 
 ;; --- CLI Argument Parsing ---
@@ -467,20 +468,29 @@
     (println "[Syl] Container restored. Continuing.\n")))
 
 ;; --- 3. The Execution Bridge ---
+(def agent-thread (volatile! nil))
+(def running-process (volatile! nil))
+
 (defn run-in-container [cmd]
   (ensure-container!)
-  (let [p      (process ["podman" "exec" container-name "/bin/bash" "-c" cmd]
-                        {:out :string :err :string})
-        result (deref p cmd-timeout-ms :timeout)]
-    (if (= result :timeout)
-      (do
+  (let [p (process ["podman" "exec" container-name "/bin/bash" "-c" cmd]
+                   {:out :string :err :string})
+        _ (vreset! running-process p)]
+    (try
+      (let [result (deref p cmd-timeout-ms :timeout)
+            _      (vreset! running-process nil)]
+        (if (= result :timeout)
+          (do (.destroy p)
+              (str "Error: Command timed out after " (/ cmd-timeout-ms 1000) " seconds."))
+          (let [{:keys [exit out err]} result]
+            (if (= 0 exit)
+              out
+              (str "Error (Exit " exit "): "
+                   (str/trim (str out (when (and (not (str/blank? out)) (not (str/blank? err))) "\n") err)))))))
+      (catch InterruptedException _
+        (vreset! running-process nil)
         (.destroy p)
-        (str "Error: Command timed out after " (/ cmd-timeout-ms 1000) " seconds."))
-      (let [{:keys [exit out err]} result]
-        (if (= 0 exit)
-          out
-          (str "Error (Exit " exit "): "
-               (str/trim (str out (when (and (not (str/blank? out)) (not (str/blank? err))) "\n") err))))))))
+        (throw (InterruptedException.))))))
 
 ;; --- 4. File Pagination ---
 (defn read-file-paged [path start-line end-line]
@@ -1161,18 +1171,22 @@
             :else
             (recur event-type))))
       (catch Exception e
-        (let [msg (str "\n[Stream Error]: " (.getMessage e))]
-          (println msg)
-          (log! "[Stream Error]:" (.getMessage e)))))))
+        (if (.isInterrupted (Thread/currentThread))
+          (throw (InterruptedException.))
+          (let [msg (str "\n[Stream Error]: " (.getMessage e))]
+            (println msg)
+            (log! "[Stream Error]:" (.getMessage e))))))))
 
 ;; --- Stream Event Handler (shared by Anthropic SSE and Bedrock EventStream) ---
 (defn make-stream-handler []
-  (let [blocks       (atom (sorted-map))
-        stop-reason  (atom nil)
-        usage-data   (atom {})
-        text-started (atom false)
-        dim          "\u001b[2m"
-        rst          "\u001b[0m"]
+  (let [blocks        (atom (sorted-map))
+        stop-reason   (atom nil)
+        usage-data    (atom {})
+        text-started  (atom false)
+        in-code-block (atom false)   ; true when inside a ``` fence in streaming text
+        line-buf      (atom "")      ; partial current line, flushed on \n
+        dim           "\u001b[2m"
+        rst           "\u001b[0m"]
     {:on-event
      (fn [data]
        (case (:type data)
@@ -1194,9 +1208,20 @@
          (let [idx (:index data) delta (:delta data)]
            (case (:type delta)
              "text_delta"
-             (do (when-not @text-started (print "\nSyl: ") (reset! text-started true))
-                 (print (:text delta)) (flush)
-                 (swap! blocks update-in [idx :text] str (:text delta)))
+             (let [text  (:text delta)
+                   parts (str/split (str @line-buf text) #"\n" -1)]
+               ;; All segments except the last are complete lines — flush them now.
+               (doseq [line (butlast parts)]
+                 (when-not @text-started (print "\nSyl: ") (reset! text-started true))
+                 (let [fence? (str/starts-with? (str/trim line) "```")]
+                   (when fence? (swap! in-code-block not))
+                   (if (or fence? @in-code-block)
+                     (print (str dim line rst "\n"))
+                     (print (str line "\n"))))
+                 (flush))
+               ;; Last segment is a partial line — hold it for the next delta.
+               (reset! line-buf (last parts))
+               (swap! blocks update-in [idx :text] str text))
              "input_json_delta"
              (swap! blocks update-in [idx :input-str] str (:partial_json delta))
              "thinking_delta"
@@ -1209,7 +1234,16 @@
          "content_block_stop"
          (let [block (get @blocks (:index data))]
            (when (= (:type block) "thinking") (println rst) (flush))
-           (when (and (= (:type block) "text") @text-started) (println) (flush)))
+           (when (= (:type block) "text")
+             ;; Flush any partial line remaining in the buffer (no trailing \n in response).
+             (when (seq @line-buf)
+               (when-not @text-started (print "\nSyl: ") (reset! text-started true))
+               (if @in-code-block
+                 (print (str dim @line-buf rst))
+                 (print @line-buf))
+               (reset! line-buf "")
+               (reset! in-code-block false))
+             (when @text-started (println) (flush))))
 
          "message_delta"
          (do (reset! stop-reason (-> data :delta :stop_reason))
@@ -1366,6 +1400,9 @@
         (repeat 5 (apply str (repeat w " ")))))))
 
 (defonce ^:private anim-stop (atom nil))
+(defonce ^:private tool-spinner-stop (atom nil))
+(defonce ^:private tool-spinner-state (atom nil))   ; nil or {:label "..." :frame "⠋" :elapsed 0}
+(def current-messages (volatile! []))
 
 (defn start-thinking-animation! []
   (when terminal
@@ -1401,6 +1438,54 @@
         (doto (.writer terminal)
           (.print (str "\u001b7"
                        "\u001b[" (dec h) ";1H"
+                       "\u001b[2K"
+                       "\u001b8"))
+          (.flush))))))
+
+(defn start-tool-spinner! [cmd]
+  (when terminal
+    (let [stop?    (atom false)
+          start-ms (System/currentTimeMillis)
+          frames   ["⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏"]
+          max-cmd  40
+          label    (if (> (count cmd) max-cmd)
+                     (str (subs cmd 0 max-cmd) "…")
+                     cmd)]
+      (reset! tool-spinner-stop stop?)
+      (reset! tool-spinner-state {:label label :frame (first frames) :elapsed 0})
+      (doto (Thread.
+              (fn []
+                (loop [i 0]
+                  (when-not @stop?
+                    (let [elapsed (quot (- (System/currentTimeMillis) start-ms) 1000)
+                          frame   (nth frames (mod i (count frames)))
+                          h       (.getHeight terminal)]
+                      (reset! tool-spinner-state {:label label :frame frame :elapsed elapsed})
+                      (when (pos? h)
+                        (doto (.writer terminal)
+                          (.print (str "\u001b7"
+                                       "\u001b[" (- h 2) ";1H"
+                                       "\u001b[2K"
+                                       frame " $ " label " (" elapsed "s)"
+                                       "\u001b8"))
+                          (.flush))))
+                    (Thread/sleep 100)
+                    (recur (inc i))))))
+        (.setDaemon true)
+        (.start)))))
+
+(defn stop-tool-spinner! []
+  (when-let [s @tool-spinner-stop]
+    (reset! s true)
+    (reset! tool-spinner-stop nil))
+  (reset! tool-spinner-state nil)
+  ;; Clear row h-2 so the next draw-status-bar! restores the normal bottom bar.
+  (when terminal
+    (let [h (.getHeight terminal)]
+      (when (pos? h)
+        (doto (.writer terminal)
+          (.print (str "\u001b7"
+                       "\u001b[" (- h 2) ";1H"
                        "\u001b[2K"
                        "\u001b8"))
           (.flush))))))
@@ -1629,22 +1714,26 @@
          " " fill)))
 
 (defn make-bottom-bar []
-  ;; Identity + shortcuts: ─ model · backend · Xs ───────────── /help /status /save /exit ─
-  (let [width     (max 60 (if terminal (.getWidth terminal) 80))
-        {:keys [r dim cy wh mg]} palette
-        timeout-s (str (/ cmd-timeout-ms 1000) "s")
-        model-seg (str cy model r
-                       (when (not= backend "anthropic")
-                         (str dim " · " r wh backend r))
-                       dim " · " r wh timeout-s r)
-        model-vis (+ (count model)
-                     (if (not= backend "anthropic") (+ 3 (count backend)) 0)
-                     3 (count timeout-s))             ; " · " + timeout
-        right-vis 32  ; " /help  /status  /save  /exit ─" = 32 visible chars
-        left-vis  (+ 2 model-vis 1)                  ; "─ " + model-seg + " " before fill
-        fill      (str dim (apply str (repeat (max 0 (- width left-vis right-vis)) "─")) r)]
-    (str dim "─" r " " model-seg " " fill
-         " " mg "/help" r "  " mg "/status" r "  " mg "/save" r "  " mg "/exit" r " " dim "─" r)))
+  (let [{:keys [r dim cy wh mg]} palette]
+    (if-let [{:keys [label frame elapsed]} @tool-spinner-state]
+      ;; Spinner active: replace bottom bar with running indicator.
+      ;; draw-status-bar! calls this too, so the spinner survives status bar redraws.
+      (str frame " $ " label " (" elapsed "s)")
+      ;; Normal bar: ─ model · backend · Xs ───────────── /help /status /save /exit ─
+      (let [width     (max 60 (if terminal (.getWidth terminal) 80))
+            timeout-s (str (/ cmd-timeout-ms 1000) "s")
+            model-seg (str cy model r
+                           (when (not= backend "anthropic")
+                             (str dim " · " r wh backend r))
+                           dim " · " r wh timeout-s r)
+            model-vis (+ (count model)
+                         (if (not= backend "anthropic") (+ 3 (count backend)) 0)
+                         3 (count timeout-s))         ; " · " + timeout
+            right-vis 32  ; " /help  /status  /save  /exit ─" = 32 visible chars
+            left-vis  (+ 2 model-vis 1)              ; "─ " + model-seg + " " before fill
+            fill      (str dim (apply str (repeat (max 0 (- width left-vis right-vis)) "─")) r)]
+        (str dim "─" r " " model-seg " " fill
+             " " mg "/help" r "  " mg "/status" r "  " mg "/save" r "  " mg "/exit" r " " dim "─" r)))))
 
 ;; --- 15. Persistent Status Bars (ANSI scroll region) ---
 ;; Row 1        = top bar     (token telemetry)
@@ -1667,6 +1756,27 @@
     (let [out (.output terminal)]
       (.write out b 0 (alength b))
       (.flush out))))
+
+(defn inside-tmux?
+  "Returns true when Syl is running inside a tmux session."
+  []
+  (boolean (seq (System/getenv "TMUX"))))
+
+(defn wrap-for-tmux
+  "Wrap image bytes in the tmux DCS passthrough sequence so the outer terminal
+   receives them intact. Requires 'set -g allow-passthrough on' in tmux.conf.
+   Format: ESC P tmux ; ESC <content-with-doubled-ESCs> ESC \\"
+  [^bytes raw]
+  (let [out    (java.io.ByteArrayOutputStream.)
+        prefix (.getBytes "\u001bPtmux;" "UTF-8")]
+    (.write out prefix 0 (alength prefix))
+    (doseq [b (seq raw)]
+      (let [ub (bit-and (int b) 0xFF)]
+        (when (= ub 0x1B) (.write out 0x1B))  ; double every ESC
+        (.write out ub)))
+    (let [suffix (.getBytes "\u001b\\" "UTF-8")]
+      (.write out suffix 0 (alength suffix)))
+    (.toByteArray out)))
 
 (defn setup-scroll-region! []
   (let [h (if terminal (.getHeight terminal) 0)]
@@ -1695,6 +1805,31 @@
              "\u001b[" (- h 2) ";1H" "\u001b[2K"    ; clear row h-2
              "\u001b[" (dec h) ";1H" "\u001b[2K"    ; clear row h-1
              "\u001b[" h ";1H" "\u001b[2K")))))
+
+(defn on-resize! []
+  (when terminal
+    (let [h (.getHeight terminal)
+          w (.getWidth terminal)]
+      (when (and (pos? h) (pos? w))
+        (setup-scroll-region!)
+        (draw-status-bar! @current-messages)
+        ;; Restart thinking animation on the correct row if one is active
+        (when @anim-stop
+          (stop-thinking-animation!)
+          (start-thinking-animation!))))))
+
+(defn install-resize-handler! []
+  (Signal/handle (Signal. "WINCH")
+                 (reify SignalHandler
+                   (handle [_ _sig]
+                     (on-resize!)))))
+
+(defn install-cancel-handler! []
+  (Signal/handle (Signal. "INT")
+                 (reify SignalHandler
+                   (handle [_ _sig]
+                     (when-let [t @agent-thread]
+                       (.interrupt t))))))
 
 ;; --- Image Rendering ---
 
@@ -1852,6 +1987,11 @@
       (= override "iterm2")  :iterm2
       (= override "sixel")   :sixel
       (= override "symbols") :symbols
+      ;; Inside tmux: DA1 probe is answered by tmux itself (false positives);
+      ;; pixel bytes also need DCS passthrough wrapping to reach the outer terminal.
+      ;; Default to symbols; use SYL_IMAGE=kitty/sixel to enable pixel graphics
+      ;; (wrap-for-tmux is applied automatically in render-image-to-terminal).
+      (inside-tmux?) :symbols
       ;; Tier 1: Kitty — env var (fast, no probe)
       (contains? #{"kitty" "WezTerm" "ghostty"} term-program) :kitty
       ;; Tier 1b: iTerm2
@@ -1906,6 +2046,7 @@
                                             (apply str (repeat rows "\n"))))
                 img-start (max 2 (- (- h 3) (dec rows)))
                 raw       (if (bytes? output) output (.getBytes ^String output "UTF-8"))
+                raw       (if (inside-tmux?) (wrap-for-tmux raw) raw)
                 prefix    (.getBytes (str "\033[r\033[" img-start ";1H") "UTF-8")
                 suffix    (.getBytes (str "\033[2;" (- h 3) "r") "UTF-8")
                 buf       (java.io.ByteArrayOutputStream.)]
@@ -1937,6 +2078,8 @@
     (print-banner))
 
   (setup-scroll-region!)
+  (install-resize-handler!)
+  (install-cancel-handler!)
   (draw-status-bar! [])
 
   ;; Gather workspace context once at startup for the system prompt
@@ -1947,6 +2090,7 @@
                            [])]
 
       (loop [messages initial-msgs]
+        (vreset! current-messages messages)
         (stop-thinking-animation!)
         (let [user-input (try
                            (do (draw-status-bar! messages)
@@ -1974,13 +2118,17 @@
 
           ;; Normal message — send to Claude with streaming
           (let [initial-msgs (conj messages {:role "user" :content user-input})
-                final-msgs
-                (loop [current-msgs initial-msgs]
-                  (let [llm-response (call-claude current-msgs system-blocks)]
+                result-p     (promise)
+                t            (Thread.
+                               (fn []
+                                 (try
+                                   (deliver result-p
+                                     {:ok (loop [current-msgs initial-msgs]
+                                            (let [llm-response (call-claude current-msgs system-blocks)]
 
-                    (cond
-                      ;; Tool use — execute all tool calls
-                      (= (:type llm-response) "tool_use")
+                                              (cond
+                                                ;; Tool use — execute all tool calls
+                                                (= (:type llm-response) "tool_use")
                       (let [tool-uses    (:tool-uses llm-response)
                             tool-results (mapv (fn [tu]
                                                 (let [tool-name (:name tu)
@@ -1994,17 +2142,19 @@
                                                         (let [cmd (-> tu :input :command)
                                                               {:keys [dim r]} palette]
                                                           (println (str "\n" dim "$ " cmd r))
-                                                          (let [raw (run-in-container cmd)
+                                                          (start-tool-spinner! cmd)
+                                                          (let [raw (try
+                                                                      (run-in-container cmd)
+                                                                      (finally (stop-tool-spinner!)))
                                                                 res (process-tool-output raw cmd)
                                                                 lines       (str/split-lines res)
                                                                 max-display 40
                                                                 clipped?    (> (count lines) max-display)
-                                                                display     (str dim
-                                                                                 (str/join "\n" (take max-display lines))
+                                                                border      (str dim "│" r)
+                                                                display     (str (str/join "\n" (map #(str border " " %) (take max-display lines)))
                                                                                  (when clipped?
-                                                                                   (str "\n... [" (- (count lines) max-display)
-                                                                                        " more lines — full output sent to model]"))
-                                                                                 r)]
+                                                                                   (str "\n" border " " dim "... [" (- (count lines) max-display)
+                                                                                        " more lines — full output sent to model]" r)))]
                                                             (println display)
                                                             res))
 
@@ -2072,13 +2222,31 @@
                                             {:role "user"      :content tool-results})]
                         (recur next-msgs))
 
-                      ;; Text response — already printed by streaming, just record
-                      :else
-                      (conj current-msgs {:role "assistant" :content (:raw-model-content llm-response)}))))]
+                                                ;; Text response — already printed by streaming, just record
+                                                :else
+                                                (conj current-msgs {:role "assistant" :content (:raw-model-content llm-response)}))))})
+                                   (catch InterruptedException _
+                                     (deliver result-p {:cancelled true}))
+                                   (catch Exception e
+                                     (deliver result-p {:error e})))))
+                _            (vreset! agent-thread t)
+                _            (.start t)
+                turn-result  @result-p
+                _            (vreset! agent-thread nil)]
 
-            (let [next-msgs (compact-history final-msgs)]
-              (save-session! next-msgs)
-              (recur next-msgs))))))))
+            (cond
+              (:ok turn-result)
+              (let [next-msgs (compact-history (:ok turn-result))]
+                (save-session! next-msgs)
+                (recur next-msgs))
+
+              (:cancelled turn-result)
+              (do (move-to-scroll!)
+                  (println "\n[Syl] Cancelled. (Ctrl+C)")
+                  (recur messages))
+
+              (:error turn-result)
+              (throw (:error turn-result)))))))))
 
 (when *main-script*
   (.addShutdownHook (Runtime/getRuntime)
