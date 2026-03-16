@@ -91,6 +91,7 @@
   (println "  /status              Show session stats (tokens, message count)")
   (println "  /save                Save conversation to disk")
   (println "  /log                 Show last 20 lines of debug log (.syl/syl.log)")
+  (println "  /memory [key]        List memory keys, or show a specific memory entry")
   (println "  /exit  /quit         Gracefully shut down Syl and remove the container")
   (System/exit 0))
 
@@ -862,6 +863,8 @@
                 wait-secs   (or retry-after (long (* (Math/pow 2 attempt) 2)))]
             (println (str "\n[Compaction rate limited] Waiting " wait-secs "s before retry "
                           (inc attempt) "/" max-retries "..."))
+            (log! "[Compaction rate limited] Waiting" wait-secs "s before retry"
+                  (str (inc attempt) "/" max-retries))
             (Thread/sleep (* wait-secs 1000))
             (recur (inc attempt)))
 
@@ -910,6 +913,8 @@
                 wait-secs   (or retry-after (long (* (Math/pow 2 attempt) 2)))]
             (println (str "\n[Extraction rate limited] Waiting " wait-secs "s before retry "
                           (inc attempt) "/" max-retries "..."))
+            (log! "[Extraction rate limited] Waiting" wait-secs "s before retry"
+                  (str (inc attempt) "/" max-retries))
             (Thread/sleep (* wait-secs 1000))
             (recur (inc attempt)))
 
@@ -1032,6 +1037,8 @@
                 wait-secs   (or retry-after (long (* (Math/pow 2 attempt) 2)))]
             (println (str "\n[Dispatch rate limited] Waiting " wait-secs "s before retry "
                           (inc attempt) "/" max-retries "..."))
+            (log! "[Dispatch rate limited] Waiting" wait-secs "s before retry"
+                  (str (inc attempt) "/" max-retries))
             (Thread/sleep (* wait-secs 1000))
             (recur (inc attempt)))
 
@@ -1199,7 +1206,12 @@
        (let [result-blocks (mapv (fn [[_ block]]
                                    (if (= (:type block) "tool_use")
                                      (-> block
-                                         (assoc :input (or (json/parse-string (:input-str block) true) {}))
+                                         (assoc :input (try
+                                                         (json/parse-string (:input-str block) true)
+                                                         (catch Exception e
+                                                           (log! "[Syl] Tool call parse error for" (:name block)
+                                                                 "-" (.getMessage e))
+                                                           {:__syl-parse-error true})))
                                          (dissoc :input-str))
                                      block))
                                  @blocks)
@@ -1284,6 +1296,8 @@
                   wait-secs   (or retry-after (long (* (Math/pow 2 attempt) 2)))]
               (println (str "\n[Rate limited] Waiting " wait-secs "s before retry "
                             (inc attempt) "/" max-retries "..."))
+              (log! "[Rate limited] Waiting" wait-secs "s before retry"
+                    (str (inc attempt) "/" max-retries))
               (Thread/sleep (* wait-secs 1000))
               (recur (inc attempt)))
             (do
@@ -1380,6 +1394,7 @@
        "    /status             — Show session stats (tokens used, message count)\n"
        "    /save               — Save conversation to disk for later --resume\n"
        "    /log                — Show the last 20 lines of the debug log (.syl/syl.log)\n"
+       "    /memory [key]       — List all memory keys, or show the contents of a specific key\n"
        "    /workflow <name>    — Run a workflow pipeline (or list available workflows)\n"
        "    /exit               — Gracefully shut down Syl and remove the container\n"
        "    /quit               — Alias for /exit\n"))
@@ -1416,6 +1431,11 @@
       (do (save-session! messages)
           (println "[Syl] Session saved to" session-file)
           {:action :continue :messages messages})
+
+      (or (= trimmed "/memory") (str/starts-with? trimmed "/memory "))
+      (let [key (str/trim (subs trimmed (count "/memory")))]
+        (println (str "\n" (memory-read key) "\n"))
+        {:action :continue :messages messages})
 
       (= trimmed "/log")
       (let [f (java.io.File. (str session-dir "/syl.log"))]
@@ -1946,13 +1966,26 @@
                                                 (let [tool-name (:name tu)
                                                       _ (move-to-scroll!)
                                                       output
-                                                      (case tool-name
+                                                      (if (:__syl-parse-error (:input tu))
+                                                        (do (println (str "[Syl] Tool call parse error — skipping " tool-name))
+                                                            (str "[Tool call skipped: JSON parse error for " tool-name "]"))
+                                                        (case tool-name
                                                         "run_bash"
-                                                        (let [cmd (-> tu :input :command)]
-                                                          (println (str "\n$ " cmd))
+                                                        (let [cmd (-> tu :input :command)
+                                                              {:keys [dim r]} palette]
+                                                          (println (str "\n" dim "$ " cmd r))
                                                           (let [raw (run-in-container cmd)
-                                                                res (process-tool-output raw cmd)]
-                                                            (println res)
+                                                                res (process-tool-output raw cmd)
+                                                                lines       (str/split-lines res)
+                                                                max-display 40
+                                                                clipped?    (> (count lines) max-display)
+                                                                display     (str dim
+                                                                                 (str/join "\n" (take max-display lines))
+                                                                                 (when clipped?
+                                                                                   (str "\n... [" (- (count lines) max-display)
+                                                                                        " more lines — full output sent to model]"))
+                                                                                 r)]
+                                                            (println display)
                                                             res))
 
                                                         "memory_write"
@@ -2009,7 +2042,7 @@
                                                           (render-image-to-terminal path {:caption caption})
                                                           (str "Image displayed: " path))
 
-                                                        (str "Unknown tool: " tool-name))]
+                                                        (str "Unknown tool: " tool-name)))]
                                                   {:type        "tool_result"
                                                    :tool_use_id (:id tu)
                                                    :content     output}))
