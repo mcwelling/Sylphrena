@@ -28,7 +28,7 @@ Syl is a lightweight AI agent harness written in [Babashka](https://babashka.org
 3. **Git Identity** — Your host's `git config` identity (`user.name`, `user.email`) is read and applied inside the container, so commits are attributed correctly.
 4. **Workspace Context & Memory** — At startup, Syl auto-injects a directory listing, `git status`, and any persistent memories from previous sessions into the system prompt, so she knows the project and your preferences without burning a tool call.
 5. **Conversation Loop** — You chat with Syl in a terminal REPL. Responses stream in real-time — via Server-Sent Events (SSE) on the Anthropic backend, or binary EventStream on the Bedrock backend.
-6. **Tool Execution** — When Claude decides to run commands, Syl executes them inside the sandboxed container and feeds results back into the conversation. Parallel tool calls are supported. Syl has five built-in tools: `run_bash`, `memory_write`, `memory_read`, `workflow_write`, and `workflow_delete`.
+6. **Tool Execution** — When Claude decides to run commands, Syl executes them inside the sandboxed container and feeds results back into the conversation. Parallel tool calls are supported. Syl has seven built-in tools: `run_bash`, `read_file`, `show_image`, `memory_write`, `memory_read`, `workflow_write`, and `workflow_delete`.
 7. **Context Compaction** — When the conversation grows beyond `max-history` messages, Syl asks Claude (via a fast `claude-haiku-4-5` model) to summarize older messages into a compact digest. The most recent `compact-keep` messages are kept verbatim. A role-boundary correction ensures the kept messages always start on a plain `user` message. If summarization fails, a simple trim fallback ensures the conversation continues gracefully.
 8. **Container Health Check** — Before every command execution, Syl checks that the container is still alive. If it has died (OOM, manual removal, etc.), she automatically resummons and reconfigures it before proceeding.
 9. **Safety** — Your code runs in an isolated, memory-limited (2GB) container. Nothing touches your host system directly. SSH keys are mounted read-only for extra protection.
@@ -117,9 +117,11 @@ Options:
   --rate-limit <tpm>   Input tokens-per-minute budget (default: 30000)
                        Raise if your Anthropic tier allows more (e.g. 80000 for Tier 2)
                        Tip: use --backend bedrock to bypass Anthropic rate limits entirely
+  --image <protocol>   Image rendering protocol: kitty, iterm2, sixel, symbols, none
+                         (also: SYL_IMAGE=<protocol>)
   --resume             Resume previous conversation session
   --no-banner          Skip the startup splash banner
-  --light               Use dark-color palette for light terminal backgrounds
+  --light              Use light-terminal color palette
                          (also: SYL_THEME=light)
   --help               Show this help message
 
@@ -128,7 +130,13 @@ Environment:
   SYL_MODEL            Model override (--model takes precedence)
   SYL_BACKEND          Backend override: 'anthropic' or 'bedrock' (--backend takes precedence)
   SYL_RATE_LIMIT       Token-per-minute budget override (--rate-limit takes precedence)
-  SYL_THEME             Set to 'light' to use dark-color palette (--light takes precedence)
+  SYL_THEME            Set to 'light' to use light-terminal color palette (--light takes precedence)
+  SYL_IMAGE            Image protocol override (--image takes precedence)
+
+Config file (lowest priority, overridden by env vars and CLI args):
+  .syl/config.edn      Per-project settings. Example:
+                         {:model "claude-opus-4-6" :rate-limit 60000 :image "kitty"}
+                       Supported keys: :model :backend :rate-limit :theme :image
 
   AWS (required for bedrock backend):
   AWS_ACCESS_KEY_ID      Your AWS access key
@@ -172,6 +180,9 @@ Type these at the `You:` prompt during a session:
 | `/clear`             | Reset conversation history (container is preserved)      |
 | `/status`            | Show session stats: model, backend, tokens used, message count |
 | `/save`              | Save conversation to `.syl/session.json` for later `--resume` |
+| `/log`               | Show the last 20 lines of `.syl/syl.log` (errors, rate limits, events) |
+| `/memory`            | List all persistent memory keys and their contents       |
+| `/memory <key>`      | Show the contents of a specific memory key               |
 | `/workflow`          | List available workflow pipelines                        |
 | `/workflow <name>`   | Run a named workflow pipeline                            |
 | `/exit`              | Gracefully shut down Syl and remove the container        |
@@ -193,16 +204,17 @@ These top-level variables are defined at the top of `syl.bb` and can be adjusted
 | `max-retries`      | `5`                  | API retry attempts on rate-limit (429/529)                    |
 | `rate-limit-budget` | `30000`             | Input tokens per minute budget for proactive throttling       |
 
-The following values can be set at runtime via CLI flags or environment variables:
+The following values can be set at runtime via CLI flags, environment variables, or `.syl/config.edn` (priority: CLI > env > config file > default):
 
-| Value          | How to change                                                              |
-|----------------|---------------------------------------------------------------------------|
-| Model          | `--model <name>` flag or `SYL_MODEL` env var                              |
-| Backend        | `--backend <name>` flag or `SYL_BACKEND` env var (`anthropic` or `bedrock`) |
-| Timeout        | `--timeout <secs>` flag                                                   |
-| Thinking budget | `--thinking <tokens>` flag                                               |
-| Rate limit      | `--rate-limit <tpm>` flag or `SYL_RATE_LIMIT` env var                   |
-| Theme           | `--light` flag or `SYL_THEME=light` env var                               |
+| Value           | CLI flag                  | Env var           | config.edn key  |
+|-----------------|---------------------------|-------------------|-----------------|
+| Model           | `--model <name>`          | `SYL_MODEL`       | `:model`        |
+| Backend         | `--backend <name>`        | `SYL_BACKEND`     | `:backend`      |
+| Timeout         | `--timeout <secs>`        | —                 | —               |
+| Thinking budget | `--thinking <tokens>`     | —                 | —               |
+| Rate limit      | `--rate-limit <tpm>`      | `SYL_RATE_LIMIT`  | `:rate-limit`   |
+| Theme           | `--light`                 | `SYL_THEME=light` | `:theme "light"`|
+| Image protocol  | `--image <protocol>`      | `SYL_IMAGE`       | `:image`        |
 
 ## Under the Hood
 
@@ -355,11 +367,13 @@ When extended thinking is enabled (`--thinking <budget>`), a windspren animation
 
 ### Output Extraction & Truncation
 
-Raw tool output is filtered through two layers before being stored in conversation history:
+Tool output is processed through three layers:
 
-1. **`max-tool-output` truncation** — Any tool result longer than `max-tool-output` characters (default: `8000`) is hard-truncated. This keeps the context window from ballooning on verbose commands.
+1. **Display cap** — `run_bash` output is capped at 40 lines in the terminal. If the result is longer, a `... [N more lines — full output sent to model]` trailer is shown. The full output is still forwarded to the model. Output is rendered in a dim style to visually distinguish it from prose.
 
-2. **Haiku-based extraction** — When a command returns output that is large or contains HTML (e.g. a `curl` returning a webpage), Syl calls `claude-haiku-4-5` with a focused extraction prompt: *"Given this raw output and the command that produced it, extract ONLY the relevant information. Return plain text or compact JSON — never HTML."* The extracted summary replaces the raw output in history. This uses the same retry/backoff logic as the main API loop and supports both Anthropic and Bedrock backends.
+2. **`max-tool-output` truncation** — Any tool result longer than `max-tool-output` characters (default: `8000`) is hard-truncated before being stored in conversation history. This keeps the context window from ballooning on verbose commands.
+
+3. **Haiku-based extraction** — When a command returns output that is large or contains HTML (e.g. a `curl` returning a webpage), Syl calls `claude-haiku-4-5` with a focused extraction prompt: *"Given this raw output and the command that produced it, extract ONLY the relevant information. Return plain text or compact JSON — never HTML."* The extracted summary replaces the raw output in history. This uses the same retry/backoff logic as the main API loop and supports both Anthropic and Bedrock backends.
 
 ### Persistent Memory
 
@@ -368,6 +382,9 @@ Syl's long-term memory is stored as plain markdown files in `.syl/memory/`:
 ```markdown
 .syl/
 ├── session.json              # Conversation history (ephemeral)
+├── syl.log                   # Append-only error/event log (errors, retries, stream failures)
+├── history                   # JLine3 input history (arrow-up across sessions)
+├── config.edn                # Per-project settings (optional)
 ├── memory/
 │   ├── project-stack.md      # e.g. "Babashka + Podman + Claude API"
 │   ├── user-preferences.md   # e.g. "Prefers concise responses, uses zsh"

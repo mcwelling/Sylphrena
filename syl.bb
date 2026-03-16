@@ -79,6 +79,11 @@
   (println "  SYL_THEME            Set to 'light' to use dark-color palette (--light takes precedence)")
   (println "  SYL_IMAGE            Image protocol override (--image takes precedence)")
   (println)
+  (println "Config file (lowest priority, overridden by env vars and CLI args):")
+  (println "  .syl/config.edn      Per-project settings. Supported keys:")
+  (println "                         :model :backend :rate-limit :theme :image")
+  (println "                       Example: {:model \"claude-opus-4-6\" :rate-limit 60000}")
+  (println)
   (println "  AWS (required for bedrock backend):")
   (println "  AWS_ACCESS_KEY_ID      Your AWS access key")
   (println "  AWS_SECRET_ACCESS_KEY  Your AWS secret key")
@@ -98,15 +103,28 @@
 ;; --- Configuration ---
 (def container-name "syl-agent")
 (def project-dir    (System/getProperty "user.dir"))
+
+;; Load per-project config from .syl/config.edn (if present).
+;; Keys: :model :backend :rate-limit :theme :image
+;; Priority: CLI args > env vars > config.edn > built-in defaults
+(def file-config
+  (let [f (java.io.File. (str project-dir "/.syl/config.edn"))]
+    (if (.exists f)
+      (try (clojure.edn/read-string (slurp f))
+           (catch Exception e
+             (println (str "[Syl] Warning: could not parse .syl/config.edn — " (.getMessage e)))
+             {}))
+      {})))
+
 (def api-key        (System/getenv "ANTHROPIC_API_KEY"))
-(def backend        (or (:backend cli-args) (System/getenv "SYL_BACKEND") "anthropic"))
+(def backend        (or (:backend cli-args) (System/getenv "SYL_BACKEND") (:backend file-config) "anthropic"))
 
 (when (and *main-script* (= backend "anthropic") (str/blank? api-key))
   (println "Error: ANTHROPIC_API_KEY environment variable is missing.")
   (System/exit 1))
 
 (def anthropic-url    "https://api.anthropic.com/v1/messages")
-(def model            (or (:model cli-args) (System/getenv "SYL_MODEL") "claude-sonnet-4-6"))
+(def model            (or (:model cli-args) (System/getenv "SYL_MODEL") (:model file-config) "claude-sonnet-4-6"))
 (def compaction-model "claude-haiku-4-5")
 (def max-tool-output        8000)
 (def extraction-threshold   3000)  ;; chars — trigger Haiku extraction above this
@@ -268,6 +286,7 @@
 ;; Track input tokens per minute and proactively throttle before hitting the limit.
 (def rate-limit-budget (or (:rate-limit cli-args)
                            (some-> (System/getenv "SYL_RATE_LIMIT") parse-long)
+                           (:rate-limit file-config)
                            30000))
 (def rate-window-ms    60000)
 (def recent-api-calls  (atom []))
@@ -1477,7 +1496,8 @@
 
 ;; --- 12. Color Palette ---
 (def light-mode? (or (:light cli-args)
-                     (= (System/getenv "SYL_THEME") "light")))
+                     (= (System/getenv "SYL_THEME") "light")
+                     (= (:theme file-config) "light")))
 
 (def dark-palette
   {:cy  "\u001b[96m"   :ye  "\u001b[93m"  :wh  "\u001b[97m"
@@ -1822,7 +1842,7 @@
   "Detect the best image rendering protocol for the current terminal.
    Checks CLI flag, SYL_IMAGE env var, TERM_PROGRAM, then active probes."
   []
-  (let [override     (or (:image cli-args) (System/getenv "SYL_IMAGE"))
+  (let [override     (or (:image cli-args) (System/getenv "SYL_IMAGE") (:image file-config))
         term-program (or (System/getenv "TERM_PROGRAM") "")
         lc-terminal  (or (System/getenv "LC_TERMINAL") "")]
     (cond
