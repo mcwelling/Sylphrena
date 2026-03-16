@@ -10,7 +10,7 @@
         '[javax.crypto Mac]
         '[javax.crypto.spec SecretKeySpec]
         '[org.jline.terminal TerminalBuilder]
-        '[org.jline.reader LineReaderBuilder EndOfFileException UserInterruptException])
+        '[org.jline.reader LineReader LineReaderBuilder EndOfFileException UserInterruptException])
 
 ;; --- CLI Argument Parsing ---
 (defn parse-cli-args [args]
@@ -42,7 +42,13 @@
 
 (def line-reader
   (when (and *main-script* terminal)
-    (-> (LineReaderBuilder/builder) (.terminal terminal) (.build))))
+    (let [syl-dir      (str (System/getProperty "user.dir") "/.syl")
+          history-file (java.io.File. syl-dir "history")]
+      (.mkdirs (java.io.File. syl-dir))
+      (-> (LineReaderBuilder/builder)
+          (.terminal terminal)
+          (.variable LineReader/HISTORY_FILE history-file)
+          (.build)))))
 
 (when (and *main-script* (:help cli-args))
   (println "Usage: ./syl.bb [options]")
