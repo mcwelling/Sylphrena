@@ -1259,12 +1259,16 @@
        (let [result-blocks (mapv (fn [[_ block]]
                                    (if (= (:type block) "tool_use")
                                      (-> block
-                                         (assoc :input (try
-                                                         (json/parse-string (:input-str block) true)
-                                                         (catch Exception e
-                                                           (log! "[Syl] Tool call parse error for" (:name block)
-                                                                 "-" (.getMessage e))
-                                                           {:__syl-parse-error true})))
+                                         (assoc :input (let [s      (:input-str block "")]
+                                                         (if (str/blank? s)
+                                                           {}
+                                                           (let [parsed (try
+                                                                          (json/parse-string s true)
+                                                                          (catch Exception e
+                                                                            (log! "[Syl] Tool call parse error for" (:name block)
+                                                                                  "-" (.getMessage e))
+                                                                            nil))]
+                                                             (if (map? parsed) parsed {:__syl-parse-error true})))))
                                          (dissoc :input-str))
                                      block))
                                  @blocks)
