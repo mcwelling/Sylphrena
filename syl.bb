@@ -453,6 +453,11 @@
     (println "[Syl Setup] Image cached as " baked-image "."))
   (write-container-marker))
 
+(defn workspace-mounted? []
+  "Returns true if /workspace is a live bind mount in the running container."
+  (zero? (:exit (shell {:continue true :out :string :err :string}
+                       (str "podman exec " container-name " mountpoint -q /workspace")))))
+
 (defn start-or-resume-container []
   (let [saved-id (read-container-marker)
         fresh?   (:fresh cli-args)
@@ -463,7 +468,11 @@
       (do (println "Resuming container...")
           (shell {:continue true :out :string :err :string}
                  (str "podman start " container-name))
-          (configure-git-and-ssh))
+          (configure-git-and-ssh)
+          (when-not (workspace-mounted?)
+            (println "[Syl] Workspace bind mount lost after warm start — rebuilding container...")
+            (nuke-container false)
+            (cold-start-container)))
       (do (nuke-container fresh?)
           (cold-start-container)))))
 
@@ -2121,7 +2130,11 @@
         (vreset! current-messages messages)
         (stop-thinking-animation!)
         (let [user-input (try
-                           (do (draw-status-bar! messages)
+                           (do (when terminal
+                                 (let [h (.getHeight terminal)]
+                                   (when (pos? h)
+                                     (term-write! (str "\u001b[" (dec h) ";1H")))))
+                               (draw-status-bar! messages)
                                (.readLine line-reader "You: "))
                            (catch EndOfFileException _  nil)
                            (catch UserInterruptException _ nil))]
@@ -2266,6 +2279,7 @@
               (:ok turn-result)
               (let [next-msgs (compact-history (:ok turn-result))]
                 (save-session! next-msgs)
+                (move-to-scroll!)
                 (recur next-msgs))
 
               (:cancelled turn-result)
