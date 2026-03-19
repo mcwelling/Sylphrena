@@ -98,6 +98,7 @@
   (println "  /save                Save conversation to disk")
   (println "  /log                 Show last 20 lines of debug log (.syl/syl.log)")
   (println "  /memory [key]        List memory keys, or show a specific memory entry")
+  (println "  /workflow <name>     Run a workflow pipeline (or list available workflows)")
   (println "  /exit  /quit         Gracefully shut down Syl and remove the container")
   (System/exit 0))
 
@@ -310,14 +311,7 @@
                                    :mem-pct (or mem-pct 0.0)}))))
     (catch Exception _ nil)))
 
-(defn start-stats-poller! []
-  (doto (Thread. (fn []
-                   (loop []
-                     (poll-container-stats!)
-                     (Thread/sleep 5000)
-                     (recur))))
-    (.setDaemon true)
-    (.start)))
+(declare start-stats-poller!)
 
 (defn prune-old-calls! []
   (let [cutoff (- (System/currentTimeMillis) rate-window-ms)]
@@ -1516,7 +1510,8 @@
           {:action :continue :messages messages})
 
       (= trimmed "/clear")
-      (do (println "\n[Syl] Conversation history cleared. The container lives on.\n")
+      (do (stop-thinking-animation!)
+          (println "\n[Syl] Conversation history cleared. The container lives on.\n")
           {:action :continue :messages []})
 
       (= trimmed "/status")
@@ -1799,6 +1794,17 @@
              (make-bottom-bar)
              "\u001b8"                               ; restore cursor
              "\u001b[" (dec h) ";1H")))))            ; then move to input row (h-1)
+
+(defn start-stats-poller! []
+  (doto (Thread. (fn []
+                   (loop []
+                     (poll-container-stats!)
+                     (when (nil? @agent-thread)
+                       (draw-status-bar! @current-messages))
+                     (Thread/sleep 5000)
+                     (recur))))
+    (.setDaemon true)
+    (.start)))
 
 (defn teardown-scroll-region! []
   (let [h (if terminal (.getHeight terminal) 0)]
