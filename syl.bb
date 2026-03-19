@@ -437,6 +437,7 @@
     (when has-bake? (println "[Syl Setup] Using cached image — skipping dependency install."))
     (shell (str "podman run -d --name " container-name " "
                 "--memory=2g "
+                "-e TERM=xterm-256color "
                 "-e TERM_PROGRAM=" (System/getenv "TERM_PROGRAM") " "
                 "-v " project-dir ":/workspace:rw "
                 (if (.exists (java.io.File. ssh-dir))
@@ -1810,8 +1811,7 @@
              (make-top-bar messages)
              "\u001b[" (- h 2) ";1H" "\u001b[2K"    ; row h-2: bottom bar
              (make-bottom-bar)
-             "\u001b8"                               ; restore cursor
-             "\u001b[" (dec h) ";1H")))))            ; then move to input row (h-1)
+             "\u001b8")))))                          ; restore cursor — let JLine3 own the input row
 
 (defn start-stats-poller! []
   (doto (Thread. (fn []
