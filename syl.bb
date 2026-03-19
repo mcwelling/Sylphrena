@@ -333,9 +333,16 @@
             (prune-old-calls!)))))))
 
 ;; --- 1. Container Management ---
-(defn nuke-container []
-  (shell {:continue true :out :string :err :string}
-         (str "podman rm -f " container-name)))
+(def baked-image "syl-agent-ready:latest")
+
+(defn nuke-container
+  ([]      (nuke-container false))
+  ([hard?]
+   (shell {:continue true :out :string :err :string}
+          (str "podman rm -f " container-name))
+   (when hard?
+     (shell {:continue true :out :string :err :string}
+            (str "podman rmi -f " baked-image)))))
 
 (defn exec-setup [& cmd]
   @(process (into ["podman" "exec" container-name] cmd)
@@ -417,10 +424,17 @@
                         (str "podman inspect --format '{{.Id}}' " container-name)))]
     (spit container-ready-file (str/trim id))))
 
+(defn baked-image-exists? []
+  (zero? (:exit (shell {:continue true :out :string :err :string}
+                       (str "podman image exists " baked-image)))))
+
 (defn cold-start-container []
-  (let [home    (System/getProperty "user.home")
-        ssh-dir (str home "/.ssh")]
+  (let [home      (System/getProperty "user.home")
+        ssh-dir   (str home "/.ssh")
+        has-bake? (baked-image-exists?)
+        base      (if has-bake? baked-image "mcr.microsoft.com/devcontainers/base:ubuntu")]
     (println "Summoning a more powerful Syl in:" project-dir)
+    (when has-bake? (println "[Syl Setup] Using cached image — skipping dependency install."))
     (shell (str "podman run -d --name " container-name " "
                 "--memory=2g "
                 "-e TERM_PROGRAM=" (System/getenv "TERM_PROGRAM") " "
@@ -429,9 +443,13 @@
                   (str "-v " ssh-dir ":/root/.ssh:ro ")
                   "")
                 "--workdir /workspace "
-                "-it mcr.microsoft.com/devcontainers/base:ubuntu /bin/bash")))
+                "-it " base " /bin/bash")))
   (configure-git-and-ssh)
-  (setup-tools)
+  (when-not (baked-image-exists?)
+    (setup-tools)
+    (println "[Syl Setup] Baking image for fast restarts...")
+    (shell (str "podman commit " container-name " " baked-image))
+    (println "[Syl Setup] Image cached as " baked-image "."))
   (write-container-marker))
 
 (defn start-or-resume-container []
@@ -445,7 +463,7 @@
           (shell {:continue true :out :string :err :string}
                  (str "podman start " container-name))
           (configure-git-and-ssh))
-      (do (nuke-container)
+      (do (nuke-container fresh?)
           (cold-start-container)))))
 
 ;; --- 2. Container Health Check ---
