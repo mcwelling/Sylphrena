@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Syl Setup Script
-# Checks for required dependencies and helps configure the environment.
+# Checks prerequisites, builds the binary, and installs the `syl` command.
 
 BOLD="\033[1m"
 GREEN="\033[32m"
@@ -29,17 +29,14 @@ case "$(uname -s)" in
   Linux*)  OS="linux" ;;
 esac
 
-# --- Check Babashka ---
-if command -v bb &>/dev/null; then
-  bb_version=$(bb --version 2>&1 | head -1)
-  pass "Babashka installed ($bb_version)"
+# --- Check Rust toolchain ---
+if command -v cargo &>/dev/null; then
+  rust_version=$(rustc --version 2>&1)
+  pass "Rust toolchain installed ($rust_version)"
 else
-  fail "Babashka not found"
-  if [ "$OS" = "macos" ]; then
-    info "Install with: brew install borkdude/brew/babashka"
-  else
-    info "Install with: bash < <(curl -s https://raw.githubusercontent.com/babashka/babashka/master/install)"
-  fi
+  fail "Rust toolchain not found"
+  info "Install with: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
+  info "Then: source \"\$HOME/.cargo/env\""
   errors=$((errors + 1))
 fi
 
@@ -48,7 +45,6 @@ if command -v podman &>/dev/null; then
   podman_version=$(podman --version 2>&1)
   pass "Podman installed ($podman_version)"
 
-  # Check Podman machine (macOS only)
   if [ "$OS" = "macos" ]; then
     if podman machine inspect &>/dev/null; then
       machine_state=$(podman machine inspect --format '{{.State}}' 2>/dev/null || echo "unknown")
@@ -81,7 +77,6 @@ if command -v git &>/dev/null; then
   git_version=$(git --version 2>&1)
   pass "Git installed ($git_version)"
 
-  # Check git identity
   git_name=$(git config --global user.name 2>/dev/null || echo "")
   git_email=$(git config --global user.email 2>/dev/null || echo "")
   if [ -n "$git_name" ] && [ -n "$git_email" ]; then
@@ -101,13 +96,11 @@ echo
 echo -e "${BOLD}API Configuration${RESET}\n"
 
 if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
-  # Show first 10 and last 4 chars
   key_preview="${ANTHROPIC_API_KEY:0:10}...${ANTHROPIC_API_KEY: -4}"
   pass "ANTHROPIC_API_KEY is set ($key_preview)"
 else
   fail "ANTHROPIC_API_KEY is not set"
 
-  # Only prompt interactively if stdin is a terminal
   api_key=""
   if [ -t 0 ]; then
     echo
@@ -115,7 +108,6 @@ else
   fi
 
   if [ -n "$api_key" ]; then
-    # Detect shell config file
     shell_rc=""
     if [ -n "${ZSH_VERSION:-}" ] || [ "$(basename "$SHELL")" = "zsh" ]; then
       shell_rc="$HOME/.zshrc"
@@ -149,9 +141,9 @@ else
   fi
 fi
 
-# --- Check AWS Credentials (for Bedrock backend) ---
+# --- Check AWS Credentials (optional — for Bedrock backend) ---
 echo
-echo -e "${BOLD}AWS Configuration (optional — for Bedrock backend)${RESET}\n"
+echo -e "${BOLD}AWS Configuration (optional — for --backend bedrock)${RESET}\n"
 
 if [ -n "${AWS_ACCESS_KEY_ID:-}" ] && [ -n "${AWS_SECRET_ACCESS_KEY:-}" ]; then
   key_preview="${AWS_ACCESS_KEY_ID:0:6}...${AWS_ACCESS_KEY_ID: -4}"
@@ -188,17 +180,72 @@ else
   warn "Skipping image pull (Podman not installed)"
 fi
 
-# --- Make syl.bb executable ---
-if [ -f "./syl.bb" ]; then
-  chmod +x ./syl.bb
-  pass "syl.bb is executable"
+# --- Build ---
+echo
+echo -e "${BOLD}Build${RESET}\n"
+
+if command -v cargo &>/dev/null; then
+  info "Building syl (release)..."
+  if cargo build --release 2>&1; then
+    pass "Build succeeded → target/release/syl"
+  else
+    fail "Build failed"
+    errors=$((errors + 1))
+  fi
+else
+  warn "Skipping build (cargo not found)"
+fi
+
+# --- Install `syl` command ---
+echo
+echo -e "${BOLD}Installing syl command${RESET}\n"
+
+INSTALL_DIR="$HOME/.local/bin"
+BINARY="$(pwd)/target/release/syl"
+
+if [ ! -f "$BINARY" ]; then
+  warn "Binary not found at $BINARY — skipping install (fix build errors first)"
+else
+  mkdir -p "$INSTALL_DIR"
+  ln -sf "$BINARY" "$INSTALL_DIR/syl"
+  pass "Symlink created: $INSTALL_DIR/syl → $BINARY"
+
+  # Check if INSTALL_DIR is on PATH
+  if echo "$PATH" | tr ':' '\n' | grep -qx "$INSTALL_DIR"; then
+    pass "$INSTALL_DIR is on your PATH"
+  else
+    warn "$INSTALL_DIR is not on your PATH"
+
+    shell_rc=""
+    if [ -n "${ZSH_VERSION:-}" ] || [ "$(basename "$SHELL")" = "zsh" ]; then
+      shell_rc="$HOME/.zshrc"
+    elif [ -n "${BASH_VERSION:-}" ] || [ "$(basename "$SHELL")" = "bash" ]; then
+      shell_rc="$HOME/.bashrc"
+    fi
+
+    if [ -n "$shell_rc" ] && [ -t 0 ]; then
+      read -rp "  Add $INSTALL_DIR to PATH in $shell_rc? [Y/n]: " confirm
+      confirm=${confirm:-Y}
+      if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        echo "" >> "$shell_rc"
+        echo "# Added by Syl setup" >> "$shell_rc"
+        echo "export PATH=\"$INSTALL_DIR:\$PATH\"" >> "$shell_rc"
+        pass "Added $INSTALL_DIR to PATH in $shell_rc"
+        info "Run 'source $shell_rc' or open a new terminal, then type: syl"
+      else
+        info "Add it manually: export PATH=\"$INSTALL_DIR:\$PATH\""
+      fi
+    else
+      info "Add to your shell config: export PATH=\"$INSTALL_DIR:\$PATH\""
+    fi
+  fi
 fi
 
 # --- Summary ---
 echo
 if [ $errors -eq 0 ]; then
-  echo -e "${GREEN}${BOLD}Ready!${RESET} Run ${CYAN}./syl.bb${RESET} to start Syl."
+  echo -e "${GREEN}${BOLD}Ready!${RESET} Run ${CYAN}syl${RESET} from this directory to start."
 else
-  echo -e "${YELLOW}${BOLD}$errors issue(s) found.${RESET} Fix them above, then run ${CYAN}./syl.bb${RESET}"
+  echo -e "${YELLOW}${BOLD}$errors issue(s) found.${RESET} Fix them above, then re-run ${CYAN}./setup.sh${RESET}"
 fi
 echo
