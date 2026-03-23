@@ -1,0 +1,44 @@
+[package]
+name = "syl-rs"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "syl_rs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "syl"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+regex = "1"
+chrono = { version = "0.4", features = ["std", "clock"], default-features = false }
+sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
+base64 = "0.22"
+toml = "0.8"
+anyhow = "1"
+thiserror = "1"
+
+# Logging
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender   = "0.2"
+
+# Async runtime + HTTP
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+crossterm = "0.28"
+rustyline = "14"
+bytes = "1"
+futures-util = "0.3"
+
+[dev-dependencies]
+tempfile = "3"
+wiremock = "0.6"
+tokio = { version = "1", features = ["full"] }
