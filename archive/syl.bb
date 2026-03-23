@@ -1,6 +1,6 @@
 #!/usr/bin/env bb
 
-(require '[babashka.process :refer [shell process]]
+(require '[babashka.process :refer [shell process destroy]]
          '[babashka.http-client :as http]
          '[cheshire.core :as json]
          '[clojure.string :as str])
@@ -502,7 +502,7 @@
       (let [result (deref p cmd-timeout-ms :timeout)
             _      (vreset! running-process nil)]
         (if (= result :timeout)
-          (do (.destroy p)
+          (do (destroy p)
               (str "Error: Command timed out after " (/ cmd-timeout-ms 1000) " seconds."))
           (let [{:keys [exit out err]} result]
             (if (= 0 exit)
@@ -511,7 +511,7 @@
                    (str/trim (str out (when (and (not (str/blank? out)) (not (str/blank? err))) "\n") err)))))))
       (catch InterruptedException _
         (vreset! running-process nil)
-        (.destroy p)
+        (destroy p)
         (throw (InterruptedException.))))))
 
 ;; --- 4. File Pagination ---

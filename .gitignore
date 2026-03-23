@@ -1,8 +1,5 @@
-
-# Babashka / clj-kondo cache
-.clj-kondo/.cache/
-.clj-kondo/imports/
-.cpcache/
+# Rust build artifacts
+target/
 
 # Syl session data
 .syl/
@@ -13,9 +10,13 @@
 # IDE / Editor artifacts
 .idea/
 .lsp/
+.clj-kondo/
 
 # Backup files
 *.bak
 
 # Local docs (not for remote)
 docs/
+
+# Test artifacts
+syl-greeting.png
