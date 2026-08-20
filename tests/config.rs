@@ -83,8 +83,11 @@ fn cli_flag_overrides_default() {
 fn toml_file_overrides_default() {
     let tmp = temp_syl_dir();
     let toml_path = tmp.path().join("config.toml");
-    std::fs::write(&toml_path, "model = \"claude-sonnet-4-6\"\nrate_limit = 40000\n")
-        .unwrap();
+    std::fs::write(
+        &toml_path,
+        "model = \"claude-sonnet-4-6\"\nrate_limit = 40000\n",
+    )
+    .unwrap();
     let cli = CliArgs::default();
     let cfg = build_config(&cli, tmp.path());
     assert_eq!(cfg.model, "claude-sonnet-4-6");
@@ -94,7 +97,11 @@ fn toml_file_overrides_default() {
 #[test]
 fn cli_overrides_toml_file() {
     let tmp = temp_syl_dir();
-    std::fs::write(tmp.path().join("config.toml"), "model = \"claude-sonnet-4-6\"\n").unwrap();
+    std::fs::write(
+        tmp.path().join("config.toml"),
+        "model = \"claude-sonnet-4-6\"\n",
+    )
+    .unwrap();
     let cli = parse_cli_args(&["--model", "claude-haiku-4-5"]);
     let cfg = build_config(&cli, tmp.path());
     // CLI wins
@@ -123,53 +130,4 @@ fn missing_config_file_gives_defaults() {
     let cli = CliArgs::default();
     let cfg = build_config(&cli, tmp.path());
     assert_eq!(cfg.model, DEFAULT_MODEL);
-}
-
-// ---------------------------------------------------------------------------
-// EDN → TOML migration
-// ---------------------------------------------------------------------------
-
-#[test]
-fn edn_migration_creates_toml() {
-    use syl_rs::config::migrate_edn_to_toml;
-
-    let tmp = temp_syl_dir();
-    let edn_path  = tmp.path().join("config.edn");
-    let toml_path = tmp.path().join("config.toml");
-
-    std::fs::write(
-        &edn_path,
-        r#"{:model "claude-sonnet-4-6" :rate-limit 30000 :theme "dark"}"#,
-    )
-    .unwrap();
-
-    migrate_edn_to_toml(&edn_path, &toml_path).expect("migration");
-    assert!(toml_path.exists(), "toml file should be created");
-
-    let content = std::fs::read_to_string(&toml_path).unwrap();
-    assert!(content.contains("claude-sonnet-4-6"), "model migrated");
-    assert!(content.contains("30000"), "rate_limit migrated");
-    assert!(content.contains("dark"), "theme migrated");
-}
-
-#[test]
-fn edn_migration_triggered_on_first_run() {
-    let tmp = temp_syl_dir();
-    let edn_path  = tmp.path().join("config.edn");
-    let toml_path = tmp.path().join("config.toml");
-
-    // Write EDN config, no TOML yet
-    std::fs::write(
-        &edn_path,
-        r#"{:model "claude-haiku-4-5" :rate-limit 25000}"#,
-    )
-    .unwrap();
-
-    let cli = CliArgs::default();
-    let cfg = build_config(&cli, tmp.path());
-
-    // Migration should have run; TOML should now exist
-    assert!(toml_path.exists(), "migration should create config.toml");
-    // And the migrated model should be loaded
-    assert_eq!(cfg.model, "claude-haiku-4-5");
 }

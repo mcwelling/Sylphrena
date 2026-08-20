@@ -1,11 +1,10 @@
-/// Phase 2 tests: AppConfig, EDN migration, SseParser, wiremock API client.
+/// Phase 2 tests: AppConfig, SseParser, wiremock API client.
 use tempfile::TempDir;
 
-use syl_rs::config::{
-    build_config, parse_cli_args, parse_edn_value, migrate_edn_to_toml,
-    AppConfig, DEFAULT_MODEL, DEFAULT_BACKEND, DEFAULT_RATE_LIMIT,
-};
 use syl_rs::api::client::SseParser;
+use syl_rs::config::{
+    build_config, parse_cli_args, AppConfig, DEFAULT_BACKEND, DEFAULT_MODEL, DEFAULT_RATE_LIMIT,
+};
 
 // ---------------------------------------------------------------------------
 // Helper
@@ -121,71 +120,7 @@ fn test_build_config_cli_overrides_toml() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. EDN migration
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_parse_edn_value_string() {
-    let edn = r#"{:model "claude-opus-4-6" :backend "anthropic"}"#;
-    assert_eq!(parse_edn_value(edn, "model"), Some("claude-opus-4-6"));
-    assert_eq!(parse_edn_value(edn, "backend"), Some("anthropic"));
-}
-
-#[test]
-fn test_parse_edn_value_missing_returns_none() {
-    let edn = r#"{:model "claude-opus-4-6"}"#;
-    assert!(parse_edn_value(edn, "rate-limit").is_none());
-}
-
-#[test]
-fn test_migrate_edn_to_toml_writes_file() {
-    let dir = tmp_syl_dir();
-    let edn = r#"{:model "claude-sonnet-4-6" :backend "anthropic" :rate-limit 45000 :theme "dark" :image "auto"}"#;
-    let edn_path = dir.path().join("config.edn");
-    let toml_path = dir.path().join("config.toml");
-    std::fs::write(&edn_path, edn).unwrap();
-
-    migrate_edn_to_toml(&edn_path, &toml_path).unwrap();
-
-    let toml_text = std::fs::read_to_string(&toml_path).unwrap();
-    assert!(toml_text.contains("model = \"claude-sonnet-4-6\""));
-    assert!(toml_text.contains("backend = \"anthropic\""));
-    assert!(toml_text.contains("rate_limit = 45000"));
-    assert!(toml_text.contains("theme = \"dark\""));
-}
-
-#[test]
-fn test_build_config_triggers_edn_migration() {
-    let dir = tmp_syl_dir();
-    let edn = r#"{:model "claude-haiku-4-5" :backend "anthropic" :rate-limit 30000}"#;
-    std::fs::write(dir.path().join("config.edn"), edn).unwrap();
-    // No config.toml yet
-
-    let cli = parse_cli_args(&[]);
-    let cfg = build_config(&cli, dir.path());
-
-    // Migration should have fired, creating config.toml
-    assert!(dir.path().join("config.toml").exists());
-    // And the model should be loaded from the migrated TOML
-    assert_eq!(cfg.model, "claude-haiku-4-5");
-}
-
-#[test]
-fn test_build_config_no_migration_when_toml_exists() {
-    let dir = tmp_syl_dir();
-    let edn = r#"{:model "edn-model"}"#;
-    let toml = "model = \"toml-model\"\n";
-    std::fs::write(dir.path().join("config.edn"), edn).unwrap();
-    std::fs::write(dir.path().join("config.toml"), toml).unwrap();
-
-    let cli = parse_cli_args(&[]);
-    let cfg = build_config(&cli, dir.path());
-    // TOML wins; EDN not touched
-    assert_eq!(cfg.model, "toml-model");
-}
-
-// ---------------------------------------------------------------------------
-// 5. SseParser — bytes-level line buffering
+// 4. SseParser — bytes-level line buffering
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -201,7 +136,7 @@ fn test_sse_parser_single_event() {
 fn test_sse_parser_split_across_chunks() {
     let mut p = SseParser::new();
     // First chunk ends mid-line
-    let first  = b"event: content_block_start\ndata: {\"type\":\"content_block_start\"";
+    let first = b"event: content_block_start\ndata: {\"type\":\"content_block_start\"";
     let second = b",\"index\":0}\n\n";
     let events1 = p.feed(first);
     assert!(events1.is_empty(), "no complete event yet");
@@ -271,7 +206,7 @@ fn test_sse_full_round_trip() {
     use syl_rs::api::sse::StreamHandler;
     use syl_rs::api::types::StopReason;
 
-    let mut parser  = SseParser::new();
+    let mut parser = SseParser::new();
     let mut handler = StreamHandler::new();
 
     let bytes = full_sse_response("hello world");
@@ -308,7 +243,7 @@ fn test_sse_tool_use_round_trip() {
         "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":15}}\n\n",
     );
 
-    let mut parser  = SseParser::new();
+    let mut parser = SseParser::new();
     let mut handler = StreamHandler::new();
     for event in parser.feed(sse.as_bytes()) {
         handler.on_event(&event.data);
@@ -334,9 +269,9 @@ fn test_sse_tool_use_round_trip() {
 
 #[tokio::test]
 async fn test_stream_turn_with_mock_server() {
-    use wiremock::{MockServer, Mock, ResponseTemplate};
-    use wiremock::matchers::{method, path};
     use tokio_util::sync::CancellationToken;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use syl_rs::api::client::{stream_turn, SystemBlock};
     use syl_rs::api::types::{Message, StopReason};
@@ -359,10 +294,7 @@ async fn test_stream_turn_with_mock_server() {
 
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_raw(sse_body, "text/event-stream")
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
         .mount(&server)
         .await;
 
@@ -375,7 +307,9 @@ async fn test_stream_turn_with_mock_server() {
     let system = vec![SystemBlock::text("You are helpful.")];
     let cancel = CancellationToken::new();
 
-    let result = stream_turn(&client, &config, &messages, &system, cancel, &|_| {}).await.unwrap();
+    let result = stream_turn(&client, &config, &messages, &system, cancel, &|_| {})
+        .await
+        .unwrap();
 
     assert_eq!(result.stop_reason, StopReason::EndTurn);
     assert_eq!(result.text(), Some("mocked"));
@@ -385,9 +319,9 @@ async fn test_stream_turn_with_mock_server() {
 
 #[tokio::test]
 async fn test_stream_turn_retries_on_429() {
-    use wiremock::{MockServer, Mock, ResponseTemplate};
-    use wiremock::matchers::{method, path};
     use tokio_util::sync::CancellationToken;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use syl_rs::api::client::SystemBlock;
     use syl_rs::api::types::{Message, StopReason};
@@ -418,10 +352,7 @@ async fn test_stream_turn_retries_on_429() {
 
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_raw(sse_body, "text/event-stream")
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
         .mount(&server)
         .await;
 
@@ -437,8 +368,15 @@ async fn test_stream_turn_retries_on_429() {
     // call_with_retry should succeed on second attempt
     let mut rate_calls = vec![];
     let result = syl_rs::api::client::call_with_retry(
-        &client, &config, &messages, &system, cancel, &mut rate_calls,
-    ).await.unwrap();
+        &client,
+        &config,
+        &messages,
+        &system,
+        cancel,
+        &mut rate_calls,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(result.stop_reason, StopReason::EndTurn);
     assert_eq!(result.text(), Some("ok"));
@@ -446,9 +384,9 @@ async fn test_stream_turn_retries_on_429() {
 
 #[tokio::test]
 async fn test_stream_turn_propagates_non_retryable_error() {
-    use wiremock::{MockServer, Mock, ResponseTemplate};
-    use wiremock::matchers::{method, path};
     use tokio_util::sync::CancellationToken;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use syl_rs::api::client::{call_with_retry, SystemBlock};
     use syl_rs::api::types::Message;
@@ -472,7 +410,15 @@ async fn test_stream_turn_propagates_non_retryable_error() {
     let cancel = CancellationToken::new();
 
     let mut rate_calls = vec![];
-    let result = call_with_retry(&client, &config, &messages, &system, cancel, &mut rate_calls).await;
+    let result = call_with_retry(
+        &client,
+        &config,
+        &messages,
+        &system,
+        cancel,
+        &mut rate_calls,
+    )
+    .await;
     assert!(result.is_err());
     let msg = result.unwrap_err().to_string();
     assert!(msg.contains("400"), "expected 400 in error: {}", msg);
@@ -480,10 +426,10 @@ async fn test_stream_turn_propagates_non_retryable_error() {
 
 #[tokio::test]
 async fn test_stream_turn_cancel() {
-    use wiremock::{MockServer, Mock, ResponseTemplate};
-    use wiremock::matchers::{method, path};
-    use tokio_util::sync::CancellationToken;
     use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use syl_rs::api::client::{stream_turn, SystemBlock};
     use syl_rs::api::types::Message;
@@ -497,7 +443,7 @@ async fn test_stream_turn_cancel() {
         .respond_with(
             ResponseTemplate::new(200)
                 .set_delay(Duration::from_millis(500))
-                .set_body_raw("data: {\"type\":\"message_stop\"}\n\n", "text/event-stream")
+                .set_body_raw("data: {\"type\":\"message_stop\"}\n\n", "text/event-stream"),
         )
         .mount(&server)
         .await;

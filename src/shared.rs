@@ -39,19 +39,31 @@ pub struct SharedState {
     /// Cancellation token for the currently running agent turn.
     /// None when idle; Some when a turn is in flight.
     pub current_cancel: Mutex<Option<CancellationToken>>,
+
+    /// Active model for this session.  Initialised from `AppConfig::model` and
+    /// updated by the `/model` selector.  `run_agent_turn` reads this each turn
+    /// so model switches take effect immediately on the next user message.
+    pub current_model: Mutex<String>,
+
+    /// Models available for the `/model` picker.  Populated at startup by
+    /// `api::models::fetch_models`; initialised to the static fallback list
+    /// so the picker works even before the first API response arrives.
+    pub available_models: Mutex<Vec<crate::api::models::DiscoveredModel>>,
 }
 
 impl SharedState {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            stdout:          Arc::new(Mutex::new(std::io::stdout())),
-            messages:        Mutex::new(Vec::new()),
-            session_tokens:  Mutex::new(Usage::default()),
-            recent_calls:    Mutex::new(Vec::new()),
+            stdout: Arc::new(Mutex::new(std::io::stdout())),
+            messages: Mutex::new(Vec::new()),
+            session_tokens: Mutex::new(Usage::default()),
+            recent_calls: Mutex::new(Vec::new()),
             container_stats: Mutex::new(None),
-            spinner:         Mutex::new(None),
-            anim:            Mutex::new(None),
-            current_cancel:  Mutex::new(None),
+            spinner: Mutex::new(None),
+            anim: Mutex::new(None),
+            current_cancel: Mutex::new(None),
+            current_model: Mutex::new(String::new()),
+            available_models: Mutex::new(crate::api::models::static_fallback()),
         })
     }
 }

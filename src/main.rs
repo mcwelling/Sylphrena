@@ -5,9 +5,7 @@ use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 
-use syl_rs::api::client::{
-    call_with_retry_shared, BlockDeltaEvent, CancelledError, SystemBlock,
-};
+use syl_rs::api::client::{call_with_retry_shared, BlockDeltaEvent, CancelledError, SystemBlock};
 use syl_rs::api::types::{ContentBlock, Message, MessageContent, StopReason};
 use syl_rs::config::{build_config, parse_cli_args};
 use syl_rs::container;
@@ -16,7 +14,12 @@ use syl_rs::shared::SharedState;
 use syl_rs::slash::{handle_slash, SlashAction, SlashContext};
 use syl_rs::system_prompt::build_system_blocks;
 use syl_rs::tools;
-use syl_rs::tui::{animation, bars::{BarData, make_bottom_bar, make_top_bar, DARK, LIGHT}, input::InputEditor, spinner, terminal};
+use syl_rs::tui::{
+    animation,
+    bars::{make_bottom_bar, make_top_bar, BarData, DARK, LIGHT},
+    input::InputEditor,
+    spinner, terminal,
+};
 use syl_rs::workspace::gather_workspace_context;
 
 // ---------------------------------------------------------------------------
@@ -55,6 +58,7 @@ async fn main() -> anyhow::Result<()> {
 
     // 6. Build SharedState
     let state = SharedState::new();
+    *state.current_model.lock().unwrap() = config.model.clone();
 
     // 7. Container lifecycle
     if cli.fresh {
@@ -114,25 +118,54 @@ async fn main() -> anyhow::Result<()> {
         let _ = terminal::print_to_scroll(&state.stdout, &lines.join("\n"), rows);
     }
 
-    // 11. SIGWINCH handler
+    // 11. Fetch available models (5 s timeout; static fallback already in state)
+    {
+        let models = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            syl_rs::api::models::fetch_models(&http, &config),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            tracing::warn!("model list fetch timed out, using static fallback");
+            syl_rs::api::models::static_fallback()
+        });
+
+        let n = models.len();
+        *state.available_models.lock().unwrap() = models;
+        let _ = terminal::print_to_scroll(
+            &state.stdout,
+            &format!("\x1b[2m{n} models available  ·  /model to switch\x1b[0m\r\n"),
+            rows,
+        );
+    }
+
+    // 12. SIGWINCH handler
     let resize_rx = terminal::spawn_sigwinch_handler();
 
-    // 12. SIGINT handler
+    // 13. SIGINT handler
     let sigint_state = state.clone();
     tokio::spawn(async move { sigint_loop(sigint_state).await });
 
-    // 13. Container stats poller (every 5 s)
+    // 14. Container stats poller (every 5 s)
     let stats_state = state.clone();
     tokio::spawn(async move { stats_poll_loop(stats_state).await });
 
-    // 14. REPL
+    // 15. REPL
     let result = main_loop(
-        &http, &config, state.clone(),
-        resize_rx, rows, cols,
-        &syl_dir, &session_path, &memory_dir, &project_dir,
-    ).await;
+        &http,
+        &config,
+        state.clone(),
+        resize_rx,
+        rows,
+        cols,
+        &syl_dir,
+        &session_path,
+        &memory_dir,
+        &project_dir,
+    )
+    .await;
 
-    // 15. Teardown: disable raw mode + reset DECSTBM
+    // 16. Teardown: disable raw mode + reset DECSTBM
     crossterm::terminal::disable_raw_mode()?;
     {
         let mut out = state.stdout.lock().unwrap();
@@ -140,7 +173,7 @@ async fn main() -> anyhow::Result<()> {
         let _ = out.flush();
     }
 
-    // 16. Remove the agent container on clean exit (mirrors syl.bb JVM shutdown hook)
+    // 17. Remove the agent container on clean exit
     println!("[Syl] Cleaning up container...");
     container::nuke_container(false);
 
@@ -171,25 +204,34 @@ fn print_help() {
 // ---------------------------------------------------------------------------
 
 fn draw_bars(
-    state:         &Arc<SharedState>,
-    config:        &syl_rs::config::AppConfig,
-    cols:          u16,
-    rows:          u16,
+    state: &Arc<SharedState>,
+    config: &syl_rs::config::AppConfig,
+    cols: u16,
+    rows: u16,
     message_count: usize,
 ) {
     let palette = if config.light { &LIGHT } else { &DARK };
 
+    // Read current model from state (may differ from config after /model switch)
+    let current_model = state.current_model.lock().unwrap().clone();
+
     let (input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd) = {
         let tok = state.session_tokens.lock().unwrap();
-        let cost = syl_rs::pricing::compute_cost_usd(&tok, &config.model);
-        (tok.input_tokens, tok.output_tokens, tok.cache_read_tokens, tok.cache_write_tokens, cost)
+        let cost = syl_rs::pricing::compute_cost_usd(&tok, &current_model);
+        (
+            tok.input_tokens,
+            tok.output_tokens,
+            tok.cache_read_tokens,
+            tok.cache_write_tokens,
+            cost,
+        )
     };
 
     let (cpu_pct, mem_mb) = {
         let stats = state.container_stats.lock().unwrap();
         match stats.as_ref() {
             Some(s) => (s.cpu_percent, s.mem_usage_mb as u64),
-            None    => (0.0, 0),
+            None => (0.0, 0),
         }
     };
 
@@ -200,24 +242,24 @@ fn draw_bars(
     };
 
     let data = BarData {
-        model:              config.model.clone(),
-        backend:            config.backend.clone(),
-        timeout_ms:         config.timeout_ms,
+        model: current_model,
+        backend: config.backend.clone(),
+        timeout_ms: config.timeout_ms,
         input_tokens,
         output_tokens,
         cache_read_tokens,
         cache_write_tokens,
         tokens_per_min,
-        tpm_limit:          config.rate_limit as f64,
+        tpm_limit: config.rate_limit as f64,
         cost_usd,
         cpu_pct,
         mem_mb,
         message_count,
-        width:              cols,
-        spinner_label:      None,
+        width: cols,
+        spinner_label: None,
     };
 
-    let top    = make_top_bar(&data, palette);
+    let top = make_top_bar(&data, palette);
     let bottom = make_bottom_bar(&data, palette);
 
     let mut out = state.stdout.lock().unwrap();
@@ -230,7 +272,9 @@ fn draw_bars(
 
 async fn sigint_loop(state: Arc<SharedState>) {
     loop {
-        tokio::signal::ctrl_c().await.expect("ctrl-c handler failed");
+        tokio::signal::ctrl_c()
+            .await
+            .expect("ctrl-c handler failed");
         if let Some(token) = state.current_cancel.lock().unwrap().as_ref() {
             token.cancel();
         }
@@ -252,20 +296,20 @@ async fn stats_poll_loop(state: Arc<SharedState>) {
 
 #[allow(clippy::too_many_arguments)]
 async fn main_loop(
-    http:          &reqwest::Client,
-    config:        &syl_rs::config::AppConfig,
-    state:         Arc<SharedState>,
+    http: &reqwest::Client,
+    config: &syl_rs::config::AppConfig,
+    state: Arc<SharedState>,
     mut resize_rx: tokio::sync::watch::Receiver<(u16, u16)>,
-    mut rows:      u16,
-    mut cols:      u16,
-    syl_dir:       &Path,
-    session_path:  &Path,
-    memory_dir:    &Path,
-    project_dir:   &Path,
+    mut rows: u16,
+    mut cols: u16,
+    syl_dir: &Path,
+    session_path: &Path,
+    memory_dir: &Path,
+    project_dir: &Path,
 ) -> anyhow::Result<()> {
     let mut editor = InputEditor::new()?;
     let workflow_dir = syl_dir.join("workflows");
-    let log_path     = syl_dir.join("syl.log");
+    let log_path = syl_dir.join("syl.log");
 
     // Welcome hint
     let _ = terminal::print_to_scroll(
@@ -278,7 +322,8 @@ async fn main_loop(
         // Drain any pending resize before showing the prompt
         while resize_rx.has_changed().unwrap_or(false) {
             let (nc, nr) = *resize_rx.borrow_and_update();
-            cols = nc; rows = nr;
+            cols = nc;
+            rows = nr;
             handle_resize(nc, nr, &state).await?;
         }
 
@@ -299,20 +344,39 @@ async fn main_loop(
 
         // Slash-command dispatch
         if line.starts_with('/') {
+            // ── Model selector ────────────────────────────────────────────
+            // Handled before the generic dispatcher because it needs direct
+            // terminal access for the interactive picker.
+            if line == "/model" || line.starts_with("/model ") {
+                if let Some(new_model) = run_model_selector(&line, &state, rows).await {
+                    *state.current_model.lock().unwrap() = new_model;
+                    draw_bars(
+                        &state,
+                        config,
+                        cols,
+                        rows,
+                        state.messages.lock().unwrap().len(),
+                    );
+                }
+                continue;
+            }
+
             let msgs = state.messages.lock().unwrap().clone();
             let (input_tokens, output_tokens) = {
                 let tok = state.session_tokens.lock().unwrap();
                 (tok.input_tokens, tok.output_tokens)
             };
+            // Read current model from state so /status reflects live selection.
+            let current_model = state.current_model.lock().unwrap().clone();
             let slash_ctx = SlashContext {
                 session_path,
                 workflow_dir: &workflow_dir,
                 memory_dir,
-                log_path:      &log_path,
-                model:         &config.model,
-                backend:       &config.backend,
-                timeout_ms:    config.timeout_ms,
-                rate_limit:    config.rate_limit,
+                log_path: &log_path,
+                model: &current_model,
+                backend: &config.backend,
+                timeout_ms: config.timeout_ms,
+                rate_limit: config.rate_limit,
                 input_tokens,
                 output_tokens,
                 message_count: msgs.len(),
@@ -337,13 +401,25 @@ async fn main_loop(
         }
 
         // Push user message
-        state.messages.lock().unwrap().push(Message::user_text(&line));
+        state
+            .messages
+            .lock()
+            .unwrap()
+            .push(Message::user_text(&line));
 
         // Agent turn
         run_agent_turn(
-            http, config, &state, &mut resize_rx,
-            &mut rows, &mut cols, syl_dir, memory_dir, project_dir,
-        ).await?;
+            http,
+            config,
+            &state,
+            &mut resize_rx,
+            &mut rows,
+            &mut cols,
+            syl_dir,
+            memory_dir,
+            project_dir,
+        )
+        .await?;
 
         // Persist after each turn
         let msgs = state.messages.lock().unwrap().clone();
@@ -355,8 +431,13 @@ async fn main_loop(
         {
             let msgs = state.messages.lock().unwrap().clone();
             let compacted = syl_rs::api::compaction::compact_history(
-                msgs, http, config, &state, CancellationToken::new(),
-            ).await;
+                msgs,
+                http,
+                config,
+                &state,
+                CancellationToken::new(),
+            )
+            .await;
             *state.messages.lock().unwrap() = compacted;
         }
     }
@@ -365,23 +446,105 @@ async fn main_loop(
 }
 
 // ---------------------------------------------------------------------------
+// Model selector
+// ---------------------------------------------------------------------------
+
+/// Handle the `/model` slash command.
+///
+/// With no argument: launches the interactive arrow-key picker populated from
+/// `state.available_models` (fetched from the API at startup).
+/// With an argument: exact or substring match against the live model list;
+/// if unrecognised, still switches — the API will validate the ID.
+async fn run_model_selector(line: &str, state: &Arc<SharedState>, rows: u16) -> Option<String> {
+    let arg = line.strip_prefix("/model").unwrap_or("").trim().to_owned();
+    let current = state.current_model.lock().unwrap().clone();
+
+    if arg.is_empty() {
+        // Interactive picker — must run synchronously; block_in_place is safe
+        // here because we're the only thread touching stdin/stdout.
+        let items: Vec<syl_rs::tui::picker::ModelOption> = {
+            let models = state.available_models.lock().unwrap();
+            models
+                .iter()
+                .map(|m| {
+                    // When display_name differs from id (dynamic API fetch),
+                    // show the id dimmed on the right so users can see it.
+                    let description = if m.id != m.display_name {
+                        m.id.clone()
+                    } else {
+                        String::new()
+                    };
+                    syl_rs::tui::picker::ModelOption {
+                        id: m.id.clone(),
+                        display: m.display_name.clone(),
+                        description,
+                    }
+                })
+                .collect()
+        };
+        let stdout = state.stdout.clone();
+        tokio::task::block_in_place(move || {
+            syl_rs::tui::picker::run_picker(&items, &current, &stdout, rows)
+        })
+    } else {
+        // Direct switch — match id or display_name (case-insensitive substring).
+        // If unrecognised, accept as a raw model ID; the API validates it.
+        let canonical: Option<String> = {
+            let models = state.available_models.lock().unwrap();
+            models
+                .iter()
+                .find(|m| {
+                    m.id == arg
+                        || m.id.contains(arg.as_str())
+                        || m.display_name.to_lowercase().contains(&arg.to_lowercase())
+                })
+                .map(|m| m.id.clone())
+        };
+
+        let model_id = canonical.clone().unwrap_or_else(|| arg.clone());
+        let note = if canonical.is_none() {
+            " \x1b[2m(not in model list — the API will validate)\x1b[0m"
+        } else {
+            ""
+        };
+        let msg = format!(
+            "\x1b[2m[Switched to \x1b[0m\x1b[96m{model_id}\x1b[0m{note}\x1b[2m]\x1b[0m\r\n"
+        );
+        let _ = terminal::print_to_scroll(&state.stdout, &msg, rows);
+        Some(model_id)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Agent turn
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
 async fn run_agent_turn(
-    http:        &reqwest::Client,
-    config:      &syl_rs::config::AppConfig,
-    state:       &Arc<SharedState>,
-    resize_rx:   &mut tokio::sync::watch::Receiver<(u16, u16)>,
-    rows:        &mut u16,
-    cols:        &mut u16,
-    syl_dir:     &Path,
-    memory_dir:  &Path,
+    http: &reqwest::Client,
+    config: &syl_rs::config::AppConfig,
+    state: &Arc<SharedState>,
+    resize_rx: &mut tokio::sync::watch::Receiver<(u16, u16)>,
+    rows: &mut u16,
+    cols: &mut u16,
+    syl_dir: &Path,
+    memory_dir: &Path,
     project_dir: &Path,
 ) -> anyhow::Result<()> {
     let cancel = CancellationToken::new();
     *state.current_cancel.lock().unwrap() = Some(cancel.clone());
+
+    // Build an effective config that reflects the live model selection.
+    // Shadow the parameter so all downstream calls use the effective config.
+    let effective_config = {
+        let model = state.current_model.lock().unwrap().clone();
+        let mut c = config.clone();
+        if !model.is_empty() {
+            c.model = model;
+        }
+        c
+    };
+    let config = &effective_config;
 
     // Start thinking animation
     {
@@ -391,22 +554,28 @@ async fn run_agent_turn(
 
     loop {
         // Build system prompt each iteration (memory/workspace may have changed)
-        let workspace  = gather_workspace_context(project_dir);
+        let workspace = gather_workspace_context(project_dir);
         let sys_blocks = build_system_blocks(&workspace, memory_dir);
-        let system: Vec<SystemBlock> = sys_blocks.into_iter().filter_map(|b| match b {
-            ContentBlock::Text { text, cache_control } => Some(if cache_control.is_some() {
-                SystemBlock::cached(text)
-            } else {
-                SystemBlock::text(text)
-            }),
-            _ => None,
-        }).collect();
+        let system: Vec<SystemBlock> = sys_blocks
+            .into_iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text {
+                    text,
+                    cache_control,
+                } => Some(if cache_control.is_some() {
+                    SystemBlock::cached(text)
+                } else {
+                    SystemBlock::text(text)
+                }),
+                _ => None,
+            })
+            .collect();
 
         let messages = state.messages.lock().unwrap().clone();
 
         let notify_fn = {
             let st = state.clone();
-            let r  = *rows;
+            let r = *rows;
             move |msg: &str| {
                 let _ = terminal::print_to_scroll(&st.stdout, &format!("{msg}\r\n"), r);
             }
@@ -417,7 +586,7 @@ async fn run_agent_turn(
 
         let on_delta = {
             let st = state.clone();
-            let r  = *rows;
+            let r = *rows;
             let ss = streaming_started.clone();
             move |delta: BlockDeltaEvent| handle_stream_delta(&st, delta, r, &ss)
         };
@@ -445,11 +614,8 @@ async fn run_agent_turn(
                 break;
             }
             Err(e) => {
-                let _ = terminal::print_to_scroll(
-                    &state.stdout,
-                    &format!("[Error: {e}]\r\n"),
-                    *rows,
-                );
+                let _ =
+                    terminal::print_to_scroll(&state.stdout, &format!("[Error: {e}]\r\n"), *rows);
                 break;
             }
         };
@@ -462,23 +628,26 @@ async fn run_agent_turn(
         // Accumulate token usage
         {
             let mut tok = state.session_tokens.lock().unwrap();
-            tok.input_tokens       += turn.usage.input_tokens;
-            tok.output_tokens      += turn.usage.output_tokens;
-            tok.cache_read_tokens  += turn.usage.cache_read_tokens;
+            tok.input_tokens += turn.usage.input_tokens;
+            tok.output_tokens += turn.usage.output_tokens;
+            tok.cache_read_tokens += turn.usage.cache_read_tokens;
             tok.cache_write_tokens += turn.usage.cache_write_tokens;
         }
 
         // Append assistant turn to history
-        state.messages.lock().unwrap().push(
-            Message::assistant_blocks(turn.content.clone())
-        );
+        state
+            .messages
+            .lock()
+            .unwrap()
+            .push(Message::assistant_blocks(turn.content.clone()));
 
         if turn.stop_reason != StopReason::ToolUse {
             break;
         }
 
         // Collect ToolUse blocks
-        let tool_calls: Vec<(String, String, serde_json::Value)> = turn.content
+        let tool_calls: Vec<(String, String, serde_json::Value)> = turn
+            .content
             .into_iter()
             .filter_map(|b| match b {
                 ContentBlock::ToolUse { id, name, input } => Some((id, name, input)),
@@ -503,7 +672,19 @@ async fn run_agent_turn(
 
         // Execute tools
         let workflow_dir = syl_dir.join("workflows");
-        let results = execute_tools(tool_calls, config, state, http, cancel.clone(), *rows, *cols, syl_dir, memory_dir, &workflow_dir).await;
+        let results = execute_tools(
+            tool_calls,
+            config,
+            state,
+            http,
+            cancel.clone(),
+            *rows,
+            *cols,
+            syl_dir,
+            memory_dir,
+            &workflow_dir,
+        )
+        .await;
 
         // Stop spinner
         if let Some(sp) = state.spinner.lock().unwrap().take() {
@@ -512,7 +693,7 @@ async fn run_agent_turn(
 
         // Append tool results and restart animation for next LLM call
         state.messages.lock().unwrap().push(Message {
-            role:    "user".to_string(),
+            role: "user".to_string(),
             content: MessageContent::Blocks(results),
         });
 
@@ -537,9 +718,9 @@ async fn run_agent_turn(
 // ---------------------------------------------------------------------------
 
 fn handle_stream_delta(
-    state:   &Arc<SharedState>,
-    delta:   BlockDeltaEvent,
-    rows:    u16,
+    state: &Arc<SharedState>,
+    delta: BlockDeltaEvent,
+    rows: u16,
     started: &std::sync::atomic::AtomicBool,
 ) {
     match delta {
@@ -564,18 +745,18 @@ fn handle_stream_delta(
 // ---------------------------------------------------------------------------
 
 async fn execute_tools(
-    calls:        Vec<(String, String, serde_json::Value)>,
-    config:       &syl_rs::config::AppConfig,
-    state:        &Arc<SharedState>,
-    client:       &reqwest::Client,
-    cancel:       CancellationToken,
-    rows:         u16,
-    cols:         u16,
-    syl_dir:      &Path,
-    memory_dir:   &Path,
+    calls: Vec<(String, String, serde_json::Value)>,
+    config: &syl_rs::config::AppConfig,
+    state: &Arc<SharedState>,
+    client: &reqwest::Client,
+    cancel: CancellationToken,
+    rows: u16,
+    cols: u16,
+    syl_dir: &Path,
+    memory_dir: &Path,
     workflow_dir: &Path,
 ) -> Vec<ContentBlock> {
-    // Health-check container before running any tools (mirrors ensure-container! in syl.bb)
+    // Health-check container before running any tools
     if let Err(e) = syl_rs::container::ensure_container(config, syl_dir) {
         let _ = terminal::print_to_scroll(
             &state.stdout,
@@ -592,11 +773,7 @@ async fn execute_tools(
             if let Some(sp) = state.spinner.lock().unwrap().take() {
                 sp.stop();
             }
-            let sp = spinner::spawn_spinner(
-                state.stdout.clone(),
-                rows,
-                format!("{name}…"),
-            );
+            let sp = spinner::spawn_spinner(state.stdout.clone(), rows, format!("{name}…"));
             *state.spinner.lock().unwrap() = Some(sp);
         }
 
@@ -604,35 +781,39 @@ async fn execute_tools(
             "run_bash" => {
                 tools::bash::run_bash(&input, config, Default::default(), cancel.clone()).await
             }
-            "memory_read" => {
-                (syl_rs::tools::memory::memory_read(memory_dir, input["key"].as_str().unwrap_or("")), false)
-            }
+            "memory_read" => (
+                syl_rs::tools::memory::memory_read(memory_dir, input["key"].as_str().unwrap_or("")),
+                false,
+            ),
             "memory_write" => {
-                let key     = input["key"].as_str().unwrap_or("").to_string();
+                let key = input["key"].as_str().unwrap_or("").to_string();
                 let content = input["content"].as_str().unwrap_or("").to_string();
-                (syl_rs::tools::memory::memory_write(memory_dir, &key, &content), false)
+                (
+                    syl_rs::tools::memory::memory_write(memory_dir, &key, &content),
+                    false,
+                )
             }
             "workflow_write" => {
-                let key     = input["name"].as_str().unwrap_or("").to_string();
+                let key = input["name"].as_str().unwrap_or("").to_string();
                 let content = input["content"].as_str().unwrap_or("").to_string();
-                (syl_rs::tools::workflow::workflow_write(workflow_dir, &key, &content), false)
+                (
+                    syl_rs::tools::workflow::workflow_write(workflow_dir, &key, &content),
+                    false,
+                )
             }
             "workflow_delete" => {
                 let key = input["name"].as_str().unwrap_or("").to_string();
-                (syl_rs::tools::workflow::workflow_delete(workflow_dir, &key), false)
+                (
+                    syl_rs::tools::workflow::workflow_delete(workflow_dir, &key),
+                    false,
+                )
             }
-            "read_file" => {
-                tools::files::read_file(&input, config)
-            }
+            "read_file" => tools::files::read_file(&input, config),
             "dispatch_agent" => {
                 tools::dispatch::dispatch_agent(&input, config, state, client, cancel.clone()).await
             }
-            "show_image" => {
-                syl_rs::tools::image::show_image(&input, config, state, rows, cols)
-            }
-            other => {
-                (format!("[Tool error: unknown tool `{other}`]"), true)
-            }
+            "show_image" => syl_rs::tools::image::show_image(&input, config, state, rows, cols),
+            other => (format!("[Tool error: unknown tool `{other}`]"), true),
         };
 
         // Per-tool TUI display
@@ -664,8 +845,11 @@ async fn execute_tools(
             }
             "dispatch_agent" => {
                 let source = input["source"].as_str().unwrap_or("?");
-                let task   = input["task"].as_str().unwrap_or("?");
-                format!("[dispatch_agent: {task} {source}] ({} chars)", content.len())
+                let task = input["task"].as_str().unwrap_or("?");
+                format!(
+                    "[dispatch_agent: {task} {source}] ({} chars)",
+                    content.len()
+                )
             }
             "show_image" => {
                 let path = input["path"].as_str().unwrap_or("?");
@@ -692,7 +876,7 @@ async fn execute_tools(
 async fn handle_resize(
     new_cols: u16,
     new_rows: u16,
-    state:    &Arc<SharedState>,
+    state: &Arc<SharedState>,
 ) -> anyhow::Result<()> {
     // Stop stale animation/spinner (they hold old row numbers)
     if let Some(anim) = state.anim.lock().unwrap().take() {
@@ -722,9 +906,9 @@ async fn handle_resize(
 /// concurrently with the streaming HTTP call.
 async fn drain_resize_during_turn(
     resize_rx: &mut tokio::sync::watch::Receiver<(u16, u16)>,
-    state:     &Arc<SharedState>,
-    rows:      &mut u16,
-    cols:      &mut u16,
+    state: &Arc<SharedState>,
+    rows: &mut u16,
+    cols: &mut u16,
 ) {
     loop {
         let _ = resize_rx.changed().await;

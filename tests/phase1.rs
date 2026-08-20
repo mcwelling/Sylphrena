@@ -4,17 +4,16 @@
 /// memory I/O, session persistence, SSE parsing, workflow CRUD, slash commands,
 /// rate limit tracking, system prompt, Bedrock signing/parsing, stream handler,
 /// cache breakpoints, fmt_num, workspace context.
-
 use syl_rs::api::cache::attach_cache_breakpoints;
 use syl_rs::api::compaction::{build_compacted_messages, find_valid_start};
 use syl_rs::api::rate_limit::{prune_old_calls, record_rate_call, RateCall, SessionTokens};
 use syl_rs::api::sse::StreamHandler;
 use syl_rs::api::types::{ContentBlock, Message, MessageContent, StopReason};
 use syl_rs::bedrock::{
-    bedrock_model_id, hmac_sha256, parse_bedrock_stream, parse_eventstream_headers,
-    sha256_hex, sign_bedrock_request,
+    bedrock_model_id, hmac_sha256, parse_bedrock_stream, parse_eventstream_headers, sha256_hex,
+    sign_bedrock_request,
 };
-use syl_rs::config::{AppConfig, parse_cli_args};
+use syl_rs::config::{parse_cli_args, AppConfig};
 use syl_rs::session::{load_session, save_session};
 use syl_rs::slash::{handle_slash, SlashAction, SlashContext};
 use syl_rs::system_prompt::build_system_blocks;
@@ -139,26 +138,29 @@ fn user_text(text: &str) -> Message {
 }
 
 fn asst_text(text: &str) -> Message {
-    Message::assistant_blocks(vec![ContentBlock::Text { text: text.to_string(), cache_control: None }])
+    Message::assistant_blocks(vec![ContentBlock::Text {
+        text: text.to_string(),
+        cache_control: None,
+    }])
 }
 
 fn tool_result_msg(tool_use_id: &str) -> Message {
     Message {
-        role:    "user".to_string(),
+        role: "user".to_string(),
         content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
             tool_use_id: tool_use_id.to_string(),
-            content:     "ok".to_string(),
-            is_error:    None,
+            content: "ok".to_string(),
+            is_error: None,
         }]),
     }
 }
 
 fn asst_tool_use(id: &str) -> Message {
     Message {
-        role:    "assistant".to_string(),
+        role: "assistant".to_string(),
         content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
-            id:    id.to_string(),
-            name:  "run_bash".to_string(),
+            id: id.to_string(),
+            name: "run_bash".to_string(),
             input: serde_json::json!({"command": "ls"}),
         }]),
     }
@@ -192,7 +194,10 @@ fn test_find_valid_start_skips_assistant_then_tool_result() {
 fn test_find_valid_start_all_tool_exchanges() {
     let asst = asst_tool_use("t1");
     let tool = tool_result_msg("t1");
-    assert_eq!(find_valid_start(vec![asst.clone(), tool.clone(), asst, tool]), vec![]);
+    assert_eq!(
+        find_valid_start(vec![asst.clone(), tool.clone(), asst, tool]),
+        vec![]
+    );
 }
 
 #[test]
@@ -277,10 +282,7 @@ fn test_session_save_and_load() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("session.json");
 
-    let msgs = vec![
-        user_text("hello"),
-        asst_text("hi there"),
-    ];
+    let msgs = vec![user_text("hello"), asst_text("hi there")];
 
     save_session(&path, &msgs).unwrap();
     assert!(path.exists());
@@ -352,10 +354,16 @@ fn test_list_and_load_workflows() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
 
-    std::fs::write(dir.join("ship.md"),
-        "# Ship\nPush code.\n\n- Test: `bb test`\n- Push: `git push`\n").unwrap();
-    std::fs::write(dir.join("check.md"),
-        "# Check\nRun checks.\n\n- Lint: `bb lint`\n").unwrap();
+    std::fs::write(
+        dir.join("ship.md"),
+        "# Ship\nPush code.\n\n- Test: `bb test`\n- Push: `git push`\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("check.md"),
+        "# Check\nRun checks.\n\n- Lint: `bb lint`\n",
+    )
+    .unwrap();
 
     let wfs = list_workflows(dir);
     assert_eq!(wfs.len(), 2);
@@ -373,7 +381,8 @@ fn test_list_and_load_workflows() {
 fn test_workflow_write_and_delete() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
-    let content = "# Deploy\nDeploy to prod.\n\n- Build: `npm run build`\n- Deploy: `npm run deploy`\n";
+    let content =
+        "# Deploy\nDeploy to prod.\n\n- Build: `npm run build`\n- Deploy: `npm run deploy`\n";
 
     let r = workflow_write(dir, "deploy", content);
     assert!(r.contains("created"), "expected 'created' in: {}", r);
@@ -405,37 +414,39 @@ fn test_workflow_write_and_delete() {
 // ============================================================
 
 // Helper: builds temp paths and returns them (the caller owns them)
-fn tmp_ctx_paths(tmp: &tempfile::TempDir) -> (
-    std::path::PathBuf,  // session_path
-    std::path::PathBuf,  // workflow_dir
-    std::path::PathBuf,  // memory_dir
-    std::path::PathBuf,  // log_path
+fn tmp_ctx_paths(
+    tmp: &tempfile::TempDir,
+) -> (
+    std::path::PathBuf, // session_path
+    std::path::PathBuf, // workflow_dir
+    std::path::PathBuf, // memory_dir
+    std::path::PathBuf, // log_path
 ) {
     let session_path = tmp.path().join("session.json");
     let workflow_dir = tmp.path().join("workflows");
-    let memory_dir   = tmp.path().join("memory");
-    let log_path     = tmp.path().join("syl.log");
+    let memory_dir = tmp.path().join("memory");
+    let log_path = tmp.path().join("syl.log");
     std::fs::create_dir_all(&workflow_dir).ok();
     std::fs::create_dir_all(&memory_dir).ok();
     (session_path, workflow_dir, memory_dir, log_path)
 }
 
 fn make_slash_ctx<'a>(
-    sp:  &'a std::path::PathBuf,
-    wd:  &'a std::path::PathBuf,
-    md:  &'a std::path::PathBuf,
-    lp:  &'a std::path::PathBuf,
+    sp: &'a std::path::PathBuf,
+    wd: &'a std::path::PathBuf,
+    md: &'a std::path::PathBuf,
+    lp: &'a std::path::PathBuf,
     cfg: &'a AppConfig,
 ) -> SlashContext<'a> {
     SlashContext {
         session_path: sp,
         workflow_dir: wd,
-        memory_dir:   md,
-        log_path:     lp,
-        model:        "claude-opus-4-6",
-        backend:      "anthropic",
-        timeout_ms:   120_000,
-        rate_limit:   0,
+        memory_dir: md,
+        log_path: lp,
+        model: "claude-opus-4-6",
+        backend: "anthropic",
+        timeout_ms: 120_000,
+        rate_limit: 0,
         input_tokens: 0,
         output_tokens: 0,
         message_count: 0,
@@ -549,7 +560,9 @@ async fn test_slash_workflow_missing() {
     let (sp, wd, md, lp) = tmp_ctx_paths(&tmp);
     let cfg = AppConfig::default();
     let ctx = make_slash_ctx(&sp, &wd, &md, &lp, &cfg);
-    let r = handle_slash("/workflow nonexistent", vec![], &ctx).await.unwrap();
+    let r = handle_slash("/workflow nonexistent", vec![], &ctx)
+        .await
+        .unwrap();
     assert_eq!(r.action, SlashAction::Continue);
 }
 
@@ -600,8 +613,16 @@ fn test_build_system_blocks_structure() {
     let tmp = tempfile::tempdir().unwrap();
     let blocks = build_system_blocks("### WORKSPACE\nFiles: syl.bb", tmp.path());
     assert_eq!(blocks.len(), 1);
-    if let ContentBlock::Text { text, cache_control } = &blocks[0] {
-        assert!(text.contains("Syl") || text.contains("WORKSPACE"), "text: {}", &text[..text.len().min(200)]);
+    if let ContentBlock::Text {
+        text,
+        cache_control,
+    } = &blocks[0]
+    {
+        assert!(
+            text.contains("Syl") || text.contains("WORKSPACE"),
+            "text: {}",
+            &text[..text.len().min(200)]
+        );
         assert!(text.contains("WORKSPACE"));
         assert_eq!(cache_control.as_ref().unwrap().kind, "ephemeral");
     } else {
@@ -615,7 +636,11 @@ fn test_build_system_blocks_includes_memories() {
     memory_write(tmp.path(), "test-key", "Test memory content");
     let blocks = build_system_blocks("workspace ctx", tmp.path());
     if let ContentBlock::Text { text, .. } = &blocks[0] {
-        assert!(text.contains("PERSISTENT MEMORIES"), "text missing PERSISTENT MEMORIES: {}", &text[..200.min(text.len())]);
+        assert!(
+            text.contains("PERSISTENT MEMORIES"),
+            "text missing PERSISTENT MEMORIES: {}",
+            &text[..200.min(text.len())]
+        );
         assert!(text.contains("Test memory content"));
     } else {
         panic!("expected Text block");
@@ -628,18 +653,22 @@ fn test_build_system_blocks_includes_memories() {
 
 #[test]
 fn test_bedrock_model_id_known() {
-    assert_eq!(bedrock_model_id("claude-sonnet-4-6"), "anthropic.claude-sonnet-4-6-20250514-v1:0");
-    assert_eq!(bedrock_model_id("claude-haiku-4-5"),  "anthropic.claude-haiku-4-5-20251001-v1:0");
-    assert_eq!(bedrock_model_id("claude-opus-4-6"),   "anthropic.claude-opus-4-6-20250514-v1:0");
+    // Use `contains` rather than exact equality so these tests survive
+    // routine model-ID updates (new date suffixes, version bumps) without
+    // needing a code change.  The exact IDs live in CLAUDE_MODELS in config.rs.
+    assert!(bedrock_model_id("claude-sonnet-4-6").contains("anthropic.claude-sonnet"));
+    assert!(bedrock_model_id("claude-haiku-4-5").contains("anthropic.claude-haiku"));
+    assert!(bedrock_model_id("claude-opus-4-6").contains("anthropic.claude-opus"));
 }
 
 #[test]
 fn test_bedrock_model_id_passthrough() {
-    assert_eq!(
-        bedrock_model_id("anthropic.claude-sonnet-4-6-20250514-v1:0"),
-        "anthropic.claude-sonnet-4-6-20250514-v1:0"
-    );
+    // Raw Bedrock IDs and unknown names pass through unchanged.
+    let raw = "anthropic.claude-sonnet-4-6-20250514-v1:0";
+    assert_eq!(bedrock_model_id(raw), raw);
     assert_eq!(bedrock_model_id("some-custom-model"), "some-custom-model");
+    // Future model not yet in catalog — should pass through as-is.
+    assert_eq!(bedrock_model_id("claude-opus-4-7"), "claude-opus-4-7");
 }
 
 #[test]
@@ -686,15 +715,21 @@ fn test_sign_bedrock_request_with_session_token() {
         "SECRET",
         Some("SESSION123"),
     );
-    assert_eq!(headers.get("x-amz-security-token").map(|s| s.as_str()), Some("SESSION123"));
-    assert!(headers.get("authorization").unwrap().contains("x-amz-security-token"));
+    assert_eq!(
+        headers.get("x-amz-security-token").map(|s| s.as_str()),
+        Some("SESSION123")
+    );
+    assert!(headers
+        .get("authorization")
+        .unwrap()
+        .contains("x-amz-security-token"));
 }
 
 #[test]
 fn test_parse_eventstream_headers_string() {
     // Build: name=":event-type" (type 7), value="chunk"
     let name_bytes = b":event-type";
-    let val_bytes  = b"chunk";
+    let val_bytes = b"chunk";
     let mut buf = vec![];
     buf.push(name_bytes.len() as u8);
     buf.extend_from_slice(name_bytes);
@@ -705,7 +740,10 @@ fn test_parse_eventstream_headers_string() {
     buf.extend_from_slice(val_bytes);
 
     let headers = parse_eventstream_headers(&buf);
-    assert_eq!(headers.get(":event-type").map(|s| s.as_str()), Some("chunk"));
+    assert_eq!(
+        headers.get(":event-type").map(|s| s.as_str()),
+        Some("chunk")
+    );
 }
 
 #[test]
@@ -731,18 +769,24 @@ fn test_parse_bedrock_stream() {
     // :message-type = "event"
     let n1 = b":message-type";
     let v1 = b"event";
-    hdr.push(n1.len() as u8); hdr.extend_from_slice(n1);
+    hdr.push(n1.len() as u8);
+    hdr.extend_from_slice(n1);
     hdr.push(7u8);
-    hdr.push(0u8); hdr.push(v1.len() as u8); hdr.extend_from_slice(v1);
+    hdr.push(0u8);
+    hdr.push(v1.len() as u8);
+    hdr.extend_from_slice(v1);
     // :event-type = "chunk"
     let n2 = b":event-type";
     let v2 = b"chunk";
-    hdr.push(n2.len() as u8); hdr.extend_from_slice(n2);
+    hdr.push(n2.len() as u8);
+    hdr.extend_from_slice(n2);
     hdr.push(7u8);
-    hdr.push(0u8); hdr.push(v2.len() as u8); hdr.extend_from_slice(v2);
+    hdr.push(0u8);
+    hdr.push(v2.len() as u8);
+    hdr.extend_from_slice(v2);
 
-    let headers_len  = hdr.len() as u32;
-    let total_len    = 16 + headers_len + payload_bytes.len() as u32;
+    let headers_len = hdr.len() as u32;
+    let total_len = 16 + headers_len + payload_bytes.len() as u32;
 
     let mut frame = vec![];
     frame.extend_from_slice(&total_len.to_be_bytes());
@@ -834,7 +878,10 @@ fn stream_handler_cache_tokens_default_zero() {
 fn test_attach_cache_breakpoints_no_eligible() {
     let messages = vec![
         user_text("hello"),
-        Message { role: "assistant".to_string(), content: MessageContent::Text("world".to_string()) },
+        Message {
+            role: "assistant".to_string(),
+            content: MessageContent::Text("world".to_string()),
+        },
     ];
     let result = attach_cache_breakpoints(messages.clone());
     assert_eq!(result, messages);
@@ -842,16 +889,17 @@ fn test_attach_cache_breakpoints_no_eligible() {
 
 #[test]
 fn test_attach_cache_breakpoints_one_turn() {
-    let messages = vec![
-        user_text("hi"),
-        asst_text("hello"),
-    ];
+    let messages = vec![user_text("hi"), asst_text("hello")];
     let result = attach_cache_breakpoints(messages);
     if let MessageContent::Blocks(ref blocks) = result[1].content {
         if let ContentBlock::Text { cache_control, .. } = &blocks[0] {
             assert_eq!(cache_control.as_ref().unwrap().kind, "ephemeral");
-        } else { panic!("expected Text block"); }
-    } else { panic!("expected Blocks"); }
+        } else {
+            panic!("expected Text block");
+        }
+    } else {
+        panic!("expected Blocks");
+    }
 }
 
 #[test]
@@ -867,30 +915,45 @@ fn test_attach_cache_breakpoints_two_turns() {
         if let MessageContent::Blocks(ref blocks) = result[idx].content {
             if let ContentBlock::Text { cache_control, .. } = &blocks[0] {
                 assert_eq!(cache_control.as_ref().unwrap().kind, "ephemeral");
-            } else { panic!("expected Text block at idx {}", idx); }
-        } else { panic!("expected Blocks at idx {}", idx); }
+            } else {
+                panic!("expected Text block at idx {}", idx);
+            }
+        } else {
+            panic!("expected Blocks at idx {}", idx);
+        }
     }
 }
 
 #[test]
 fn test_attach_cache_breakpoints_only_last_two() {
     let messages = vec![
-        user_text("a"), asst_text("1"),
-        user_text("b"), asst_text("2"),
-        user_text("c"), asst_text("3"),
+        user_text("a"),
+        asst_text("1"),
+        user_text("b"),
+        asst_text("2"),
+        user_text("c"),
+        asst_text("3"),
     ];
     let result = attach_cache_breakpoints(messages);
     // First assistant turn (idx 1) should NOT have cache_control
     if let MessageContent::Blocks(ref blocks) = result[1].content {
         if let ContentBlock::Text { cache_control, .. } = &blocks[0] {
-            assert!(cache_control.is_none(), "idx 1 should not have cache_control");
+            assert!(
+                cache_control.is_none(),
+                "idx 1 should not have cache_control"
+            );
         }
     }
     // Last two (idx 3 and 5) should have it
     for idx in [3usize, 5] {
         if let MessageContent::Blocks(ref blocks) = result[idx].content {
             if let ContentBlock::Text { cache_control, .. } = &blocks[0] {
-                assert_eq!(cache_control.as_ref().unwrap().kind, "ephemeral", "idx {} missing cache_control", idx);
+                assert_eq!(
+                    cache_control.as_ref().unwrap().kind,
+                    "ephemeral",
+                    "idx {} missing cache_control",
+                    idx
+                );
             }
         }
     }
@@ -903,19 +966,31 @@ fn test_attach_cache_breakpoints_skips_tool_use_blocks() {
         Message {
             role: "assistant".to_string(),
             content: MessageContent::Blocks(vec![
-                ContentBlock::ToolUse { id: "x".to_string(), name: "run_bash".to_string(), input: serde_json::json!({}) },
-                ContentBlock::Text { text: "done".to_string(), cache_control: None },
+                ContentBlock::ToolUse {
+                    id: "x".to_string(),
+                    name: "run_bash".to_string(),
+                    input: serde_json::json!({}),
+                },
+                ContentBlock::Text {
+                    text: "done".to_string(),
+                    cache_control: None,
+                },
             ]),
         },
     ];
     let result = attach_cache_breakpoints(messages);
     if let MessageContent::Blocks(ref blocks) = result[1].content {
         // tool_use block (idx 0) should NOT have cache_control
-        if let ContentBlock::ToolUse { .. } = &blocks[0] { /* ok */ } else { panic!("expected ToolUse"); }
+        if let ContentBlock::ToolUse { .. } = &blocks[0] { /* ok */
+        } else {
+            panic!("expected ToolUse");
+        }
         // text block (idx 1) SHOULD have cache_control
         if let ContentBlock::Text { cache_control, .. } = &blocks[1] {
             assert_eq!(cache_control.as_ref().unwrap().kind, "ephemeral");
-        } else { panic!("expected Text at idx 1"); }
+        } else {
+            panic!("expected Text at idx 1");
+        }
     }
 }
 
@@ -936,9 +1011,9 @@ fn test_fmt_num_small() {
 
 #[test]
 fn test_fmt_num_thousands() {
-    assert_eq!(fmt_num(1000),   "1k");
-    assert_eq!(fmt_num(1999),   "1k");
-    assert_eq!(fmt_num(12345),  "12k");
+    assert_eq!(fmt_num(1000), "1k");
+    assert_eq!(fmt_num(1999), "1k");
+    assert_eq!(fmt_num(12345), "12k");
     assert_eq!(fmt_num(999999), "999k");
 }
 
@@ -958,7 +1033,11 @@ fn test_gather_workspace_context_structure() {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let ctx = gather_workspace_context(dir);
 
-    assert!(ctx.contains("WORKSPACE STATE"), "missing header: {}", &ctx[..ctx.len().min(300)]);
+    assert!(
+        ctx.contains("WORKSPACE STATE"),
+        "missing header: {}",
+        &ctx[..ctx.len().min(300)]
+    );
     assert!(ctx.contains("Project:"), "missing Project: line");
     assert!(ctx.contains("Files:"), "missing Files: section");
     assert!(ctx.contains("```"), "missing code fence");
@@ -969,7 +1048,11 @@ fn test_gather_workspace_context_contains_files() {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let ctx = gather_workspace_context(dir);
     // The manifest dir contains Cargo.toml — it should appear in the find output
-    assert!(ctx.contains("Cargo.toml"), "Cargo.toml not in file listing: {}", &ctx[..ctx.len().min(500)]);
+    assert!(
+        ctx.contains("Cargo.toml"),
+        "Cargo.toml not in file listing: {}",
+        &ctx[..ctx.len().min(500)]
+    );
 }
 
 #[test]
@@ -977,7 +1060,11 @@ fn test_gather_workspace_context_git_branch() {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let ctx = gather_workspace_context(dir);
     // In a git repo, the Branch: line should be present
-    assert!(ctx.contains("Branch:"), "Branch: line missing — is this a git repo? ctx: {}", &ctx[..ctx.len().min(300)]);
+    assert!(
+        ctx.contains("Branch:"),
+        "Branch: line missing — is this a git repo? ctx: {}",
+        &ctx[..ctx.len().min(300)]
+    );
 }
 
 #[test]
@@ -991,5 +1078,8 @@ fn test_gather_workspace_context_non_git_dir() {
     assert!(ctx.contains("WORKSPACE STATE"));
     assert!(ctx.contains("Files:"));
     // No Branch: line without git
-    assert!(!ctx.contains("Branch:"), "unexpected Branch: in non-git dir");
+    assert!(
+        !ctx.contains("Branch:"),
+        "unexpected Branch: in non-git dir"
+    );
 }

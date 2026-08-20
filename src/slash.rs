@@ -14,37 +14,38 @@ pub enum SlashAction {
 
 #[derive(Debug, Clone)]
 pub struct SlashResult {
-    pub action:   SlashAction,
+    pub action: SlashAction,
     pub messages: Vec<Message>,
-    pub output:   Option<String>,
+    pub output: Option<String>,
 }
 
 pub struct SlashContext<'a> {
-    pub session_path:  &'a Path,
-    pub workflow_dir:  &'a Path,
-    pub memory_dir:    &'a Path,
-    pub log_path:      &'a Path,
-    pub model:         &'a str,
-    pub backend:       &'a str,
-    pub timeout_ms:    u64,
-    pub rate_limit:    u64,
-    pub input_tokens:  u64,
+    pub session_path: &'a Path,
+    pub workflow_dir: &'a Path,
+    pub memory_dir: &'a Path,
+    pub log_path: &'a Path,
+    pub model: &'a str,
+    pub backend: &'a str,
+    pub timeout_ms: u64,
+    pub rate_limit: u64,
+    pub input_tokens: u64,
     pub output_tokens: u64,
     pub message_count: usize,
-    pub config:        &'a AppConfig,
+    pub config: &'a AppConfig,
 }
 
 /// Handle a slash command. Returns None if the input is not a slash command.
 pub async fn handle_slash(
-    input:    &str,
+    input: &str,
     messages: Vec<Message>,
-    ctx:      &SlashContext<'_>,
+    ctx: &SlashContext<'_>,
 ) -> Option<SlashResult> {
     let trimmed = input.trim();
 
     if trimmed == "/help" {
         let output = "\
 Slash commands:
+  /model [name]     Interactive model picker, or switch directly by name
   /status           Session stats
   /save             Save session now
   /memory [key]     List memories or show one
@@ -53,11 +54,19 @@ Slash commands:
   /clear            Clear conversation history
   /exit             Exit"
             .to_string();
-        return Some(SlashResult { action: SlashAction::Continue, messages, output: Some(output) });
+        return Some(SlashResult {
+            action: SlashAction::Continue,
+            messages,
+            output: Some(output),
+        });
     }
 
     if trimmed == "/clear" {
-        return Some(SlashResult { action: SlashAction::Continue, messages: vec![], output: None });
+        return Some(SlashResult {
+            action: SlashAction::Continue,
+            messages: vec![],
+            output: None,
+        });
     }
 
     if trimmed == "/status" {
@@ -78,7 +87,11 @@ Slash commands:
             ctx.output_tokens,
             ctx.session_path.display(),
         );
-        return Some(SlashResult { action: SlashAction::Continue, messages, output: Some(output) });
+        return Some(SlashResult {
+            action: SlashAction::Continue,
+            messages,
+            output: Some(output),
+        });
     }
 
     if trimmed == "/save" {
@@ -86,7 +99,11 @@ Slash commands:
             Ok(()) => "Session saved.".to_string(),
             Err(e) => format!("Save failed: {}", e),
         };
-        return Some(SlashResult { action: SlashAction::Continue, messages, output: Some(output) });
+        return Some(SlashResult {
+            action: SlashAction::Continue,
+            messages,
+            output: Some(output),
+        });
     }
 
     if trimmed == "/memory" || trimmed.starts_with("/memory ") {
@@ -106,7 +123,11 @@ Slash commands:
                 content
             }
         };
-        return Some(SlashResult { action: SlashAction::Continue, messages, output: Some(output) });
+        return Some(SlashResult {
+            action: SlashAction::Continue,
+            messages,
+            output: Some(output),
+        });
     }
 
     if trimmed == "/log" {
@@ -118,7 +139,11 @@ Slash commands:
             }
             _ => "No log entries yet.".to_string(),
         };
-        return Some(SlashResult { action: SlashAction::Continue, messages, output: Some(output) });
+        return Some(SlashResult {
+            action: SlashAction::Continue,
+            messages,
+            output: Some(output),
+        });
     }
 
     if trimmed == "/workflow" || trimmed.starts_with("/workflow ") {
@@ -128,7 +153,11 @@ Slash commands:
             if entries.is_empty() {
                 "No workflows.".to_string()
             } else {
-                entries.iter().map(|e| e.key.clone()).collect::<Vec<_>>().join("\n")
+                entries
+                    .iter()
+                    .map(|e| e.key.clone())
+                    .collect::<Vec<_>>()
+                    .join("\n")
             }
         } else {
             match load_workflow(ctx.workflow_dir, wf_name) {
@@ -136,11 +165,19 @@ Slash commands:
                 Some(wf) => run_workflow(&wf, ctx.config).await,
             }
         };
-        return Some(SlashResult { action: SlashAction::Continue, messages, output: Some(output) });
+        return Some(SlashResult {
+            action: SlashAction::Continue,
+            messages,
+            output: Some(output),
+        });
     }
 
     if trimmed == "/exit" || trimmed == "/quit" {
-        return Some(SlashResult { action: SlashAction::Exit, messages, output: None });
+        return Some(SlashResult {
+            action: SlashAction::Exit,
+            messages,
+            output: None,
+        });
     }
 
     if trimmed.starts_with('/') {
