@@ -71,7 +71,10 @@ async fn main() -> anyhow::Result<()> {
     if config.resume && !cli.fresh && session_path.exists() {
         if let Some(msgs) = load_session(&session_path) {
             println!("[Syl] Resuming previous session...");
-            *state.messages.lock().unwrap() = msgs;
+            // The saved thinking blocks were bound to the old session's system
+            // prompt; replaying them under a new one fails the prefix check.
+            *state.messages.lock().unwrap() =
+                syl_rs::api::compaction::strip_thinking(msgs);
         }
     }
 
@@ -186,7 +189,7 @@ fn print_help() {
         "syl — AI coding assistant\n\n\
          Usage: syl [options]\n\n\
          Options:\n  \
-         --model <name>      Override model (default: claude-opus-4-6)\n  \
+         --model <name>      Override model (default: claude-opus-5-5)\n  \
          --backend <name>    anthropic | bedrock  (default: anthropic)\n  \
          --rate-limit <n>    TPM budget  (default: 60000)\n  \
          --timeout <secs>    Request timeout in seconds  (default: 120)\n  \
@@ -540,23 +543,39 @@ async fn run_agent_turn(
     }
 
     loop {
-        // Build system prompt each iteration (memory/workspace may have changed)
-        let workspace = gather_workspace_context(project_dir);
-        let sys_blocks = build_system_blocks(&workspace, memory_dir);
-        let system: Vec<SystemBlock> = sys_blocks
-            .into_iter()
-            .filter_map(|b| match b {
-                ContentBlock::Text {
-                    text,
-                    cache_control,
-                } => Some(if cache_control.is_some() {
-                    SystemBlock::cached(text)
-                } else {
-                    SystemBlock::text(text)
-                }),
-                _ => None,
-            })
-            .collect();
+        // The system prompt (persona + workspace snapshot + memories) is built
+        // once per conversation and then frozen: editing `system` mid-
+        // conversation fails the thinking-block prefix check on Opus 5.5 and
+        // other models with preserved thinking.  It is rebuilt only while no
+        // assistant turn exists yet (new session or after /clear).
+        let system: Vec<SystemBlock> = {
+            let fresh_conversation = !state
+                .messages
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|m| m.role == "assistant");
+            let mut cached = state.system_prompt.lock().unwrap();
+            if fresh_conversation || cached.is_none() {
+                let workspace = gather_workspace_context(project_dir);
+                let blocks: Vec<SystemBlock> = build_system_blocks(&workspace, memory_dir)
+                    .into_iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::Text {
+                            text,
+                            cache_control,
+                        } => Some(if cache_control.is_some() {
+                            SystemBlock::cached(text)
+                        } else {
+                            SystemBlock::text(text)
+                        }),
+                        _ => None,
+                    })
+                    .collect();
+                *cached = Some(blocks);
+            }
+            cached.clone().unwrap_or_default()
+        };
 
         // Compact before every model call, not just between user messages:
         // a long tool chain inside one turn can otherwise grow without bound.

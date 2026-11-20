@@ -198,7 +198,7 @@ Memory entries are plain markdown files in `.syl/memory/`:
     └── ship.md
 ```
 
-`memory_write` stores a note by topic key (overwrites if the key exists). `memory_read` returns a specific entry or lists all keys. All memory files are injected into the system prompt at startup, before the first user turn, so Syl has full recall from turn one without burning a tool call.
+`memory_write` stores a note by topic key (overwrites if the key exists). `memory_read` returns a specific entry or lists all keys. All memory files are injected into the system prompt when a conversation starts (startup, or after `/clear`), so Syl has full recall from turn one without burning a tool call.
 
 ---
 
@@ -257,7 +257,7 @@ Syl ── ↑ 1024  ↓ 512  · $0.0124 ── TPM ████░░ 42% ─�
 
 **Bottom bar:**
 ```
-─ claude-opus-4-6 · 120s ────────────────────────── /help  /save  /exit ─
+─ claude-opus-5-5 · 120s ────────────────────────── /help  /save  /exit ─
 ```
 
 Shows the active model, backend (when not `anthropic`), and request timeout. While a tool is running, it switches to a spinner showing the active tool name.
@@ -265,6 +265,14 @@ Shows the active model, backend (when not `anthropic`), and request timeout. Whi
 ---
 
 ## Thinking Animation
+
+**`--thinking` and adaptive models.** Models with manual extended thinking get `thinking: {type: "enabled", budget_tokens: N}`. Adaptive-thinking models (Opus 4.7 and later, and every 5.x model, including the default `claude-opus-5-5`) reject that with a 400 and always think; by default their thinking arrives *omitted* (an empty block with a signature). For those models `--thinking` sends `thinking: {type: "adaptive", display: "summarized"}` so the summarized reasoning streams in, and the budget number is ignored. See `supports_manual_thinking` in `src/config.rs`.
+
+**Thinking blocks and the prefix check.** Opus 5.5 and other models with preserved thinking sign each thinking block against everything before it, and reject (or drop) blocks if `system`, `tools` or an earlier message changed. Syl keeps conversations append-only:
+
+- Assistant turns are stored and sent back exactly as streamed, thinking blocks and signatures included.
+- The system prompt (persona, workspace snapshot, memories) is built when a conversation starts and then frozen in `SharedState::system_prompt`. It is rebuilt only while history has no assistant turn yet (new session, or after `/clear`). Memories written mid-session reach the model through the tool result, and appear in the system prompt from the next conversation.
+- Where history *is* rewritten (compaction, or `--resume` under a fresh system prompt) every old thinking block is removed with `compaction::strip_thinking`, so nothing stale is sent back.
 
 When extended thinking is enabled (`--thinking <budget>`), a windspren animation plays in the bottom status bar while Claude's thinking block streams in — an animated `≋` character drifts across a trail of `·` dots at 80 ms per frame. The animation stops the moment the first text delta arrives.
 

@@ -31,6 +31,36 @@ pub fn find_valid_start(msgs: Vec<Message>) -> Vec<Message> {
     }
 }
 
+/// Remove every `thinking` block from `msgs`.
+///
+/// Thinking blocks are signed against everything that came before them. After
+/// history is rewritten (compaction, or a resumed session under a new system
+/// prompt) none of the old blocks would pass the prefix check on models with
+/// preserved thinking, so all of them are dropped: with no old thinking sent
+/// back there is nothing to fail, and new turns produce fresh blocks. An
+/// assistant message left empty gets a placeholder text block so roles keep
+/// alternating.
+pub fn strip_thinking(msgs: Vec<Message>) -> Vec<Message> {
+    msgs.into_iter()
+        .map(|m| match m.content {
+            MessageContent::Blocks(blocks) if m.role == "assistant" => {
+                let mut kept: Vec<ContentBlock> = blocks
+                    .into_iter()
+                    .filter(|b| !matches!(b, ContentBlock::Thinking { .. }))
+                    .collect();
+                if kept.is_empty() {
+                    kept.push(ContentBlock::Text {
+                        text: "(continued)".to_string(),
+                        cache_control: None,
+                    });
+                }
+                Message { role: m.role, content: MessageContent::Blocks(kept) }
+            }
+            content => Message { role: m.role, content },
+        })
+        .collect()
+}
+
 /// Build compacted message history from a summary + kept messages.
 /// None summary → return kept messages unchanged.
 pub fn build_compacted_messages(summary: Option<&str>, keep_msgs: Vec<Message>) -> Vec<Message> {
@@ -201,7 +231,7 @@ pub async fn compact_history(
         KeepBoundary::UserText(i) | KeepBoundary::Assistant(i) => i,
     };
     let old  = messages[..keep_start].to_vec();
-    let keep = messages[keep_start..].to_vec();
+    let keep = strip_thinking(messages[keep_start..].to_vec());
 
     tracing::info!(
         old = old.len(), keep = keep.len(),

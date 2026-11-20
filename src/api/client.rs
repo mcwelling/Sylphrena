@@ -103,14 +103,27 @@ fn build_payload(
         "messages": messages,
     });
 
-    if let Some(budget) = config.thinking_budget {
-        body["thinking"] = serde_json::json!({
-            "type": "enabled",
-            "budget_tokens": budget,
-        });
+    if let Some(thinking) = thinking_param(config) {
+        body["thinking"] = thinking;
     }
 
     body
+}
+
+/// The `thinking` request field for `--thinking <budget>`, or None when the
+/// flag isn't set.
+///
+/// Models with manual thinking get `{type: enabled, budget_tokens}`. Adaptive
+/// models (Opus 4.7+, all 5.x) reject that with a 400 and always think anyway,
+/// returning *omitted* (empty) thinking by default, so for them `--thinking`
+/// asks for summarized thinking to be streamed instead.
+pub fn thinking_param(config: &AppConfig) -> Option<serde_json::Value> {
+    let budget = config.thinking_budget?;
+    Some(if crate::config::supports_manual_thinking(&config.model) {
+        serde_json::json!({ "type": "enabled", "budget_tokens": budget })
+    } else {
+        serde_json::json!({ "type": "adaptive", "display": "summarized" })
+    })
 }
 
 /// Build a Bedrock-compatible request body (no `stream` flag; requires
@@ -134,11 +147,8 @@ fn build_bedrock_payload(
         "messages": messages,
     });
 
-    if let Some(budget) = config.thinking_budget {
-        body["thinking"] = serde_json::json!({
-            "type":          "enabled",
-            "budget_tokens": budget,
-        });
+    if let Some(thinking) = thinking_param(config) {
+        body["thinking"] = thinking;
     }
 
     body
