@@ -52,7 +52,27 @@ pub const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 pub const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
 pub const ANTHROPIC_VERSION: &str = "2023-06-01";
 pub const BAKED_IMAGE: &str = "syl-agent-ready:latest";
-pub const CONTAINER_NAME: &str = "syl-agent";
+/// Container name used by Syl versions before per-project names existed.
+pub const LEGACY_CONTAINER_NAME: &str = "syl-agent";
+
+/// Podman container name for this project: `syl-agent-<hash>` where the hash is
+/// derived from the project directory. Each project gets its own container, so
+/// running Syl in two projects at once no longer collides.
+pub fn container_name() -> &'static str {
+    static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| {
+        let dir = std::env::current_dir().unwrap_or_default();
+        let dir = dir.canonicalize().unwrap_or(dir);
+        container_name_for(&dir)
+    })
+}
+
+/// Pure helper behind `container_name()` (exposed for tests).
+pub fn container_name_for(project_dir: &std::path::Path) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(project_dir.to_string_lossy().as_bytes());
+    format!("syl-agent-{}", &hex::encode(digest)[..10])
+}
 
 // ---------------------------------------------------------------------------
 // AppConfig

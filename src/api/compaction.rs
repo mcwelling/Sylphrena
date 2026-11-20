@@ -149,9 +149,39 @@ pub async fn summarize_messages(
 // Public compact_history entry point
 // ---------------------------------------------------------------------------
 
+/// Where the kept tail of the history starts, and how it must be framed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeepBoundary {
+    /// Tail starts at a plain user text message: use the usual
+    /// `[user summary, assistant ack, ...tail]` framing.
+    UserText(usize),
+    /// Tail starts at an assistant message (mid tool chain, no plain user
+    /// message in the window): frame as `[user summary, ...tail]` so roles
+    /// still alternate and every tool_result keeps its matching tool_use.
+    Assistant(usize),
+}
+
+/// Choose the absolute index at which the kept tail begins, searching forward
+/// from `len - COMPACT_KEEP`. Returns None if no safe boundary exists.
+pub fn choose_keep_boundary(messages: &[Message]) -> Option<KeepBoundary> {
+    let window_start = messages.len().saturating_sub(COMPACT_KEEP);
+    let window = &messages[window_start..];
+    if let Some(i) = window
+        .iter()
+        .position(|m| m.role == "user" && matches!(m.content, MessageContent::Text(_)))
+    {
+        return Some(KeepBoundary::UserText(window_start + i));
+    }
+    window
+        .iter()
+        .position(|m| m.role == "assistant")
+        .map(|i| KeepBoundary::Assistant(window_start + i))
+}
+
 /// Compact the conversation history when it exceeds MAX_HISTORY messages.
-/// Summarises the oldest messages via Haiku and keeps the COMPACT_KEEP most
-/// recent messages, preserving a valid user-first start.
+/// Summarises the oldest messages via Haiku and keeps (roughly) the
+/// COMPACT_KEEP most recent ones, always producing a valid user-first,
+/// role-alternating history. Safe to call mid-turn, inside a tool chain.
 pub async fn compact_history(
     messages: Vec<Message>,
     http:     &reqwest::Client,
@@ -163,9 +193,15 @@ pub async fn compact_history(
         return messages;
     }
 
-    let keep_start = messages.len() - COMPACT_KEEP;
+    let Some(boundary) = choose_keep_boundary(&messages) else {
+        tracing::warn!("compaction: no safe boundary in recent window — skipping");
+        return messages;
+    };
+    let keep_start = match boundary {
+        KeepBoundary::UserText(i) | KeepBoundary::Assistant(i) => i,
+    };
     let old  = messages[..keep_start].to_vec();
-    let keep = find_valid_start(messages[keep_start..].to_vec());
+    let keep = messages[keep_start..].to_vec();
 
     tracing::info!(
         old = old.len(), keep = keep.len(),
@@ -176,5 +212,20 @@ pub async fn compact_history(
     if summary.is_none() {
         tracing::warn!("compaction summary failed — keeping recent messages only");
     }
-    build_compacted_messages(summary.as_deref(), keep)
+
+    match boundary {
+        KeepBoundary::UserText(_) => build_compacted_messages(summary.as_deref(), keep),
+        KeepBoundary::Assistant(_) => {
+            let lead = match summary.as_deref() {
+                Some(s) => format!("[Context summary of earlier conversation]\n{}", s),
+                None => "[Earlier conversation was dropped to save context.]".to_string(),
+            };
+            let mut result = vec![Message {
+                role:    "user".to_string(),
+                content: MessageContent::Text(lead),
+            }];
+            result.extend(keep);
+            result
+        }
+    }
 }

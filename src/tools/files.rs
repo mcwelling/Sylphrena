@@ -1,7 +1,7 @@
 /// `read_file` tool — reads a paged range of lines from a file inside the container.
 /// Mirrors `read-file-paged` in syl.bb.
-use crate::config::{AppConfig, CONTAINER_NAME};
-use crate::util::truncate_output;
+use crate::config::{container_name, AppConfig};
+use crate::util::{shell_quote, truncate_output};
 
 /// Run the `read_file` tool. Returns `(output, is_error)`.
 ///
@@ -30,19 +30,19 @@ pub fn read_file(input: &serde_json::Value, config: &AppConfig) -> (String, bool
 
     // Mirror the syl.bb command exactly
     let cmd = format!(
-        "f='{abs}'; \
+        "f={abs}; \
          if [ ! -f \"$f\" ]; then echo \"Error: file not found: $f\"; exit 1; fi; \
          total=$(wc -l < \"$f\"); \
          echo \"[File: $f — $total lines total, showing {start}-{end}]\"; \
          awk 'NR>={start}{{printf \"%5d: %s\\n\", NR, $0}} NR>{end}{{exit}}' \"$f\"",
-        abs   = abs_path,
+        abs   = shell_quote(&abs_path),
         start = start,
         end   = end,
     );
 
     let _ = config.timeout_ms; // timeout enforced at container level via bash timeout if needed
     match std::process::Command::new("podman")
-        .args(["exec", CONTAINER_NAME, "/bin/bash", "-c", &cmd])
+        .args(["exec", container_name(), "/bin/bash", "-c", &cmd])
         .output()
     {
         Ok(out) => {

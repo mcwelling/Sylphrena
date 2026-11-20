@@ -2,7 +2,12 @@ pub const MAX_TOOL_OUTPUT: usize = 8000;
 
 pub fn truncate_output(s: &str) -> String {
     if s.len() > MAX_TOOL_OUTPUT {
-        format!("{}\n... [truncated: {} total chars]", &s[..MAX_TOOL_OUTPUT], s.len())
+        // Back off to a char boundary so multi-byte UTF-8 never panics the slice.
+        let mut cut = MAX_TOOL_OUTPUT;
+        while !s.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        format!("{}\n... [truncated: {} total chars]", &s[..cut], s.len())
     } else {
         s.to_string()
     }
@@ -65,6 +70,25 @@ pub fn process_tool_output(raw: &str) -> String {
 
     // Stage 3: Hard truncation
     truncate_output(raw)
+}
+
+/// Wrap a string in single quotes for safe interpolation into a `sh -c` /
+/// `bash -c` command line. Embedded single quotes become `'\''`.
+pub fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// Validate a memory / workflow key before it becomes a file name on the HOST.
+/// Allows ASCII letters, digits, `-`, `_` and `.`; rejects empty keys, leading
+/// dots, and `..` so a key can never escape its directory.
+pub fn is_safe_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= 128
+        && !key.starts_with('.')
+        && !key.contains("..")
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
 pub fn fmt_num(n: u64) -> String {

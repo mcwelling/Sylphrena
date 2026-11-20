@@ -1,6 +1,7 @@
 /// Syl — main entry point.  Phase 4: full REPL wire-up.
 use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
@@ -426,20 +427,6 @@ async fn main_loop(
         if let Err(e) = save_session(session_path, &msgs) {
             tracing::warn!("session save failed: {e}");
         }
-
-        // Compact history if it has grown too long
-        {
-            let msgs = state.messages.lock().unwrap().clone();
-            let compacted = syl_rs::api::compaction::compact_history(
-                msgs,
-                http,
-                config,
-                &state,
-                CancellationToken::new(),
-            )
-            .await;
-            *state.messages.lock().unwrap() = compacted;
-        }
     }
 
     Ok(())
@@ -571,38 +558,88 @@ async fn run_agent_turn(
             })
             .collect();
 
+        // Compact before every model call, not just between user messages:
+        // a long tool chain inside one turn can otherwise grow without bound.
+        // (No-op until history exceeds MAX_HISTORY.)
+        {
+            let msgs = state.messages.lock().unwrap().clone();
+            if msgs.len() > syl_rs::api::compaction::MAX_HISTORY {
+                let compacted = syl_rs::api::compaction::compact_history(
+                    msgs,
+                    http,
+                    config,
+                    state,
+                    cancel.clone(),
+                )
+                .await;
+                *state.messages.lock().unwrap() = compacted;
+            }
+        }
+
         let messages = state.messages.lock().unwrap().clone();
+
+        // Rows are read live by the callbacks so a resize mid-stream is honoured
+        // without restarting the request.
+        let live_rows = Arc::new(AtomicU16::new(*rows));
 
         let notify_fn = {
             let st = state.clone();
-            let r = *rows;
+            let lr = live_rows.clone();
             move |msg: &str| {
+                let r = lr.load(Ordering::Relaxed);
                 let _ = terminal::print_to_scroll(&st.stdout, &format!("{msg}\r\n"), r);
             }
         };
 
         // Per-iteration flag: did any text deltas arrive this turn?
-        let streaming_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let streaming_started = Arc::new(AtomicBool::new(false));
 
         let on_delta = {
             let st = state.clone();
-            let r = *rows;
+            let lr = live_rows.clone();
             let ss = streaming_started.clone();
-            move |delta: BlockDeltaEvent| handle_stream_delta(&st, delta, r, &ss)
+            move |delta: BlockDeltaEvent| {
+                handle_stream_delta(&st, delta, lr.load(Ordering::Relaxed), &ss)
+            }
         };
 
-        let result = tokio::select! {
-            r = call_with_retry_shared(http, config, state, &messages, &system, cancel.clone(), notify_fn, on_delta) => r,
-            _ = drain_resize_during_turn(resize_rx, state, rows, cols) => {
-                if streaming_started.load(std::sync::atomic::Ordering::Relaxed) {
-                    let _ = terminal::end_streaming(&state.stdout, *rows);
+        // Keep the same in-flight request alive across terminal resizes.
+        // (Previously a resize dropped the stream and re-sent the whole call,
+        // which double-billed and printed partly duplicated text.)
+        let call = call_with_retry_shared(
+            http, config, state, &messages, &system, cancel.clone(), notify_fn, on_delta,
+        );
+        tokio::pin!(call);
+        let mut resize_open = true;
+        let result = loop {
+            tokio::select! {
+                r = &mut call => break r,
+                changed = resize_rx.changed(), if resize_open => {
+                    if changed.is_err() {
+                        // Resize sender gone; just wait for the call.
+                        resize_open = false;
+                        continue;
+                    }
+                    let (nc, nr) = *resize_rx.borrow_and_update();
+                    *cols = nc;
+                    *rows = nr;
+                    live_rows.store(nr, Ordering::Relaxed);
+                    let _ = handle_resize(nc, nr, state).await;
+                    if streaming_started.load(Ordering::Relaxed) {
+                        // Text is already flowing: no thinking animation, and
+                        // re-anchor the streaming line inside the new region.
+                        if let Some(anim) = state.anim.lock().unwrap().take() {
+                            anim.stop();
+                        }
+                        let _ = terminal::end_streaming(&state.stdout, nr);
+                        let _ = terminal::begin_streaming(&state.stdout, nr);
+                    }
                 }
-                continue;
             }
         };
 
         // Close streaming line before processing result
-        if streaming_started.load(std::sync::atomic::Ordering::Relaxed) {
+        if streaming_started.load(Ordering::Relaxed) {
             let _ = terminal::end_streaming(&state.stdout, *rows);
         }
 
@@ -721,11 +758,11 @@ fn handle_stream_delta(
     state: &Arc<SharedState>,
     delta: BlockDeltaEvent,
     rows: u16,
-    started: &std::sync::atomic::AtomicBool,
+    started: &AtomicBool,
 ) {
     match delta {
         BlockDeltaEvent::ThinkingDelta { text } | BlockDeltaEvent::TextDelta { text } => {
-            if !started.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            if !started.swap(true, Ordering::Relaxed) {
                 // First text delta: stop animation and open a new scroll line
                 if let Some(anim) = state.anim.lock().unwrap().take() {
                     anim.stop();
@@ -899,22 +936,4 @@ async fn handle_resize(
     }
 
     Ok(())
-}
-
-/// Awaits resize events from `resize_rx`, calls `handle_resize`, and loops.
-/// Used inside `tokio::select!` in `run_agent_turn` so resizes are handled
-/// concurrently with the streaming HTTP call.
-async fn drain_resize_during_turn(
-    resize_rx: &mut tokio::sync::watch::Receiver<(u16, u16)>,
-    state: &Arc<SharedState>,
-    rows: &mut u16,
-    cols: &mut u16,
-) {
-    loop {
-        let _ = resize_rx.changed().await;
-        let (nc, nr) = *resize_rx.borrow_and_update();
-        *cols = nc;
-        *rows = nr;
-        let _ = handle_resize(nc, nr, state).await;
-    }
 }

@@ -7,7 +7,7 @@ use std::io::Write;
 use std::process::Command;
 use std::sync::Arc;
 
-use crate::config::{AppConfig, CONTAINER_NAME};
+use crate::config::{container_name, AppConfig};
 use crate::shared::SharedState;
 use crate::tui::{image_proto, terminal};
 
@@ -31,7 +31,7 @@ pub fn show_image(
 
     // Verify the file exists inside the container before invoking a renderer
     let check = Command::new("podman")
-        .args(["exec", CONTAINER_NAME, "test", "-f", &container_path])
+        .args(["exec", container_name(), "test", "-f", &container_path])
         .status();
     if !check.map(|s| s.success()).unwrap_or(false) {
         return (format!("[Tool error: file not found: {}]", rel_path), true);
@@ -88,7 +88,7 @@ fn image_size_chars(cols: u16, rows: u16) -> (u16, u16) {
 fn renderer_cmd(container_path: &str, args: &[&str]) -> Option<Vec<u8>> {
     let result = Command::new("podman")
         .args(["exec", "--env", "TERM=xterm-kitty", "--env", "COLORTERM=truecolor",
-               CONTAINER_NAME])
+               container_name()])
         .args(args)
         .arg(container_path)
         .output()

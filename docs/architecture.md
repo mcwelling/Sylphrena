@@ -130,7 +130,7 @@ Long conversations are summarised rather than naively truncated.
                      New compact history
 ```
 
-Triggered when `len(messages) > MAX_HISTORY` (30). Compaction uses a dedicated `claude-haiku` call with `max_tokens: 2048`. If summarisation fails, the oldest messages are simply dropped so the conversation continues uninterrupted.
+Checked before **every** model call, including mid-turn inside a tool chain, and triggered when `len(messages) > MAX_HISTORY` (30). If the recent window contains no plain user message (a long tool chain), the kept tail starts at the first assistant message instead and is framed as `[user: summary] + tail`, so every `tool_result` keeps its matching `tool_use`. Compaction uses a dedicated `claude-haiku` call with `max_tokens: 2048`. If summarisation fails, the oldest messages are simply dropped so the conversation continues uninterrupted.
 
 ---
 
@@ -141,7 +141,7 @@ syl starts
    │
    ├─ marker file (.syl/container-ready) present and matches live container ID?
    │     YES → podman start {name}; verify /workspace mount still live
-   │     NO  → podman rm -f; cold start
+   │     NO  → podman rm -f (plus any legacy `syl-agent` container for this project); cold start
    │
    └─ cold start
          ├─ syl-agent-ready:latest image exists? → run from baked image (fast)
@@ -150,9 +150,13 @@ syl starts
                → podman commit → syl-agent-ready:latest (baked for next time)
 ```
 
+**Container name:** `syl-agent-<hash>`, where `<hash>` is the first 10 hex characters of SHA-256 of the canonical project path. Each project gets its own container, so several Syl sessions can run side by side. The baked image (`syl-agent-ready:latest`) is shared.
+
 Before every tool execution `ensure_container()` runs `podman inspect`. If the container has died (OOM, sleep/wake, manual removal), it is automatically resummons before the tool runs.
 
-**Container constraints:** `--memory=2g`, `/workspace` bind-mounted read-write, `~/.ssh` bind-mounted read-only.
+**Container constraints:** `--memory=2g`, `/workspace` bind-mounted read-write, `/workspace/.syl` re-mounted **read-only** (so code in the container can't rewrite Syl's memory, workflows, session or log), `~/.ssh` bind-mounted read-only. Host paths are shell-quoted, so project paths with spaces work.
+
+**Host-side tools:** `memory_*` and `workflow_*` run on the host, not in the container. Their keys are validated (`[A-Za-z0-9._-]`, no `..`, no leading `.`, ≤128 chars) so a key can never resolve outside `.syl/memory/` or `.syl/workflows/`.
 
 ---
 
@@ -220,13 +224,17 @@ Run with `/workflow <name>`. List all with `/workflow`. Claude can create and de
 
 ## Output Handling
 
-Tool output is processed through three layers:
+Tool output is processed before it reaches the model (`process_tool_output` in `src/util.rs`):
 
-1. **Display cap** — `run_bash` output is shown capped at 40 lines in the TUI with a `... (N more lines)` trailer. The full output is still sent to the model.
+1. **HTML stripping** — Output that looks like HTML has `<script>`/`<style>` blocks and tags removed and whitespace collapsed.
 
-2. **History truncation** — Any tool result longer than `max-tool-output` is hard-truncated before being stored in conversation history to prevent context bloat.
+2. **Paging** — Output longer than 100 lines is replaced by a numbered 100-line preview with a hint to narrow the command or use `read_file`.
 
-3. **Haiku extraction** — When a command returns large or HTML output (e.g. `curl` returning a webpage), a `claude-haiku` sub-agent distils only the relevant content. The extracted summary replaces the raw output in history.
+3. **Hard truncation** — Anything still longer than `MAX_TOOL_OUTPUT` (8 000 bytes) is cut at the nearest UTF-8 character boundary with a `[truncated: N total chars]` trailer.
+
+Separately, the TUI shows `run_bash` output capped at 40 lines with a `... (N more lines)` trailer; this is display-only.
+
+For remote content, Claude can call `dispatch_agent`, which fetches a URL and has a `claude-haiku` sub-agent extract only what the task needs. That is an explicit tool call, not an automatic step applied to `run_bash` output.
 
 ---
 
