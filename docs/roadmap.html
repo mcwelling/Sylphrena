@@ -172,9 +172,10 @@ footer { margin-top: 56px; padding-top: 16px; border-top: 1px solid var(--border
     <li><a href="#survey">Field survey</a></li>
     <li><a href="#matrix">Comparison matrix</a></li>
     <li><a href="#principles">Principles for Syl</a></li>
+    <li><a href="#decisions">Decisions</a></li>
     <li><a href="#roadmap">Roadmap</a></li>
     <li><a href="#bondsmith">What Bondsmith needs from Syl</a></li>
-    <li><a href="#order">Suggested order</a></li>
+    <li><a href="#order">Order</a></li>
     <li><a href="#sources">Sources and gaps</a></li>
   </ol>
 </nav>
@@ -354,14 +355,35 @@ footer { margin-top: 56px; padding-top: 16px; border-top: 1px solid var(--border
 </ol>
 
 <!-- ============================================================ -->
-<h2 id="roadmap">5. Roadmap</h2>
+<h2 id="decisions">5. Decisions</h2>
+<p>Signed off 20 November 2026. The phases below already reflect these.</p>
+<div class="table-wrap">
+<table class="decisions">
+  <thead><tr><th>Question</th><th>Decision</th><th>Affects</th></tr></thead>
+  <tbody>
+    <tr><td>How Bondsmith talks to Syl</td><td><strong>ACP.</strong> <code>syl acp</code> over stdio first, WebSocket later. Bondsmith is a generic ACP client that can host other agents the same way.</td><td>Phase 4</td></tr>
+    <tr><td>Sandbox as a shared service</td><td><strong>Yes.</strong> Split the Podman machinery into a <code>syl-container</code> crate in Phase 0 so Bondsmith can reuse it for agents without a sandbox.</td><td>Phase 0</td></tr>
+    <tr><td>Who owns memory, workflows and schedules</td><td><strong>Shared plain files.</strong> They stay plain files in <code>.syl/</code>, and Bondsmith reads and writes the same files. No Syl-specific API for them.</td><td>Phases 5, 6</td></tr>
+    <tr><td>Model providers</td><td><strong>Anthropic only, behind a <code>ModelAdapter</code> seam,</strong> so adding a provider later isn’t a rewrite.</td><td>Phase 0</td></tr>
+    <tr><td>Default permission policy</td><td><strong>Allow everything, no prompts.</strong> The container limits the damage, and undo and receipts are the safety net. Allow/ask/deny rules are opt-in.</td><td>Phase 3</td></tr>
+    <tr><td>Reviewer model on error</td><td><strong>Fail closed:</strong> fall back to asking. It only reviews <code>ask</code> rules you add.</td><td>Phase 3</td></tr>
+    <tr><td>Where MCP servers run</td><td><strong>In the container</strong> by default. Running on the host is opt-in per server.</td><td>Phase 5</td></tr>
+    <tr><td>Existing <code>.syl/session.json</code></td><td><strong>Not migrated.</strong> The new log starts fresh and the old file is ignored, so current sessions can’t be resumed after upgrading.</td><td>Phase 1</td></tr>
+    <tr><td>Plugin runtime</td><td><strong>Deferred.</strong> Ship shell hooks, MCP and skills; add a runtime only if they prove insufficient.</td><td>Phase 5</td></tr>
+    <tr><td>Where to start</td><td><strong>Phase 0, then in order.</strong></td><td>All</td></tr>
+  </tbody>
+</table>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="roadmap">6. Roadmap</h2>
 <p>Each phase ends in something shippable, and most phases unblock the next. Rough sizes assume one developer working with an agent.</p>
 
 <section class="phase" id="phase-0">
   <div class="phase-head"><span class="phase-num">PHASE 0</span><h3>Core extraction</h3><span class="size">foundation · ~1–2 weeks</span></div>
   <p>The goal is an agent loop that runs without a terminal.</p>
   <ul>
-    <li>Create a <code>syl-core</code> crate (workspace or module) owning the agent loop, tools, sessions, compaction and the API client. <code>main.rs</code> shrinks to the TUI client.</li>
+    <li>Turn the repo into a Cargo workspace. A <code>syl-core</code> crate owns the agent loop, tools, sessions, compaction and the API client. A <code>syl-container</code> crate owns the Podman lifecycle and command execution, with no dependency on the agent, so Bondsmith can reuse it. <code>main.rs</code> shrinks to the TUI client.</li>
     <li>Define an <code>AgentEvent</code> stream: <code>TurnStarted</code>, <code>TextDelta</code>, <code>ThinkingDelta</code>, <code>ToolCallStarted{id,name,input}</code>, <code>ToolCallFinished{id,output,is_error}</code>, <code>PermissionRequested</code>, <code>Usage</code>, <code>Compacted</code>, <code>TurnEnded{stop_reason}</code>, <code>Error</code>. Pair it with a command channel: <code>Prompt</code>, <code>Cancel</code>, <code>ApprovePermission</code>, <code>SetModel</code>.</li>
     <li>Move the TUI onto that stream. It becomes the first client and stops calling into loop internals.</li>
     <li>Add a <code>ModelAdapter</code> trait around <code>stream_turn</code>/<code>call_with_retry_shared</code>, with only the Anthropic implementation for now.</li>
@@ -373,7 +395,7 @@ footer { margin-top: 56px; padding-top: 16px; border-top: 1px solid var(--border
 <section class="phase" id="phase-1">
   <div class="phase-head"><span class="phase-num">PHASE 1</span><h3>Session log and context</h3><span class="size">~1–2 weeks</span></div>
   <ul>
-    <li>Replace <code>session.json</code> with an append-only JSONL log under <code>.syl/sessions/&lt;id&gt;.jsonl</code>. Entries carry <code>id</code>, <code>parentId</code>, <code>type</code> and a timestamp. Types are messages, tool calls and results, compaction summaries, model switches and approvals. Each line is fsynced.</li>
+    <li>Replace <code>session.json</code> with an append-only JSONL log under <code>.syl/sessions/&lt;id&gt;.jsonl</code>. Entries carry <code>id</code>, <code>parentId</code>, <code>type</code> and a timestamp. Types are messages, tool calls and results, compaction summaries, model switches and approvals. Each line is fsynced. Existing <code>session.json</code> files are not migrated; they are ignored.</li>
     <li>Derive model history from the log (<code>derive_messages</code>). Compaction appends a summary entry instead of rewriting history, so the full transcript survives.</li>
     <li>Add commands to list sessions, resume (<code>--continue</code>, <code>--resume</code>), fork from an entry and name sessions.</li>
     <li>Make compaction <strong>token-based</strong>. Track the context size from <code>usage</code>, compact when within a buffer of the model’s window (for example 15%), and keep the most recent N tokens rather than 10 messages. Also run it when the API reports the context overflowed, then retry.</li>
@@ -398,11 +420,12 @@ footer { margin-top: 56px; padding-top: 16px; border-top: 1px solid var(--border
 <section class="phase" id="phase-3">
   <div class="phase-head"><span class="phase-num">PHASE 3</span><h3>Control and safety</h3><span class="size">~2 weeks</span></div>
   <ul>
-    <li><strong>Permissions:</strong> ordered allow/ask/deny rules over <code>{tool, pattern}</code> in <code>.syl/config.toml</code>. The last match wins. <code>run_bash</code> gets a simple command splitter so <code>git status &amp;&amp; rm -rf x</code> is checked per command. Approvals can be once, always for this project, or reject. Defaults suit a container: allow everything except network egress and <code>git push</code> (ask), with deny for paths outside <code>/workspace</code>.</li>
+    <li><strong>Permissions:</strong> ordered allow/ask/deny rules over <code>{tool, pattern}</code> in <code>.syl/config.toml</code>. The last match wins. <code>run_bash</code> gets a simple command splitter so <code>git status &amp;&amp; rm -rf x</code> is checked per command. Approvals can be once, always for this project, or reject. <strong>The default is allow everything with no prompts;</strong> rules are opt-in, for example asking before <code>git push</code>.</li>
     <li><strong>Checkpoints and undo:</strong> before each turn that changes files, snapshot the workspace with a shadow git repository (<code>git --git-dir=.syl/shadow.git --work-tree=/workspace</code>) so the user’s own git history isn’t touched. <code>/undo</code> reverts the last turn, and <code>/restore &lt;n&gt;</code> goes back further. Revert is staged and then committed, as in opencode.</li>
     <li><strong>Receipts:</strong> a <code>/receipts</code> view derived from the log, listing files changed, commands run, URLs fetched and approvals given for each turn.</li>
     <li><strong>Modes:</strong> <code>plan</code> (read-only tools; edits and writing <code>run_bash</code> denied by rule) and <code>build</code>. Toggle with a key and show the mode in the status bar.</li>
-    <li><strong>Optional reviewer:</strong> a cheap-model ALLOW/BLOCK check for ask items, so they can be auto-approved (from Goose’s adversary mode and CodeWhale’s Auto-Review). Unlike Goose, it should fail <strong>closed</strong>.</li>
+    <li><strong>Optional reviewer:</strong> a cheap-model ALLOW/BLOCK check for ask items, so they can be auto-approved (from Goose’s adversary mode and CodeWhale’s Auto-Review). It only applies to <code>ask</code> rules you add. Unlike Goose, it fails <strong>closed</strong>: on an error or timeout it falls back to asking.</li>
+    <li>Because nothing prompts by default, <strong>checkpoints and receipts are the main safety net</strong>, and they ship before or with the rule engine.</li>
     <li><strong>Container hardening:</strong> an optional network-off mode (<code>--network=none</code>, with an allowlist proxy later) and per-project resource limits in config.</li>
   </ul>
   <div class="done"><b>Done when:</b> <code>rm -rf</code> inside a turn can be undone in one keystroke, and plan mode can’t change files.</div>
@@ -423,12 +446,13 @@ footer { margin-top: 56px; padding-top: 16px; border-top: 1px solid var(--border
 <section class="phase" id="phase-5">
   <div class="phase-head"><span class="phase-num">PHASE 5</span><h3>Extensibility</h3><span class="size">~2–3 weeks</span></div>
   <ul>
-    <li><strong>MCP client:</strong> stdio and Streamable HTTP servers configured in <code>.syl/config.toml</code>. Namespace tools as <code>server__tool</code>. Load them when a conversation starts and freeze them with the system prompt to protect the cache. Inject server instructions. Decide whether MCP servers run inside the container (the default, for safety) or on the host (opt-in, for things like browsers).</li>
+    <li><strong>MCP client:</strong> stdio and Streamable HTTP servers configured in <code>.syl/config.toml</code>. Namespace tools as <code>server__tool</code>. Load them when a conversation starts and freeze them with the system prompt to protect the cache. Inject server instructions. Servers run <strong>inside the container</strong> by default; running one on the host (for example a browser) is opt-in per server.</li>
     <li><strong>Skills:</strong> discover <code>SKILL.md</code> directories in <code>.syl/skills/</code>, <code>~/.syl/skills/</code> and <code>.agents/skills/</code>. Put only names and descriptions in the system prompt, and load the full skill on demand, either through a <code>skill</code> tool or <code>/skill:name</code>.</li>
     <li><strong>Hooks:</strong> shell commands configured for <code>pre_tool</code>, <code>post_tool</code>, <code>turn_end</code> and <code>session_start</code>. They get JSON on stdin, and a non-zero exit blocks. This is the simplest extension point and needs no plugin runtime.</li>
     <li><strong>Workflows become recipes.</strong> Keep the markdown format, and add <code>{{params}}</code>, retry-with-check steps, the model and tools to use, and an optional JSON schema for structured output. Workflows that only run commands keep working as they do now.</li>
     <li>Custom slash commands as prompt templates in <code>.syl/commands/*.md</code>.</li>
-    <li>Hold off on a full plugin runtime (pi-style TypeScript or Wasm) until hooks, MCP and skills prove insufficient.</li>
+    <li>No plugin runtime (pi-style TypeScript or Wasm) for now. Add one only if hooks, MCP and skills prove insufficient.</li>
+    <li>Memories, workflows and recipes stay plain files in <code>.syl/</code> that Bondsmith can read and write directly.</li>
   </ul>
 </section>
 
@@ -454,7 +478,7 @@ footer { margin-top: 56px; padding-top: 16px; border-top: 1px solid var(--border
 </section>
 
 <!-- ============================================================ -->
-<h2 id="bondsmith">6. What Bondsmith needs from Syl</h2>
+<h2 id="bondsmith">7. What Bondsmith needs from Syl</h2>
 <p>If Bondsmith is a meta-harness, its natural shape is an <strong>ACP client that hosts many agents</strong>. Syl would be the reference agent, with Goose, CodeWhale, Claude Code (via <code>claude-acp</code>) and Codex (via <code>codex-acp</code>) as peers. The contract Syl should meet:</p>
 
 <div class="table-wrap">
@@ -473,15 +497,10 @@ footer { margin-top: 56px; padding-top: 16px; border-top: 1px solid var(--border
 </table>
 </div>
 
-<h3>Two design questions to settle early</h3>
-<p>These shape Phases 0–4.</p>
-<ol>
-  <li><strong>Where does the sandbox live?</strong> If Bondsmith hosts agents that have no sandbox of their own (pi, Claude Code), it may want Syl’s container machinery as a shared service (“run any ACP agent inside a Syl container”). That argues for <code>syl-container</code> as a separate crate from the start.</li>
-  <li><strong>Who owns memory, workflows and schedules: Syl or Bondsmith?</strong> If Bondsmith shares them across agents, keep Syl’s formats plain files (they already are) and let Bondsmith read the same <code>.syl/</code> directory, rather than building Syl-specific APIs for them.</li>
-</ol>
+<p>Two Bondsmith-level questions are now settled (see <a href="#decisions">Decisions</a>). Syl’s container machinery becomes a reusable <code>syl-container</code> crate, so Bondsmith can run agents that have no sandbox of their own (pi, Claude Code) inside a container. Memory, workflows and schedules stay plain files in <code>.syl/</code> that Bondsmith shares across agents.</p>
 
 <!-- ============================================================ -->
-<h2 id="order">7. Suggested order</h2>
+<h2 id="order">8. Order</h2>
 
 <div class="flow" role="img" aria-label="Phase 0 comes first. Phases 1, 2 and 3 follow in parallel. Phase 4 follows them, and Bondsmith work can start there. Phases 5 and 6 come after Phase 4.">
   <div class="flow-row"><div class="box"><b>PHASE 0</b>Core + events</div></div>
@@ -502,7 +521,7 @@ footer { margin-top: 56px; padding-top: 16px; border-top: 1px solid var(--border
 <p>Phases 1–3 can run in parallel once Phase 0 lands. Bondsmith work can begin against Phase 4 using <code>syl -p --output json</code> as a stopgap before ACP is finished.</p>
 
 <!-- ============================================================ -->
-<h2 id="sources">8. Sources and gaps</h2>
+<h2 id="sources">9. Sources and gaps</h2>
 <ul>
   <li><strong>pi:</strong> <a href="https://unpkg.com/@mariozechner/pi-coding-agent@0.73.1/README.md">README (0.73.1)</a>, <a href="https://lucumr.pocoo.org/2026/1/31/pi.md">Armin Ronacher on pi</a></li>
   <li><strong>opencode:</strong> <a href="https://opencode.ai/docs">docs</a>, <a href="https://opencode.ai/docs/agents">agents</a>, <a href="https://opencode.ai/docs/permissions">permissions</a>, <a href="https://opencode.ai/docs/server">server API</a></li>
