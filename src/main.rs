@@ -690,12 +690,24 @@ async fn run_agent_turn(
             tok.cache_write_tokens += turn.usage.cache_write_tokens;
         }
 
-        // Append assistant turn to history
+        // Append assistant turn to history. A tool_use the model did not
+        // finish (stop_reason max_tokens etc.) gets no tool_result, and a
+        // tool_use without one makes every later request fail with a 400,
+        // so only a tool_use turn keeps its tool_use blocks.
         state
             .messages
             .lock()
             .unwrap()
-            .push(Message::assistant_blocks(turn.content.clone()));
+            .push(Message::assistant_blocks(
+                syl_rs::api::compaction::drop_unanswered_tool_uses(&turn.content, &turn.stop_reason),
+            ));
+        if turn.stop_reason == StopReason::MaxTokens {
+            let _ = terminal::print_to_scroll(
+                &state.stdout,
+                "\x1b[2m[response hit max_tokens and was cut off]\x1b[0m\r\n",
+                *rows,
+            );
+        }
 
         if turn.stop_reason != StopReason::ToolUse {
             break;

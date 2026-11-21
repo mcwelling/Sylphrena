@@ -1,26 +1,26 @@
-/// Interactive arrow-key model picker rendered in the scroll area.
-///
-/// # Terminal mechanics
-///
-/// The picker prints into the scroll region (rows 2 .. rows-3 in 1-indexed
-/// terminal coordinates).  On the initial call it moves the cursor to the last
-/// row of the scroll region and emits one `\r\n` per picker line; DECSTBM
-/// keeps the cursor at the scroll-region bottom while scrolling old content
-/// upward, so the picker appears at the bottom of the visible area.
-///
-/// For in-place redraws (key-navigation), `\x1b[{N}A` moves the cursor back
-/// to the top of the picker and `\x1b[J` (Erase to End of Screen within the
-/// scroll region) clears the old content before reprinting.
-///
-/// # Usage
-///
-/// Call from a synchronous context (or via `tokio::task::block_in_place`):
-///
-/// ```ignore
-/// let choice = tokio::task::block_in_place(|| {
-///     picker::run_picker(&items, &current_model, &state.stdout, rows)
-/// });
-/// ```
+//! Interactive arrow-key model picker rendered in the scroll area.
+//!
+//! # Terminal mechanics
+//!
+//! The picker prints into the scroll region (rows 2 .. rows-3 in 1-indexed
+//! terminal coordinates).  On the initial call it moves the cursor to the last
+//! row of the scroll region and emits one `\r\n` per picker line; DECSTBM
+//! keeps the cursor at the scroll-region bottom while scrolling old content
+//! upward, so the picker appears at the bottom of the visible area.
+//!
+//! For in-place redraws (key-navigation), `\x1b[{N}A` moves the cursor back
+//! to the top of the picker and `\x1b[J` (Erase to End of Screen within the
+//! scroll region) clears the old content before reprinting.
+//!
+//! # Usage
+//!
+//! Call from a synchronous context (or via `tokio::task::block_in_place`):
+//!
+//! ```ignore
+//! let choice = tokio::task::block_in_place(|| {
+//!     picker::run_picker(&items, &current_model, &state.stdout, rows)
+//! });
+//! ```
 use crossterm::{
     cursor,
     event::{self, Event, KeyCode, KeyEventKind},

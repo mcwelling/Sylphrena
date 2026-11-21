@@ -256,3 +256,13 @@ async fn slash_unknown_returns_none() {
     let result = handle_slash("/notacommand", empty_messages(), &ctx).await;
     assert!(result.is_none());
 }
+
+#[tokio::test]
+async fn slash_command_tolerates_surrounding_whitespace() {
+    let tmp = TempDir::new().unwrap();
+    let (sp, wd, md, lp) = make_paths(&tmp);
+    let cfg = AppConfig::default();
+    let ctx = build_ctx(&sp, &wd, &md, &lp, "claude-opus-4-6", "anthropic", 120_000, 0, 0, 0, 0, &cfg);
+    let result = handle_slash("  /exit  ", empty_messages(), &ctx).await.unwrap();
+    assert_eq!(result.action, SlashAction::Exit);
+}

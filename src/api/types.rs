@@ -41,6 +41,17 @@ pub enum ContentBlock {
         #[serde(skip_serializing_if = "Option::is_none")]
         signature: Option<String>,
     },
+    /// Encrypted thinking. Must be sent back unchanged with the rest of the
+    /// assistant turn, like a `thinking` block.
+    #[serde(rename = "redacted_thinking")]
+    RedactedThinking { data: String },
+}
+
+impl ContentBlock {
+    /// `thinking` or `redacted_thinking`.
+    pub fn is_thinking(&self) -> bool {
+        matches!(self, ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. })
+    }
 }
 
 /// Message content: either a plain string or a block array.

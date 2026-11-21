@@ -1,5 +1,6 @@
 //! Regression tests for the path-traversal, UTF-8 truncation, container-name,
-//! shell-quoting and mid-turn compaction fixes.
+//! shell-quoting, mid-turn compaction, unanswered tool_use, mid-stream error
+//! and cancellable-backoff fixes.
 use std::path::Path;
 
 use serde_json::json;
@@ -165,4 +166,167 @@ fn boundary_inside_long_tool_chain_starts_at_assistant() {
     assert_eq!(msgs[i].role, "assistant");
     // Every tool_result in the tail is preceded by its tool_use.
     assert_eq!(msgs[i + 1].role, "user");
+}
+
+// ---------------------------------------------------------------------------
+// Unanswered tool_use (turn cut off by max_tokens)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn unanswered_tool_use_is_not_stored() {
+    use syl_rs::api::compaction::drop_unanswered_tool_uses;
+    use syl_rs::api::types::StopReason;
+
+    let text = ContentBlock::Text { text: "let me check".into(), cache_control: None };
+    let tu = ContentBlock::ToolUse { id: "t1".into(), name: "run_bash".into(), input: json!({}) };
+
+    // A tool_use turn keeps everything: its tools get run and answered.
+    let both = vec![text.clone(), tu.clone()];
+    assert_eq!(drop_unanswered_tool_uses(&both, &StopReason::ToolUse), both);
+
+    // Cut off mid tool call: the tool_use would never get a tool_result.
+    assert_eq!(drop_unanswered_tool_uses(&both, &StopReason::MaxTokens), vec![text]);
+
+    // Nothing but the tool_use (plus thinking) left: placeholder text, never empty.
+    let thinking = ContentBlock::Thinking { thinking: "x".into(), signature: Some("s".into()) };
+    let out = drop_unanswered_tool_uses(&[thinking.clone(), tu], &StopReason::MaxTokens);
+    assert_eq!(out.len(), 2);
+    assert_eq!(out[0], thinking);
+    assert!(matches!(out[1], ContentBlock::Text { .. }));
+}
+
+// ---------------------------------------------------------------------------
+// Mid-stream error events
+// ---------------------------------------------------------------------------
+
+async fn mock_server_with(bodies: Vec<&'static str>) -> wiremock::MockServer {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    let n = bodies.len();
+    for (i, body) in bodies.into_iter().enumerate() {
+        let m = Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"));
+        // Earlier bodies answer once each; the last one answers the rest.
+        let m = if i + 1 < n { m.up_to_n_times(1) } else { m };
+        m.mount(&server).await;
+    }
+    server
+}
+
+const OVERLOADED_MID_STREAM: &str = concat!(
+    "event: message_start\n",
+    "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+    "event: content_block_start\n",
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+    "event: content_block_delta\n",
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n",
+    "event: error\n",
+    "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n",
+);
+
+const OK_STREAM: &str = concat!(
+    "event: message_start\n",
+    "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+    "event: content_block_start\n",
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+    "event: content_block_delta\n",
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"complete\"}}\n\n",
+    "event: message_delta\n",
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+);
+
+fn mock_config(server: &wiremock::MockServer) -> syl_rs::config::AppConfig {
+    let mut config = syl_rs::config::AppConfig::default();
+    config.api_url = format!("{}/v1/messages", server.uri());
+    config.api_key = "test-key".to_string();
+    config
+}
+
+#[tokio::test]
+async fn overloaded_error_mid_stream_is_retried_not_returned_as_partial_turn() {
+    use syl_rs::api::client::{call_with_retry_shared, SystemBlock};
+    let server = mock_server_with(vec![OVERLOADED_MID_STREAM, OK_STREAM]).await;
+    let state = syl_rs::shared::SharedState::new();
+    let turn = call_with_retry_shared(
+        &reqwest::Client::new(),
+        &mock_config(&server),
+        &state,
+        &[Message::user_text("hi")],
+        &[SystemBlock::text("sys")],
+        tokio_util::sync::CancellationToken::new(),
+        |_| {},
+        |_| {},
+    )
+    .await
+    .unwrap();
+    assert_eq!(turn.text(), Some("complete"));
+}
+
+#[tokio::test]
+async fn other_error_mid_stream_is_surfaced() {
+    use syl_rs::api::client::{stream_turn, SystemBlock};
+    const API_ERROR: &str = concat!(
+        "event: error\n",
+        "data: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"boom\"}}\n\n",
+    );
+    let server = mock_server_with(vec![API_ERROR]).await;
+    let err = stream_turn(
+        &reqwest::Client::new(),
+        &mock_config(&server),
+        &[Message::user_text("hi")],
+        &[SystemBlock::text("sys")],
+        tokio_util::sync::CancellationToken::new(),
+        &|_| {},
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("api_error") && err.contains("boom"), "{err}");
+}
+
+#[tokio::test]
+async fn cancel_during_retry_backoff_returns_promptly() {
+    use syl_rs::api::client::{call_with_retry_shared, SystemBlock};
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    Mock::given(method("POST")).respond_with(ResponseTemplate::new(529)).mount(&server).await;
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let c = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        c.cancel();
+    });
+    let started = std::time::Instant::now();
+    let state = syl_rs::shared::SharedState::new();
+    let err = call_with_retry_shared(
+        &reqwest::Client::new(),
+        &mock_config(&server),
+        &state,
+        &[Message::user_text("hi")],
+        &[SystemBlock::text("sys")],
+        cancel,
+        |_| {},
+        |_| {},
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("cancelled"), "{err}");
+    // Full backoff would be 0.5 + 1 + 2 + 4 s.
+    assert!(started.elapsed().as_secs() < 2, "took {:?}", started.elapsed());
+}
+
+// ---------------------------------------------------------------------------
+// HTML stripping (used to panic: the regex used an unsupported backreference)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn html_tool_output_is_stripped_without_panicking() {
+    let page = "<!DOCTYPE html><html><head><style>body { color: red }</style>\
+                <script type=\"text/javascript\">var x = '<b>';</script></head>\
+                <body><h1>Title</h1><p>Hello   world</p><SCRIPT>evil()</SCRIPT></body></html>";
+    let out = syl_rs::util::process_tool_output(page);
+    assert_eq!(out, "Title Hello world");
 }

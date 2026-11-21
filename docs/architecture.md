@@ -106,7 +106,7 @@ Three layers protect against rate limit errors:
 
 2. **Retry with exponential backoff** — On `429` / `529` responses, retries up to 4 times with base delay 500 ms, doubling each attempt (capped at 32 s). `retry-after` headers are respected.
 
-3. **Prompt caching** — The system prompt and tools schema are marked with `cache_control: {type: ephemeral}` breakpoints, reducing input tokens on repeat calls via Anthropic's server-side prompt cache.
+3. **Prompt caching** — `cache_control: {type: ephemeral}` breakpoints go on the system prompt and on the last text block of each of the two most recent assistant turns (at most three of the API's four), reducing input tokens on repeat calls via Anthropic's server-side prompt cache.
 
 The TPM bar in the top status bar is colour-coded: green < 50%, yellow 50–80%, red ≥ 80% (when proactive throttling is active).
 

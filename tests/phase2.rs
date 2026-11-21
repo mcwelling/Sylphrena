@@ -3,7 +3,7 @@ use tempfile::TempDir;
 
 use syl_rs::api::client::SseParser;
 use syl_rs::config::{
-    build_config, parse_cli_args, AppConfig, DEFAULT_BACKEND, DEFAULT_MODEL, DEFAULT_RATE_LIMIT,
+    build_config, parse_cli_args, AppConfig, DEFAULT_BACKEND, DEFAULT_RATE_LIMIT,
 };
 
 // ---------------------------------------------------------------------------
@@ -17,12 +17,6 @@ fn tmp_syl_dir() -> TempDir {
 // ---------------------------------------------------------------------------
 // 1. AppConfig defaults
 // ---------------------------------------------------------------------------
-
-#[test]
-fn test_appconfig_default_model() {
-    let cfg = AppConfig::default();
-    assert_eq!(cfg.model, DEFAULT_MODEL);
-}
 
 #[test]
 fn test_appconfig_default_backend() {
@@ -39,14 +33,6 @@ fn test_appconfig_default_rate_limit() {
 // ---------------------------------------------------------------------------
 // 2. build_config: CLI overrides defaults
 // ---------------------------------------------------------------------------
-
-#[test]
-fn test_build_config_cli_model_override() {
-    let dir = tmp_syl_dir();
-    let cli = parse_cli_args(&["--model", "claude-haiku-4-5"]);
-    let cfg = build_config(&cli, dir.path());
-    assert_eq!(cfg.model, "claude-haiku-4-5");
-}
 
 #[test]
 fn test_build_config_cli_backend_override() {
@@ -106,17 +92,6 @@ fn test_build_config_from_toml() {
     assert_eq!(cfg.model, "claude-sonnet-4-6");
     assert_eq!(cfg.rate_limit, 45_000);
     assert!(cfg.light); // theme = "light" sets cfg.light
-}
-
-#[test]
-fn test_build_config_cli_overrides_toml() {
-    let dir = tmp_syl_dir();
-    let toml = "model = \"claude-sonnet-4-6\"\n";
-    std::fs::write(dir.path().join("config.toml"), toml).unwrap();
-
-    let cli = parse_cli_args(&["--model", "claude-haiku-4-5"]);
-    let cfg = build_config(&cli, dir.path());
-    assert_eq!(cfg.model, "claude-haiku-4-5"); // CLI wins
 }
 
 // ---------------------------------------------------------------------------
@@ -365,15 +340,10 @@ async fn test_stream_turn_retries_on_429() {
     let system = vec![SystemBlock::text("sys")];
     let cancel = CancellationToken::new();
 
-    // call_with_retry should succeed on second attempt
-    let mut rate_calls = vec![];
-    let result = syl_rs::api::client::call_with_retry(
-        &client,
-        &config,
-        &messages,
-        &system,
-        cancel,
-        &mut rate_calls,
+    // call_with_retry_shared should succeed on second attempt
+    let state = syl_rs::shared::SharedState::new();
+    let result = syl_rs::api::client::call_with_retry_shared(
+        &client, &config, &state, &messages, &system, cancel, |_| {}, |_| {},
     )
     .await
     .unwrap();
@@ -388,7 +358,7 @@ async fn test_stream_turn_propagates_non_retryable_error() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    use syl_rs::api::client::{call_with_retry, SystemBlock};
+    use syl_rs::api::client::{call_with_retry_shared, SystemBlock};
     use syl_rs::api::types::Message;
     use syl_rs::config::AppConfig;
 
@@ -409,16 +379,10 @@ async fn test_stream_turn_propagates_non_retryable_error() {
     let system = vec![SystemBlock::text("sys")];
     let cancel = CancellationToken::new();
 
-    let mut rate_calls = vec![];
-    let result = call_with_retry(
-        &client,
-        &config,
-        &messages,
-        &system,
-        cancel,
-        &mut rate_calls,
-    )
-    .await;
+    let state = syl_rs::shared::SharedState::new();
+    let result =
+        call_with_retry_shared(&client, &config, &state, &messages, &system, cancel, |_| {}, |_| {})
+            .await;
     assert!(result.is_err());
     let msg = result.unwrap_err().to_string();
     assert!(msg.contains("400"), "expected 400 in error: {}", msg);

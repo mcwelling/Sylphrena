@@ -24,14 +24,19 @@ pub fn is_html(text: &str) -> bool {
 
 pub fn strip_html(text: &str) -> String {
     use std::sync::LazyLock;
+    // The regex crate has no backreferences (`</\1>` panics on first use),
+    // so script and style blocks get one pattern each.
     static RE_SCRIPT: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r"(?si)<(script|style)[^>]*>.*?</\1>").unwrap());
+        LazyLock::new(|| regex::Regex::new(r"(?si)<script[^>]*>.*?</script\s*>").unwrap());
+    static RE_STYLE: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"(?si)<style[^>]*>.*?</style\s*>").unwrap());
     static RE_TAGS: LazyLock<regex::Regex> =
         LazyLock::new(|| regex::Regex::new(r"<[^>]+>").unwrap());
     static RE_WS: LazyLock<regex::Regex> =
         LazyLock::new(|| regex::Regex::new(r"\s+").unwrap());
 
     let text = RE_SCRIPT.replace_all(text, " ");
+    let text = RE_STYLE.replace_all(&text, " ");
     let text = RE_TAGS.replace_all(&text, " ");
     RE_WS.replace_all(&text, " ").trim().to_string()
 }

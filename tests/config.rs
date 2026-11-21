@@ -53,6 +53,16 @@ fn parse_multiple_flags() {
     assert!(cli.light);
 }
 
+#[test]
+fn parse_timeout_thinking_and_boolean_flags() {
+    let a = parse_cli_args(&["--timeout", "30", "--thinking", "4000", "--resume", "--no-banner", "--help"]);
+    assert_eq!(a.timeout, Some(30));
+    assert_eq!(a.thinking, Some(4000));
+    assert!(a.resume);
+    assert!(a.no_banner);
+    assert!(a.help);
+}
+
 // ---------------------------------------------------------------------------
 // build_config — priority: CLI > env > file > default
 // ---------------------------------------------------------------------------

@@ -86,3 +86,33 @@ fn strip_thinking_removes_only_thinking_and_keeps_roles() {
     assert_eq!(out[2], msgs[2]);
     assert!(matches!(&out[3].content, MessageContent::Blocks(bs) if bs.len() == 1 && matches!(bs[0], ContentBlock::Text { .. })));
 }
+
+#[test]
+fn max_tokens_adds_budget_only_for_manual_thinking() {
+    use syl_rs::api::client::{request_max_tokens, MIN_THINKING_BUDGET};
+    let base = AppConfig::default().max_tokens as u64;
+    assert_eq!(request_max_tokens(&cfg("claude-opus-5-5", None)), base);
+    // Adaptive models ignore the budget, so it must not inflate max_tokens.
+    assert_eq!(request_max_tokens(&cfg("claude-opus-5-5", Some(100_000))), base);
+    assert_eq!(request_max_tokens(&cfg("claude-opus-4-6", Some(8000))), base + 8000);
+    // Below the API minimum the budget is raised, in both fields.
+    assert_eq!(request_max_tokens(&cfg("claude-opus-4-6", Some(500))), base + MIN_THINKING_BUDGET);
+    assert_eq!(
+        thinking_param(&cfg("claude-opus-4-6", Some(500))),
+        Some(json!({"type": "enabled", "budget_tokens": MIN_THINKING_BUDGET}))
+    );
+}
+
+#[test]
+fn strip_thinking_also_removes_redacted_thinking() {
+    let msgs = vec![
+        Message::user_text("hi"),
+        Message::assistant_blocks(vec![
+            ContentBlock::RedactedThinking { data: "opaque".into() },
+            ContentBlock::Text { text: "hello".into(), cache_control: None },
+        ]),
+    ];
+    let out = strip_thinking(msgs);
+    assert!(matches!(&out[1].content, MessageContent::Blocks(bs)
+        if bs.len() == 1 && matches!(bs[0], ContentBlock::Text { .. })));
+}

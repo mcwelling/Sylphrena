@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use crate::api::client::{call_with_retry_shared, SystemBlock};
-use crate::api::types::{ContentBlock, Message, MessageContent};
+use crate::api::types::{ContentBlock, Message, MessageContent, StopReason};
 use crate::config::AppConfig;
 use crate::shared::SharedState;
 
@@ -16,22 +16,30 @@ pub const COMPACT_KEEP: usize = 10;
 const COMPACT_MODEL:    &str  = "claude-haiku-4-5-20251001";
 
 // ---------------------------------------------------------------------------
-// Existing helpers (unchanged)
+// History helpers
 // ---------------------------------------------------------------------------
 
-/// Drop leading messages until the first plain user text message.
-/// Returns empty vec if none found.
-pub fn find_valid_start(msgs: Vec<Message>) -> Vec<Message> {
-    let pos = msgs.iter().position(|m| {
-        m.role == "user" && matches!(m.content, MessageContent::Text(_))
-    });
-    match pos {
-        Some(i) => msgs[i..].to_vec(),
-        None    => vec![],
+/// The content to store in history for an assistant turn that stopped with
+/// `stop`. Only a `tool_use` stop gets its tools run and answered; any
+/// `tool_use` block in another turn (cut off by `max_tokens`, say) would be
+/// left without a `tool_result`, which fails every later request, so it is
+/// dropped. A turn left empty gets a placeholder text block.
+pub fn drop_unanswered_tool_uses(content: &[ContentBlock], stop: &StopReason) -> Vec<ContentBlock> {
+    if *stop == StopReason::ToolUse {
+        return content.to_vec();
     }
+    let mut kept: Vec<ContentBlock> = content
+        .iter()
+        .filter(|b| !matches!(b, ContentBlock::ToolUse { .. }))
+        .cloned()
+        .collect();
+    if !kept.iter().any(|b| !b.is_thinking()) {
+        kept.push(ContentBlock::Text { text: "(no response)".to_string(), cache_control: None });
+    }
+    kept
 }
 
-/// Remove every `thinking` block from `msgs`.
+/// Remove every `thinking` and `redacted_thinking` block from `msgs`.
 ///
 /// Thinking blocks are signed against everything that came before them. After
 /// history is rewritten (compaction, or a resumed session under a new system
@@ -46,7 +54,7 @@ pub fn strip_thinking(msgs: Vec<Message>) -> Vec<Message> {
             MessageContent::Blocks(blocks) if m.role == "assistant" => {
                 let mut kept: Vec<ContentBlock> = blocks
                     .into_iter()
-                    .filter(|b| !matches!(b, ContentBlock::Thinking { .. }))
+                    .filter(|b| !b.is_thinking())
                     .collect();
                 if kept.is_empty() {
                     kept.push(ContentBlock::Text {
@@ -122,7 +130,8 @@ fn messages_to_text(msgs: &[Message]) -> String {
                     ContentBlock::Text { text, .. }              => Some(text.clone()),
                     ContentBlock::ToolUse { name, input, .. }    => Some(format!("[tool_use: {} {}]", name, input)),
                     ContentBlock::ToolResult { content, .. }     => Some(format!("[tool_result: {}]", content)),
-                    ContentBlock::Thinking { .. }                => None,
+                    ContentBlock::Thinking { .. }
+                    | ContentBlock::RedactedThinking { .. }      => None,
                 }).collect::<Vec<_>>().join("\n")
             }
         };
