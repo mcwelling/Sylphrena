@@ -25,7 +25,6 @@ pub struct SlashContext<'a> {
     pub memory_dir: &'a Path,
     pub log_path: &'a Path,
     pub model: &'a str,
-    pub backend: &'a str,
     pub timeout_ms: u64,
     pub rate_limit: u64,
     pub input_tokens: u64,
@@ -77,9 +76,8 @@ Slash commands:
             format!("{} tpm", ctx.rate_limit)
         };
         let output = format!(
-            "model:    {}  backend: {}\ntimeout:  {}s             rate:    {}\nmessages: {}               tokens:  in:{} out:{}\nsession:  {}",
+            "model:    {}\ntimeout:  {}s             rate:    {}\nmessages: {}               tokens:  in:{} out:{}\nsession:  {}",
             ctx.model,
-            ctx.backend,
             timeout_s,
             rate_display,
             ctx.message_count,

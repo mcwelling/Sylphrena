@@ -93,7 +93,6 @@ fn wind_frames_last_forward_wave_at_end() {
 fn default_bar_data() -> BarData {
     BarData {
         model: "claude-opus-4-6".into(),
-        backend: "anthropic".into(),
         timeout_ms: 60_000,
         input_tokens: 12_345,
         output_tokens: 1_234,
@@ -155,21 +154,6 @@ fn top_bar_tpm_zero_limit() {
 fn bottom_bar_shows_model() {
     let bar = make_bottom_bar(&default_bar_data(), &DARK);
     assert!(bar.contains("claude-opus-4-6"), "bottom bar missing model: {}", bar);
-}
-
-#[test]
-fn bottom_bar_hides_anthropic_backend() {
-    // "anthropic" is the default backend — it is intentionally omitted from the bar.
-    let bar = make_bottom_bar(&default_bar_data(), &DARK);
-    assert!(!bar.contains("anthropic"), "bottom bar should hide default backend: {}", bar);
-}
-
-#[test]
-fn bottom_bar_shows_non_default_backend() {
-    let mut data = default_bar_data();
-    data.backend = "bedrock".to_string();
-    let bar = make_bottom_bar(&data, &DARK);
-    assert!(bar.contains("bedrock"), "bottom bar should show non-default backend: {}", bar);
 }
 
 #[test]

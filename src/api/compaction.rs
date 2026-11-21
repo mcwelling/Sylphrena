@@ -109,7 +109,7 @@ fn compaction_config(base: &AppConfig) -> AppConfig {
         resume:          false,
         fresh:           false,
         no_banner:       false,
-        // All other fields (auth, backend, rate-limit, UI, etc.)
+        // All other fields (auth, rate-limit, UI, etc.)
         // pass through from base.  Using ..base.clone() means new
         // AppConfig fields are automatically included — no exhaustive
         // listing required.

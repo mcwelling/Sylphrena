@@ -1,5 +1,4 @@
 pub mod api;
-pub mod bedrock;
 pub mod config;
 pub mod pricing;
 pub mod container;

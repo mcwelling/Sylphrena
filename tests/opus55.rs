@@ -4,14 +4,12 @@ use serde_json::json;
 use syl_rs::api::client::thinking_param;
 use syl_rs::api::compaction::strip_thinking;
 use syl_rs::api::types::{ContentBlock, Message, MessageContent};
-use syl_rs::bedrock::bedrock_model_id;
 use syl_rs::config::{supports_manual_thinking, AppConfig, CLAUDE_MODELS, DEFAULT_MODEL};
 
 #[test]
 fn default_model_is_opus_5_5_and_in_catalog() {
     assert_eq!(DEFAULT_MODEL, "claude-opus-5-5");
     assert_eq!(CLAUDE_MODELS[0].id, DEFAULT_MODEL, "default should lead the picker");
-    assert_eq!(bedrock_model_id(DEFAULT_MODEL), "anthropic.claude-opus-5-5");
     assert_eq!(AppConfig::default().model, DEFAULT_MODEL);
 }
 
@@ -23,7 +21,6 @@ fn manual_thinking_support_by_model() {
     for m in [
         "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5", "claude-haiku-5-5",
         "claude-fable-5-2", "claude-opus-4-7", "claude-opus-4-8",
-        "anthropic.claude-opus-5-5", "us.anthropic.claude-opus-4-8",
     ] {
         assert!(!supports_manual_thinking(m), "{m} is adaptive-only");
     }

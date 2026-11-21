@@ -190,7 +190,6 @@ fn print_help() {
          Usage: syl [options]\n\n\
          Options:\n  \
          --model <name>      Override model (default: claude-opus-5-5)\n  \
-         --backend <name>    anthropic | bedrock  (default: anthropic)\n  \
          --rate-limit <n>    TPM budget  (default: 60000)\n  \
          --timeout <secs>    Request timeout in seconds  (default: 120)\n  \
          --thinking <n>      Thinking budget in tokens\n  \
@@ -247,7 +246,6 @@ fn draw_bars(
 
     let data = BarData {
         model: current_model,
-        backend: config.backend.clone(),
         timeout_ms: config.timeout_ms,
         input_tokens,
         output_tokens,
@@ -378,7 +376,6 @@ async fn main_loop(
                 memory_dir,
                 log_path: &log_path,
                 model: &current_model,
-                backend: &config.backend,
                 timeout_ms: config.timeout_ms,
                 rate_limit: config.rate_limit,
                 input_tokens,

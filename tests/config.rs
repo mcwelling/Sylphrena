@@ -33,12 +33,6 @@ fn parse_fresh_flag() {
 }
 
 #[test]
-fn parse_backend_flag() {
-    let cli = parse_cli_args(&["--backend", "bedrock"]);
-    assert_eq!(cli.backend.as_deref(), Some("bedrock"));
-}
-
-#[test]
 fn parse_unknown_flag_ignored() {
     let cli = parse_cli_args(&["--unknown-thing", "value"]);
     // Should not panic and other fields stay default

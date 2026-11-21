@@ -3,7 +3,7 @@
 /// Covers: truncate_output, build_compacted_messages, memory I/O, session
 /// persistence, workflow CRUD, system prompt, stream handler, cache
 /// breakpoints, fmt_num, workspace context. CLI/config, slash commands, rate
-/// limiting and Bedrock have their own test files.
+/// limiting have their own test files.
 use syl_rs::api::cache::attach_cache_breakpoints;
 use syl_rs::api::compaction::build_compacted_messages;
 use syl_rs::api::sse::StreamHandler;

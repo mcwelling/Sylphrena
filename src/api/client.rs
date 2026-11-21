@@ -1,4 +1,4 @@
-/// Async HTTP API client for Anthropic (and Bedrock via SigV4).
+/// Async HTTP API client for the Anthropic Messages API.
 /// `stream_turn` sends a streaming POST and reassembles the SSE into a `TurnResult`.
 /// `call_with_retry_shared` wraps it with rate-limit throttle + 429/529 retry.
 use anyhow::Context;
@@ -41,21 +41,14 @@ const BASE_DELAY_MS: u64 = 500;
 
 fn auth_headers(config: &AppConfig) -> HeaderMap {
     let mut headers = HeaderMap::new();
-    match config.backend.as_str() {
-        "bedrock" => {
-            // SigV4 headers are added in build_bedrock_request; nothing static here
-        }
-        _ => {
-            headers.insert(
-                HeaderName::from_static("x-api-key"),
-                HeaderValue::from_str(&config.api_key).unwrap_or_else(|_| HeaderValue::from_static("")),
-            );
-            headers.insert(
-                HeaderName::from_static("anthropic-version"),
-                HeaderValue::from_static(ANTHROPIC_VERSION),
-            );
-        }
-    }
+    headers.insert(
+        HeaderName::from_static("x-api-key"),
+        HeaderValue::from_str(&config.api_key).unwrap_or_else(|_| HeaderValue::from_static("")),
+    );
+    headers.insert(
+        HeaderName::from_static("anthropic-version"),
+        HeaderValue::from_static(ANTHROPIC_VERSION),
+    );
     headers
 }
 
@@ -139,30 +132,6 @@ pub fn request_max_tokens(config: &AppConfig) -> u64 {
         }
         _ => config.max_tokens as u64,
     }
-}
-
-/// Build a Bedrock-compatible request body (no `stream` flag; requires
-/// `anthropic_version: "bedrock-2023-05-31"`; model is encoded in the URL).
-fn build_bedrock_payload(
-    messages: &[Message],
-    system:   &[SystemBlock],
-    config:   &AppConfig,
-) -> serde_json::Value {
-    let max_tokens = request_max_tokens(config);
-
-    let mut body = serde_json::json!({
-        "anthropic_version": "bedrock-2023-05-31",
-        "max_tokens": max_tokens,
-        "system": system,
-        "tools": syl_tools(),
-        "messages": messages,
-    });
-
-    if let Some(thinking) = thinking_param(config) {
-        body["thinking"] = thinking;
-    }
-
-    body
 }
 
 // ---------------------------------------------------------------------------
@@ -266,70 +235,6 @@ pub async fn stream_turn(
 ) -> anyhow::Result<TurnResult> {
     let messages = crate::api::cache::attach_cache_breakpoints(messages.to_vec());
 
-    // ---------------------------------------------------------------------------
-    // Bedrock path (EventStream binary protocol + SigV4)
-    // ---------------------------------------------------------------------------
-    if config.backend == "bedrock" {
-        let base_id   = crate::bedrock::bedrock_model_id(&config.model);
-        // Encode `:` as `%3A` — required in both the URL and the SigV4 canonical URI
-        let model_enc = format!("{}{}", config.bedrock_prefix, base_id).replace(':', "%3A");
-        let path      = format!("/model/{}/invoke-with-response-stream", model_enc);
-        let url       = format!("https://bedrock-runtime.{}.amazonaws.com{}", config.aws_region, path);
-
-        let payload  = build_bedrock_payload(&messages, system, config);
-        let body_str = serde_json::to_string(&payload)?;
-
-        let signed = crate::bedrock::sign_bedrock_request(
-            "POST", &path, &body_str, &config.aws_region,
-            &config.api_key,           // AWS_ACCESS_KEY_ID
-            &config.aws_secret_key,
-            config.aws_session_token.as_deref(),
-        );
-
-        let mut req = client.post(&url).body(body_str);
-        for (k, v) in &signed {
-            req = req.header(k.as_str(), v.as_str());
-        }
-
-        let resp = tokio::select! {
-            r = req.send() => r.context("Bedrock HTTP send failed")?,
-            _ = cancel.cancelled() => return Err(CancelledError.into()),
-        };
-
-        let status = resp.status();
-        if status == 429 || status.as_u16() == 529 {
-            anyhow::bail!("rate_limit:{}", status.as_u16());
-        }
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Bedrock API error {}: {}", status, body);
-        }
-
-        // Read full response body then parse synchronously
-        let body_bytes = tokio::select! {
-            b = resp.bytes() => b.context("Bedrock response read failed")?,
-            _ = cancel.cancelled() => return Err(CancelledError.into()),
-        };
-
-        let mut handler = StreamHandler::new();
-        crate::bedrock::parse_bedrock_stream(
-            std::io::Cursor::new(body_bytes),
-            |event_data| {
-                if let Some(delta) = extract_block_delta(&event_data) {
-                    on_delta(delta);
-                }
-                handler.on_event(&event_data);
-            },
-        );
-        if let Some(err) = handler.stream_error() {
-            return Err(stream_error_to_anyhow(err));
-        }
-        return Ok(handler.build_result());
-    }
-
-    // ---------------------------------------------------------------------------
-    // Anthropic SSE path
-    // ---------------------------------------------------------------------------
     let payload = build_payload(&messages, system, config);
 
     let request = client
