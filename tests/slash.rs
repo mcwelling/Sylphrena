@@ -31,7 +31,6 @@ fn build_ctx<'a>(
     memory_dir:    &'a std::path::PathBuf,
     log_path:      &'a std::path::PathBuf,
     model:         &'a str,
-    backend:       &'a str,
     timeout_ms:    u64,
     rate_limit:    u64,
     input_tokens:  u64,
@@ -45,7 +44,6 @@ fn build_ctx<'a>(
         memory_dir,
         log_path,
         model,
-        backend,
         timeout_ms,
         rate_limit,
         input_tokens,
@@ -72,7 +70,7 @@ async fn slash_exit_returns_exit_action() {
     let tmp = TempDir::new().unwrap();
     let (sp, wd, md, lp) = make_paths(&tmp);
     let cfg = AppConfig::default();
-    let ctx = build_ctx(&sp, &wd, &md, &lp, "claude-opus-4-6", "anthropic", 120_000, 0, 0, 0, 0, &cfg);
+    let ctx = build_ctx(&sp, &wd, &md, &lp, "claude-opus-4-6", 120_000, 0, 0, 0, 0, &cfg);
     let result = handle_slash("/exit", empty_messages(), &ctx).await.unwrap();
     assert_eq!(result.action, SlashAction::Exit);
 }
@@ -82,7 +80,7 @@ async fn slash_quit_also_exits() {
     let tmp = TempDir::new().unwrap();
     let (sp, wd, md, lp) = make_paths(&tmp);
     let cfg = AppConfig::default();
-    let ctx = build_ctx(&sp, &wd, &md, &lp, "claude-opus-4-6", "anthropic", 120_000, 0, 0, 0, 0, &cfg);
+    let ctx = build_ctx(&sp, &wd, &md, &lp, "claude-opus-4-6", 120_000, 0, 0, 0, 0, &cfg);
     let result = handle_slash("/quit", empty_messages(), &ctx).await.unwrap();
     assert_eq!(result.action, SlashAction::Exit);
 }
@@ -92,7 +90,7 @@ async fn slash_clear_empties_messages() {
     let tmp = TempDir::new().unwrap();
     let (sp, wd, md, lp) = make_paths(&tmp);
     let cfg = AppConfig::default();
-    let ctx = build_ctx(&sp, &wd, &md, &lp, "claude-opus-4-6", "anthropic", 120_000, 0, 0, 0, 1, &cfg);
+    let ctx = build_ctx(&sp, &wd, &md, &lp, "claude-opus-4-6", 120_000, 0, 0, 0, 1, &cfg);
     let result = handle_slash("/clear", some_messages(), &ctx).await.unwrap();
     assert!(result.messages.is_empty());
     assert_eq!(result.action, SlashAction::Continue);
@@ -103,7 +101,7 @@ async fn slash_help_has_output() {
     let tmp = TempDir::new().unwrap();
     let (sp, wd, md, lp) = make_paths(&tmp);
     let cfg = AppConfig::default();
-    let ctx = build_ctx(&sp, &wd, &md, &lp, "claude-opus-4-6", "anthropic", 120_000, 0, 0, 0, 0, &cfg);
+    let ctx = build_ctx(&sp, &wd, &md, &lp, "claude-opus-4-6", 120_000, 0, 0, 0, 0, &cfg);
     let result = handle_slash("/help", empty_messages(), &ctx).await.unwrap();
     assert!(result.output.is_some());
     let text = result.output.unwrap();
@@ -116,11 +114,10 @@ async fn slash_status_output_contains_model() {
     let tmp = TempDir::new().unwrap();
     let (sp, wd, md, lp) = make_paths(&tmp);
     let cfg = AppConfig::default();
-    let ctx = build_ctx(&sp, &wd, &md, &lp, "claude-opus-4-6", "anthropic", 120_000, 60_000, 100, 50, 4, &cfg);
+    let ctx = build_ctx(&sp, &wd, &md, &lp, "claude-opus-4-6", 120_000, 60_000, 100, 50, 4, &cfg);
     let result = handle_slash("/status", some_messages(), &ctx).await.unwrap();
     let text = result.output.unwrap();
     assert!(text.contains("claude-opus-4-6"), "status should show model");
-    assert!(text.contains("anthropic"),       "status should show backend");
     assert!(text.contains("120"),             "status should show timeout");
     assert!(text.contains("60000 tpm"),       "status should show rate limit");
     assert!(text.contains("in:100"),          "status should show input tokens");
@@ -132,7 +129,7 @@ async fn slash_status_unlimited_rate() {
     let tmp = TempDir::new().unwrap();
     let (sp, wd, md, lp) = make_paths(&tmp);
     let cfg = AppConfig::default();
-    let ctx = build_ctx(&sp, &wd, &md, &lp, "claude-opus-4-6", "anthropic", 60_000, 0, 0, 0, 0, &cfg);
+    let ctx = build_ctx(&sp, &wd, &md, &lp, "claude-opus-4-6", 60_000, 0, 0, 0, 0, &cfg);
     let result = handle_slash("/status", empty_messages(), &ctx).await.unwrap();
     let text = result.output.unwrap();
     assert!(text.contains("unlimited"));
@@ -143,7 +140,7 @@ async fn slash_save_writes_file() {
     let tmp = TempDir::new().unwrap();
     let (session_path, wd, md, lp) = make_paths(&tmp);
     let cfg = AppConfig::default();
-    let ctx = build_ctx(&session_path, &wd, &md, &lp, "claude-opus-4-6", "anthropic", 120_000, 0, 0, 0, 1, &cfg);
+    let ctx = build_ctx(&session_path, &wd, &md, &lp, "claude-opus-4-6", 120_000, 0, 0, 0, 1, &cfg);
     let result = handle_slash("/save", some_messages(), &ctx).await.unwrap();
     assert!(result.output.is_some());
     let text = result.output.unwrap().to_lowercase();
@@ -158,7 +155,7 @@ async fn slash_save_output_confirms() {
     let tmp = TempDir::new().unwrap();
     let (sp, wd, md, lp) = make_paths(&tmp);
     let cfg = AppConfig::default();
-    let ctx = build_ctx(&sp, &wd, &md, &lp, "claude-opus-4-6", "anthropic", 120_000, 0, 0, 0, 0, &cfg);
+    let ctx = build_ctx(&sp, &wd, &md, &lp, "claude-opus-4-6", 120_000, 0, 0, 0, 0, &cfg);
     let result = handle_slash("/save", empty_messages(), &ctx).await.unwrap();
     let text = result.output.unwrap().to_lowercase();
     assert!(text.contains("saved") || text.contains("session"));
@@ -169,7 +166,7 @@ async fn slash_memory_empty_dir() {
     let tmp = TempDir::new().unwrap();
     let (sp, wd, md, lp) = make_paths(&tmp);
     let cfg = AppConfig::default();
-    let ctx = build_ctx(&sp, &wd, &md, &lp, "claude-opus-4-6", "anthropic", 120_000, 0, 0, 0, 0, &cfg);
+    let ctx = build_ctx(&sp, &wd, &md, &lp, "claude-opus-4-6", 120_000, 0, 0, 0, 0, &cfg);
     let result = handle_slash("/memory", empty_messages(), &ctx).await.unwrap();
     assert_eq!(result.output.as_deref(), Some("No memories."));
 }
@@ -179,7 +176,7 @@ async fn slash_memory_lists_keys() {
     let tmp = TempDir::new().unwrap();
     let (sp, wd, memory_dir, lp) = make_paths(&tmp);
     let cfg = AppConfig::default();
-    let ctx = build_ctx(&sp, &wd, &memory_dir, &lp, "claude-opus-4-6", "anthropic", 120_000, 0, 0, 0, 0, &cfg);
+    let ctx = build_ctx(&sp, &wd, &memory_dir, &lp, "claude-opus-4-6", 120_000, 0, 0, 0, 0, &cfg);
     fs::write(memory_dir.join("alpha.md"), "content a").unwrap();
     fs::write(memory_dir.join("beta.md"),  "content b").unwrap();
     let result = handle_slash("/memory", empty_messages(), &ctx).await.unwrap();
@@ -193,7 +190,7 @@ async fn slash_memory_named_key() {
     let tmp = TempDir::new().unwrap();
     let (sp, wd, memory_dir, lp) = make_paths(&tmp);
     let cfg = AppConfig::default();
-    let ctx = build_ctx(&sp, &wd, &memory_dir, &lp, "claude-opus-4-6", "anthropic", 120_000, 0, 0, 0, 0, &cfg);
+    let ctx = build_ctx(&sp, &wd, &memory_dir, &lp, "claude-opus-4-6", 120_000, 0, 0, 0, 0, &cfg);
     fs::write(memory_dir.join("mykey.md"), "the memory contents").unwrap();
     let result = handle_slash("/memory mykey", empty_messages(), &ctx).await.unwrap();
     let text = result.output.unwrap();
@@ -205,7 +202,7 @@ async fn slash_memory_missing_key() {
     let tmp = TempDir::new().unwrap();
     let (sp, wd, md, lp) = make_paths(&tmp);
     let cfg = AppConfig::default();
-    let ctx = build_ctx(&sp, &wd, &md, &lp, "claude-opus-4-6", "anthropic", 120_000, 0, 0, 0, 0, &cfg);
+    let ctx = build_ctx(&sp, &wd, &md, &lp, "claude-opus-4-6", 120_000, 0, 0, 0, 0, &cfg);
     let result = handle_slash("/memory nonexistent", empty_messages(), &ctx).await.unwrap();
     let text = result.output.unwrap().to_lowercase();
     assert!(text.contains("not found"));
@@ -216,7 +213,7 @@ async fn slash_workflow_empty_dir() {
     let tmp = TempDir::new().unwrap();
     let (sp, wd, md, lp) = make_paths(&tmp);
     let cfg = AppConfig::default();
-    let ctx = build_ctx(&sp, &wd, &md, &lp, "claude-opus-4-6", "anthropic", 120_000, 0, 0, 0, 0, &cfg);
+    let ctx = build_ctx(&sp, &wd, &md, &lp, "claude-opus-4-6", 120_000, 0, 0, 0, 0, &cfg);
     let result = handle_slash("/workflow", empty_messages(), &ctx).await.unwrap();
     assert_eq!(result.output.as_deref(), Some("No workflows."));
 }
@@ -226,7 +223,7 @@ async fn slash_log_missing_file() {
     let tmp = TempDir::new().unwrap();
     let (sp, wd, md, lp) = make_paths(&tmp);
     let cfg = AppConfig::default();
-    let ctx = build_ctx(&sp, &wd, &md, &lp, "claude-opus-4-6", "anthropic", 120_000, 0, 0, 0, 0, &cfg);
+    let ctx = build_ctx(&sp, &wd, &md, &lp, "claude-opus-4-6", 120_000, 0, 0, 0, 0, &cfg);
     let result = handle_slash("/log", empty_messages(), &ctx).await.unwrap();
     assert_eq!(result.output.as_deref(), Some("No log entries yet."));
 }
@@ -236,7 +233,7 @@ async fn slash_log_reads_last_lines() {
     let tmp = TempDir::new().unwrap();
     let (sp, wd, md, log_path) = make_paths(&tmp);
     let cfg = AppConfig::default();
-    let ctx = build_ctx(&sp, &wd, &md, &log_path, "claude-opus-4-6", "anthropic", 120_000, 0, 0, 0, 0, &cfg);
+    let ctx = build_ctx(&sp, &wd, &md, &log_path, "claude-opus-4-6", 120_000, 0, 0, 0, 0, &cfg);
     let lines: Vec<String> = (1..=25).map(|i| format!("line {}", i)).collect();
     fs::write(&log_path, lines.join("\n")).unwrap();
     let result = handle_slash("/log", empty_messages(), &ctx).await.unwrap();
@@ -252,7 +249,7 @@ async fn slash_unknown_returns_none() {
     let tmp = TempDir::new().unwrap();
     let (sp, wd, md, lp) = make_paths(&tmp);
     let cfg = AppConfig::default();
-    let ctx = build_ctx(&sp, &wd, &md, &lp, "claude-opus-4-6", "anthropic", 120_000, 0, 0, 0, 0, &cfg);
+    let ctx = build_ctx(&sp, &wd, &md, &lp, "claude-opus-4-6", 120_000, 0, 0, 0, 0, &cfg);
     let result = handle_slash("/notacommand", empty_messages(), &ctx).await;
     assert!(result.is_none());
 }
@@ -262,7 +259,7 @@ async fn slash_command_tolerates_surrounding_whitespace() {
     let tmp = TempDir::new().unwrap();
     let (sp, wd, md, lp) = make_paths(&tmp);
     let cfg = AppConfig::default();
-    let ctx = build_ctx(&sp, &wd, &md, &lp, "claude-opus-4-6", "anthropic", 120_000, 0, 0, 0, 0, &cfg);
+    let ctx = build_ctx(&sp, &wd, &md, &lp, "claude-opus-4-6", 120_000, 0, 0, 0, 0, &cfg);
     let result = handle_slash("  /exit  ", empty_messages(), &ctx).await.unwrap();
     assert_eq!(result.action, SlashAction::Exit);
 }

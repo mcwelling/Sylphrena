@@ -35,14 +35,13 @@ use std::sync::{Arc, Mutex};
 
 /// One selectable entry in the picker.
 pub struct ModelOption {
-    /// The model ID sent to the API backend (e.g. `"claude-opus-4-6-20250514"`
-    /// for Anthropic, `"anthropic.claude-opus-4-6-20250514-v1:0"` for Bedrock).
+    /// The model ID sent to the API (e.g. `"claude-opus-4-6-20250514"`).
     pub id: String,
     /// Primary label shown in the left column (e.g. `"Claude Opus 4.6"`).
     /// For static fallback entries this is the same as `id`.
     pub display: String,
     /// Secondary info shown dimmed in the right column.
-    /// For dynamic Anthropic/Bedrock entries this is typically the raw model
+    /// For dynamic API entries this is typically the raw model
     /// ID when it differs from `display`; for static fallback it's the
     /// human description.
     pub description: String,

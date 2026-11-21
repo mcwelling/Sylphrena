@@ -6,7 +6,6 @@ This document covers the implementation details behind Syl's main subsystems.
 
 ## Table of Contents
 
-- [Dual Backend](#dual-backend)
 - [Model Discovery](#model-discovery)
 - [Streaming](#streaming)
 - [Rate Limiting](#rate-limiting)
@@ -22,29 +21,10 @@ This document covers the implementation details behind Syl's main subsystems.
 
 ---
 
-## Dual Backend
-
-Syl supports two API backends that share the same streaming handler and tool loop.
-
-| | `anthropic` | `bedrock` |
-|---|---|---|
-| Transport | HTTPS + Server-Sent Events | HTTPS + binary EventStream |
-| Auth | `ANTHROPIC_API_KEY` header | AWS Signature Version 4 |
-| Host | `api.anthropic.com` | `bedrock-runtime.{region}.amazonaws.com` |
-| Model ID | friendly name (e.g. `claude-opus-4-6`) | full Bedrock ID (e.g. `anthropic.claude-opus-4-6-20250514-v1:0`) |
-| Streaming | incremental SSE events | base64-encoded EventStream frames |
-
-The Bedrock backend implements SigV4 request signing natively — no AWS SDK. The binary EventStream framing (12-byte prelude + headers + payload + CRC) is parsed by `src/bedrock.rs`. Both backends produce the same `TurnResult` type for the agent loop.
-
-**Bedrock model IDs:** The cross-region inference prefix (`us.`, `eu.`, `ap.`) is derived automatically from `AWS_REGION` — `eu-*` → `eu.`, `ap-*` → `ap.`, everything else → `us.`. The full URL path looks like `/model/us.anthropic.claude-opus-4-6-20250514-v1%3A0/invoke-with-response-stream`.
-
----
-
 ## Model Discovery
 
-At startup Syl fetches the available model list from the backend API (5-second timeout), replacing the static fallback list in `SharedState::available_models`.
+At startup Syl fetches the available model list from the Anthropic API (5-second timeout), replacing the static fallback list in `SharedState::available_models`.
 
-**Anthropic:**
 ```
 GET https://api.anthropic.com/v1/models
 x-api-key: {ANTHROPIC_API_KEY}
@@ -52,20 +32,11 @@ anthropic-version: 2023-06-01
 ```
 Returns `data[].{ id, display_name }`. Only `claude-*` entries are kept.
 
-**Bedrock:**
-```
-GET https://bedrock.{region}.amazonaws.com/foundation-models
-    ?byOutputModality=TEXT&byProvider=Anthropic
-```
-SigV4-signed GET (management-plane host `bedrock.`, not `bedrock-runtime.`). Returns `modelSummaries[].{ modelId, modelName }`, filtered to `responseStreamingSupported=true`.
-
 On failure (no credentials, network error, timeout) the compile-time `CLAUDE_MODELS` list in `src/config.rs` is used as a fallback. `/model <name>` accepts any string — unknown names are passed to the API as-is and validated there.
 
 ---
 
 ## Streaming
-
-### Anthropic (SSE)
 
 ```
 HTTP POST /v1/messages (stream: true)
@@ -78,20 +49,6 @@ SseParser (byte-chunk line buffer)
    │  content_block_stop   → finalise block
    │  message_delta        → capture stop_reason + final usage
    └──────────────────────→ TurnResult
-```
-
-### Bedrock (binary EventStream)
-
-```
-HTTP POST /model/.../invoke-with-response-stream
-   │
-   ▼
-parse_bedrock_stream()
-   │  12-byte prelude  → total_len + headers_len + prelude_crc
-   │  headers          → :event-type ("chunk" or ignore)
-   │  payload          → JSON with base64 "bytes" field
-   │  decode           → same SSE handler as Anthropic
-   └──────────────────→ TurnResult
 ```
 
 Text deltas are printed immediately via `terminal::write_streaming`. Tool-use JSON accumulates in `StreamHandler` and is parsed at block completion. Thinking deltas are printed in dim text.
@@ -260,7 +217,7 @@ Syl ── ↑ 1024  ↓ 512  · $0.0124 ── TPM ████░░ 42% ─�
 ─ claude-opus-5-5 · 120s ────────────────────────── /help  /save  /exit ─
 ```
 
-Shows the active model, backend (when not `anthropic`), and request timeout. While a tool is running, it switches to a spinner showing the active tool name.
+Shows the active model and request timeout. While a tool is running, it switches to a spinner showing the active tool name.
 
 ---
 
@@ -286,7 +243,6 @@ src/
 ├── config.rs          # AppConfig, CLI parser, CLAUDE_MODELS fallback
 ├── shared.rs          # SharedState (Arc-wrapped mutexes)
 ├── container.rs       # Podman lifecycle, SSH/git setup, stats polling
-├── bedrock.rs         # SigV4 signing, EventStream parsing
 ├── pricing.rs         # cost estimation from token usage
 ├── session.rs         # load/save session.json
 ├── slash.rs           # slash command handlers
@@ -297,7 +253,7 @@ src/
 │
 ├── api/
 │   ├── client.rs      # stream_turn, call_with_retry_shared, SseParser
-│   ├── models.rs      # dynamic model discovery (Anthropic + Bedrock)
+│   ├── models.rs      # dynamic model discovery
 │   ├── sse.rs         # StreamHandler (SSE event → TurnResult)
 │   ├── compaction.rs  # context compaction via Haiku summarisation
 │   ├── cache.rs       # cache_control breakpoint injection

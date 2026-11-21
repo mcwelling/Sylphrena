@@ -16,8 +16,7 @@ use crate::util::{is_html, strip_html};
 // ---------------------------------------------------------------------------
 
 /// Versioned model ID for the dispatch sub-agent.
-/// Update here when Haiku is upgraded; also verify the ID matches the runtime
-/// api_url (direct Anthropic API vs Bedrock use different identifiers).
+/// Update here when Haiku is upgraded.
 const HAIKU_MODEL: &str = "claude-haiku-4-5-20251001";
 
 /// Maximum characters of fetched content passed to the sub-agent.
@@ -205,7 +204,7 @@ fn haiku_config(base: &AppConfig, max_tokens: u32) -> AppConfig {
         resume:   false,
         fresh:    false,
         no_banner: false,
-        // All other fields (auth, backend, region, rate-limit, UI, etc.)
+        // All other fields (auth, rate-limit, UI, etc.)
         // pass through from base. New AppConfig fields are automatically included.
         ..base.clone()
     }

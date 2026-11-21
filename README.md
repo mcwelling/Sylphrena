@@ -2,14 +2,14 @@
 
 **An honorspren for your codebase.**
 
-Syl is a lightweight AI agent written in Rust. She spins up a sandboxed Ubuntu container via Podman, connects to Claude through the Anthropic API or AWS Bedrock with real-time streaming, and drops you into an interactive terminal REPL where the assistant can read, write, and execute code safely.
+Syl is a lightweight AI agent written in Rust. She spins up a sandboxed Ubuntu container via Podman, connects to Claude through the Anthropic API with real-time streaming, and drops you into an interactive terminal REPL where the assistant can read, write, and execute code safely.
 
 > *"I'm not a pet. I'm a honorspren. There's a difference."*
 
 ```
 ┌──────────────┐       ┌──────────────────┐  streaming  ┌──────────────────────────┐
 │  You (REPL)  │ ───▶  │  syl  (Rust)     │ ◀═══════▶  │  Claude API              │
-│              │ ◀───  │                  │  SSE/ES     │  (Anthropic or Bedrock)  │
+│              │ ◀───  │                  │     SSE     │  (Anthropic)             │
 └──────────────┘       └────────┬─────────┘             └──────────────────────────┘
                                 │ tool calls
                                 ▼
@@ -28,8 +28,7 @@ Syl is a lightweight AI agent written in Rust. She spins up a sandboxed Ubuntu c
 | **Podman** | `brew install podman && podman machine init && podman machine start` | `sudo apt install podman` |
 | **Git** | pre-installed | pre-installed |
 
-**Anthropic:** set `ANTHROPIC_API_KEY`  
-**Bedrock:** set `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`
+Set `ANTHROPIC_API_KEY`.
 
 ## Quick Start
 
@@ -51,7 +50,6 @@ On first run Syl pulls an Ubuntu base image, installs dev tools, and bakes a cac
 | Flag | Default | Description |
 |---|---|---|
 | `--model <name>` | `claude-opus-5-5` | Starting model (switch live with `/model`) |
-| `--backend <name>` | `anthropic` | `anthropic` or `bedrock` |
 | `--rate-limit <n>` | `60000` | Token-per-minute budget |
 | `--timeout <secs>` | `120` | Request timeout |
 | `--thinking <n>` | — | Extended thinking token budget. On adaptive-thinking models (Opus 4.7+, all 5.x models, including the default) the budget is ignored and Syl streams summarized thinking instead |
@@ -62,7 +60,7 @@ On first run Syl pulls an Ubuntu base image, installs dev tools, and bakes a cac
 | `--light` | — | Light terminal colour theme |
 | `--help` | — | Show this help |
 
-**Environment overrides:** `SYL_MODEL`, `SYL_BACKEND`, `SYL_RATE_LIMIT`, `SYL_THEME`, `SYL_IMAGE`
+**Environment overrides:** `SYL_MODEL`, `SYL_RATE_LIMIT`, `SYL_THEME`, `SYL_IMAGE`
 
 **Per-project config** (lowest priority): `.syl/config.toml`
 ```toml
@@ -78,7 +76,7 @@ Priority: **CLI flag > environment variable > `.syl/config.toml` > default**
 | Command | Description |
 |---|---|
 | `/model [name]` | Interactive picker (↑↓ / jk + Enter), or direct: `/model sonnet` |
-| `/status` | Model, backend, timeout, rate limit, token counts, cost |
+| `/status` | Model, timeout, rate limit, token counts, cost |
 | `/save` | Save conversation to `.syl/session.json` |
 | `/memory [key]` | List persistent memory keys or show one |
 | `/workflow [name]` | List pipelines or run one |
@@ -104,7 +102,6 @@ Claude has eight built-in tools inside the container:
 
 ```bash
 syl                          # standard session
-syl --backend bedrock        # route through AWS Bedrock
 syl --thinking 8000          # show Claude's thinking as it streams
 syl --resume                 # continue previous conversation
 syl --fresh                  # clean slate (new container)

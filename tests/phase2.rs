@@ -3,7 +3,7 @@ use tempfile::TempDir;
 
 use syl_rs::api::client::SseParser;
 use syl_rs::config::{
-    build_config, parse_cli_args, AppConfig, DEFAULT_BACKEND, DEFAULT_RATE_LIMIT,
+    build_config, parse_cli_args, AppConfig, DEFAULT_RATE_LIMIT,
 };
 
 // ---------------------------------------------------------------------------
@@ -19,12 +19,6 @@ fn tmp_syl_dir() -> TempDir {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_appconfig_default_backend() {
-    let cfg = AppConfig::default();
-    assert_eq!(cfg.backend, DEFAULT_BACKEND);
-}
-
-#[test]
 fn test_appconfig_default_rate_limit() {
     let cfg = AppConfig::default();
     assert_eq!(cfg.rate_limit, DEFAULT_RATE_LIMIT);
@@ -33,14 +27,6 @@ fn test_appconfig_default_rate_limit() {
 // ---------------------------------------------------------------------------
 // 2. build_config: CLI overrides defaults
 // ---------------------------------------------------------------------------
-
-#[test]
-fn test_build_config_cli_backend_override() {
-    let dir = tmp_syl_dir();
-    let cli = parse_cli_args(&["--backend", "bedrock"]);
-    let cfg = build_config(&cli, dir.path());
-    assert_eq!(cfg.backend, "bedrock");
-}
 
 #[test]
 fn test_build_config_cli_rate_limit_override() {

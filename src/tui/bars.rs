@@ -50,8 +50,6 @@ pub const LIGHT: Palette = Palette {
 pub struct BarData {
     /// Model identifier shown in the bottom bar.
     pub model: String,
-    /// Backend name ("anthropic" / "bedrock").
-    pub backend: String,
     /// Request timeout in milliseconds.
     pub timeout_ms: u64,
     /// Cumulative input tokens for this session.
@@ -84,7 +82,6 @@ impl Default for BarData {
     fn default() -> Self {
         BarData {
             model: String::from("claude-opus-4-6"),
-            backend: String::from("anthropic"),
             timeout_ms: 60_000,
             input_tokens: 0,
             output_tokens: 0,
@@ -208,7 +205,7 @@ pub fn make_top_bar(data: &BarData, p: &Palette) -> String {
     }
 }
 
-/// Build the bottom status bar: model + timeout (+ backend when not anthropic) + right-aligned shortcuts.
+/// Build the bottom status bar: model + timeout + right-aligned shortcuts.
 ///
 /// Layout: `─ model · Ns timeout ──────────────── /help  /save  /exit ─`
 pub fn make_bottom_bar(data: &BarData, p: &Palette) -> String {
@@ -222,18 +219,12 @@ pub fn make_bottom_bar(data: &BarData, p: &Palette) -> String {
         }
         None => {
             let timeout_s = data.timeout_ms / 1000;
-            let backend_seg = if data.backend != "anthropic" {
-                format!(" {dim}· {backend}{r}", dim = p.dim, r = p.r, backend = data.backend)
-            } else {
-                String::new()
-            };
             format!(
-                "{dim}─{r} {lb}{model}{r}{backend} {dim}· {timeout}s{r}",
+                "{dim}─{r} {lb}{model}{r} {dim}· {timeout}s{r}",
                 dim     = p.dim,
                 r       = p.r,
                 lb      = p.lb,
                 model   = data.model,
-                backend = backend_seg,
                 timeout = timeout_s,
             )
         }

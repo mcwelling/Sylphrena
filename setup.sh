@@ -141,23 +141,6 @@ else
   fi
 fi
 
-# --- Check AWS Credentials (optional — for Bedrock backend) ---
-echo
-echo -e "${BOLD}AWS Configuration (optional — for --backend bedrock)${RESET}\n"
-
-if [ -n "${AWS_ACCESS_KEY_ID:-}" ] && [ -n "${AWS_SECRET_ACCESS_KEY:-}" ]; then
-  key_preview="${AWS_ACCESS_KEY_ID:0:6}...${AWS_ACCESS_KEY_ID: -4}"
-  region="${AWS_REGION:-${AWS_DEFAULT_REGION:-us-east-1}}"
-  pass "AWS credentials are set ($key_preview)"
-  pass "AWS region: $region"
-  if [ -n "${AWS_SESSION_TOKEN:-}" ]; then
-    pass "AWS session token is set (temporary credentials)"
-  fi
-else
-  info "AWS credentials not set (only needed for --backend bedrock)"
-  info "To use Bedrock, set: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION"
-fi
-
 # --- Pull container image ---
 echo
 echo -e "${BOLD}Container Image${RESET}\n"
