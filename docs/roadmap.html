@@ -1,0 +1,519 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Syl Roadmap</title>
+<meta name="description" content="Survey of open-source agent harnesses against Sylphrena, and a phased roadmap toward the Bondsmith meta-harness.">
+<style>
+:root {
+  --bg: #fbfaf7;
+  --surface: #ffffff;
+  --surface-2: #f3f1ec;
+  --text: #1d1c1a;
+  --muted: #6b6760;
+  --border: #e4e0d8;
+  --accent: #2f6fb3;
+  --accent-soft: #e6eef8;
+  --yes: #1f7a4d;   --yes-bg: #e3f3ea;
+  --part: #8a5a00;  --part-bg: #fbf0d9;
+  --ext: #5b4bb3;   --ext-bg: #ece9fa;
+  --no: #a23b32;    --no-bg: #f8e5e3;
+  --unk: #6b6760;   --unk-bg: #efede8;
+  --code-bg: #f1eee8;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #151514;
+    --surface: #1d1d1b;
+    --surface-2: #252522;
+    --text: #ebe8e2;
+    --muted: #a19c93;
+    --border: #34332f;
+    --accent: #7fb0e6;
+    --accent-soft: #1f2c3b;
+    --yes: #6fd09c;   --yes-bg: #17301f;
+    --part: #e6b65c;  --part-bg: #33281a;
+    --ext: #b3a6f2;   --ext-bg: #262140;
+    --no: #f08f85;    --no-bg: #3a1e1b;
+    --unk: #a19c93;   --unk-bg: #2a2926;
+    --code-bg: #262521;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #151514; --surface: #1d1d1b; --surface-2: #252522; --text: #ebe8e2; --muted: #a19c93;
+  --border: #34332f; --accent: #7fb0e6; --accent-soft: #1f2c3b;
+  --yes: #6fd09c; --yes-bg: #17301f; --part: #e6b65c; --part-bg: #33281a;
+  --ext: #b3a6f2; --ext-bg: #262140; --no: #f08f85; --no-bg: #3a1e1b;
+  --unk: #a19c93; --unk-bg: #2a2926; --code-bg: #262521; color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif;
+}
+main { max-width: 960px; margin: 0 auto; padding: 48px 16px 96px; }
+h1, h2, h3 { line-height: 1.25; letter-spacing: -0.01em; }
+h1 { font-size: 2.1rem; margin: 0 0 6px; }
+h2 { font-size: 1.45rem; margin: 56px 0 14px; padding-top: 10px; border-top: 1px solid var(--border); }
+h3 { font-size: 1.1rem; margin: 28px 0 8px; }
+p, ul, ol { margin: 0 0 14px; }
+ul, ol { padding-left: 22px; }
+li { margin: 4px 0; }
+a { color: var(--accent); text-underline-offset: 2px; }
+code {
+  font: 0.86em/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  background: var(--code-bg);
+  padding: 1px 5px;
+  border-radius: 4px;
+  overflow-wrap: anywhere;
+}
+.sub { color: var(--muted); margin-bottom: 28px; }
+.lede { font-size: 1.06rem; }
+.callout {
+  background: var(--accent-soft);
+  border-left: 3px solid var(--accent);
+  padding: 14px 18px;
+  border-radius: 6px;
+  margin: 20px 0;
+}
+.callout p:last-child { margin-bottom: 0; }
+
+nav.toc {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px 18px;
+  margin: 24px 0 8px;
+}
+nav.toc strong { display: block; margin-bottom: 6px; font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+nav.toc ol { margin: 0; columns: 2; column-gap: 32px; }
+@media (max-width: 600px) { nav.toc ol { columns: 1; } }
+
+.table-wrap { overflow-x: auto; margin: 0 0 18px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
+table { border-collapse: collapse; width: 100%; font-size: 0.92rem; }
+th, td { text-align: left; vertical-align: top; padding: 9px 12px; border-bottom: 1px solid var(--border); }
+tr:last-child td { border-bottom: none; }
+thead th { background: var(--surface-2); font-weight: 600; white-space: nowrap; }
+td:first-child { font-weight: 500; }
+table.kv td:first-child { white-space: nowrap; }
+
+table.matrix { font-size: 0.86rem; }
+table.matrix th:first-child, table.matrix td:first-child { position: sticky; left: 0; background: var(--surface); z-index: 1; min-width: 190px; }
+table.matrix thead th:first-child { background: var(--surface-2); }
+table.matrix th.syl, table.matrix td.syl-col { background: var(--accent-soft); }
+table.matrix td { white-space: nowrap; }
+.m { display: inline-block; padding: 1px 8px; border-radius: 999px; font-weight: 600; font-size: 0.8rem; }
+.m.y { color: var(--yes); background: var(--yes-bg); }
+.m.p { color: var(--part); background: var(--part-bg); }
+.m.e { color: var(--ext); background: var(--ext-bg); }
+.m.n { color: var(--no); background: var(--no-bg); }
+.m.u { color: var(--unk); background: var(--unk-bg); }
+.m small { font-weight: 500; opacity: 0.85; }
+.legend { display: flex; flex-wrap: wrap; gap: 10px 16px; margin: 0 0 12px; font-size: 0.85rem; color: var(--muted); }
+
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; margin: 8px 0 18px; }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 16px 18px; }
+.card h3 { margin-top: 0; }
+.card .tag { font-size: 0.78rem; color: var(--muted); display: block; margin: -4px 0 10px; }
+.card ul { margin-bottom: 0; padding-left: 18px; font-size: 0.93rem; }
+
+.phase { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 18px 20px 6px; margin: 16px 0; }
+.phase-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 12px; margin-bottom: 8px; }
+.phase-head h3 { margin: 0; }
+.phase-num { font: 600 0.78rem/1 ui-monospace, Menlo, monospace; color: var(--accent); background: var(--accent-soft); padding: 4px 8px; border-radius: 6px; }
+.size { font-size: 0.85rem; color: var(--muted); }
+.phase.key { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; }
+.done { background: var(--surface-2); border-radius: 8px; padding: 10px 14px; font-size: 0.93rem; margin: 6px 0 14px; }
+.done b { color: var(--yes); }
+
+ol.principles > li { margin-bottom: 10px; }
+
+.flow { display: grid; gap: 10px; margin: 12px 0 16px; }
+.flow-row { display: flex; flex-wrap: wrap; gap: 10px; align-items: stretch; }
+.flow .box { flex: 1 1 180px; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; font-size: 0.9rem; }
+.flow .box b { display: block; font-size: 0.78rem; color: var(--accent); font-family: ui-monospace, Menlo, monospace; }
+.flow .box.key { border-color: var(--accent); }
+.flow .arrow { text-align: center; color: var(--muted); font-size: 0.85rem; }
+
+.small { font-size: 0.88rem; color: var(--muted); }
+footer { margin-top: 56px; padding-top: 16px; border-top: 1px solid var(--border); }
+</style>
+</head>
+<body>
+<main>
+
+<header>
+  <h1>Syl Roadmap: from harness to Bondsmith</h1>
+  <p class="sub">November 2026 · written against <code>remove-bedrock</code> (<code>eb09481</code>)</p>
+</header>
+
+<p class="lede">Syl is a solid single-user terminal agent with one strong opinion: everything the model runs happens inside a Podman container. The open-source harnesses surveyed here have moved past “a REPL around a tool loop” in three directions:</p>
+<ol>
+  <li><strong>A headless core with a protocol in front of it.</strong> The TUI becomes one client among several.</li>
+  <li><strong>Durable, append-only session logs.</strong> These make branching, undo, resume and replay cheap.</li>
+  <li><strong>Extensibility through shared standards.</strong> That means MCP, Agent Skills, <code>AGENTS.md</code> and ACP, not bespoke formats.</li>
+</ol>
+
+<div class="callout">
+  <p>Bondsmith is a meta-harness desktop app, so the most important item on this roadmap is <a href="#phase-4">Phase 4</a>: <strong>Syl must speak ACP</strong> (Agent Client Protocol). Goose, CodeWhale and DeepSeek Harness already do, and Zed and JetBrains use it as their agent interface. If Bondsmith is an ACP client, it can host Syl, and it can host other agents the same way. Everything before that phase is groundwork that makes Syl worth hosting.</p>
+</div>
+
+<nav class="toc" aria-label="Contents">
+  <strong>Contents</strong>
+  <ol>
+    <li><a href="#today">Where Syl stands today</a></li>
+    <li><a href="#survey">Field survey</a></li>
+    <li><a href="#matrix">Comparison matrix</a></li>
+    <li><a href="#principles">Principles for Syl</a></li>
+    <li><a href="#roadmap">Roadmap</a></li>
+    <li><a href="#bondsmith">What Bondsmith needs from Syl</a></li>
+    <li><a href="#order">Suggested order</a></li>
+    <li><a href="#sources">Sources and gaps</a></li>
+  </ol>
+</nav>
+
+<!-- ============================================================ -->
+<h2 id="today">1. Where Syl stands today</h2>
+
+<h3>Strengths worth keeping</h3>
+<div class="table-wrap">
+<table class="kv">
+  <tbody>
+    <tr><td>Container-first sandbox</td><td>Every command runs in a per-project Podman container. <code>.syl/</code> is mounted read-only, and <code>~/.ssh</code> is read-only. Most harnesses either have no sandbox (pi) or bolt on Seatbelt/bubblewrap (CodeWhale, Codex). This is Syl’s main differentiator.</td></tr>
+    <tr><td>Single Rust binary</td><td>Fast startup and no Node or Python runtime. Goose and CodeWhale make the same bet.</td></tr>
+    <tr><td>Prompt-cache discipline</td><td>Frozen system prompt, append-only history and thinking-block handling are already correct for Opus 5.5.</td></tr>
+    <tr><td>Persona and memory</td><td>Persistent markdown memories are injected at conversation start. The persona gives Syl character.</td></tr>
+    <tr><td>Workflows</td><td>Markdown pipelines run with <code>/workflow</code>. These are a seed for something recipe-like.</td></tr>
+    <tr><td>Cost and TPM tracking</td><td>Live cost and rate-limit bars.</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h3>Gaps</h3>
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Area</th><th>Today</th><th>Problem</th></tr></thead>
+  <tbody>
+    <tr><td>Architecture</td><td>~8k lines; <code>main.rs</code> (~950 lines) mixes the REPL, the agent loop, tool dispatch and TUI drawing</td><td>The loop can’t run without the TUI, so it can’t be embedded, tested end to end, or driven by Bondsmith.</td></tr>
+    <tr><td>Sessions</td><td>One <code>.syl/session.json</code>, overwritten each turn</td><td>No branching, fork, undo, multiple sessions per project, or crash-safe writes.</td></tr>
+    <tr><td>Context</td><td>Compacts at 30 <em>messages</em> and keeps 10</td><td>Ignores tokens. A few huge tool results can overflow, while many tiny turns compact early.</td></tr>
+    <tr><td>Editing</td><td>No edit or write tool; the model edits with <code>sed</code>/heredocs through <code>run_bash</code></td><td>Edits are error-prone and token-heavy, and there is no diff to review or undo.</td></tr>
+    <tr><td>Tools</td><td>8 tools, run one at a time</td><td>No <code>grep</code>/<code>glob</code>/<code>ls</code>, and read-only calls can’t run in parallel.</td></tr>
+    <tr><td>Project context</td><td>Doesn’t read <code>AGENTS.md</code> / <code>CLAUDE.md</code></td><td>Misses the convention every other harness follows.</td></tr>
+    <tr><td>Control</td><td>No permission model, no undo, no audit trail</td><td>The container limits damage to the workspace but doesn’t prevent it.</td></tr>
+    <tr><td>Extensibility</td><td>No MCP, skills, hooks or plugins</td><td>Users can’t extend Syl without changing Rust code.</td></tr>
+    <tr><td>Modes</td><td>Interactive only</td><td>No <code>-p</code> one-shot, JSON event stream, RPC/ACP, or SDK.</td></tr>
+    <tr><td>Multi-agent</td><td><code>dispatch_agent</code> only (fetch a URL, summarize with Haiku)</td><td>No real subagents and no plan/build split.</td></tr>
+    <tr><td>Providers</td><td>Anthropic only (by choice, after removing Bedrock)</td><td>Fine for now. Keep a seam so it isn’t a rewrite later.</td></tr>
+  </tbody>
+</table>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="survey">2. Field survey: ideas worth taking</h2>
+
+<div class="cards">
+  <div class="card">
+    <h3>pi</h3>
+    <span class="tag">Mario Zechner · pi-mono / pi.dev · TypeScript · minimal core, maximal extension</span>
+    <ul>
+      <li><strong>Four default tools</strong> (<code>read</code>, <code>write</code>, <code>edit</code>, <code>bash</code>) and a deliberately tiny system prompt.</li>
+      <li><strong>Sessions are JSONL trees.</strong> Each entry has an <code>id</code> and <code>parentId</code>, so <code>/tree</code>, <code>/fork</code> and <code>/clone</code> branch inside one file, and side quests can be summarized back into the main line.</li>
+      <li><strong>TypeScript extensions</strong> can register tools, commands, providers and <code>tool_call</code> hooks, and draw TUI widgets and overlays. <code>/reload</code> hot-reloads them. Plan mode, subagents, permission gates and MCP all ship as extensions, not core.</li>
+      <li><strong>Skills</strong> follow the Agent Skills standard (<code>SKILL.md</code>). Prompt templates expand with <code>/name</code>, and both can be bundled as installable packages (npm/git).</li>
+      <li><strong>Modes:</strong> interactive, <code>-p</code> print, <code>--mode json</code> (event stream), <code>--mode rpc</code> (JSONL over stdio), and an SDK. OpenClaw is built on the SDK.</li>
+      <li><strong>Steering queue:</strong> Enter queues a message for after the current tool calls, and Alt+Enter queues one for after all work is done.</li>
+      <li><strong>Opinions:</strong> no MCP (tool schemas load at session start and break the cache on reload), no built-in todos, no permission popups (use a container).</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <h3>opencode</h3>
+    <span class="tag">sst / anomalyco · TypeScript on Bun · client/server first</span>
+    <ul>
+      <li><strong>One server process hosts the runtime,</strong> and the TUI, desktop app and web pairing are all clients. An OpenAPI 3.1 HTTP API covers sessions, prompts, interrupt, compact, fork, revert, per-turn diffs, permissions and an event stream (<code>session.text.delta</code>, <code>permission.asked</code>, …).</li>
+      <li><strong>Agents:</strong> primary agents <code>build</code> and <code>plan</code> (edits denied), and subagents <code>general</code> and <code>explore</code>. Agents are markdown files with frontmatter. Subagents run in child sessions with fresh context, and the depth limit defaults to 1.</li>
+      <li><strong>Permissions:</strong> an ordered list of <code>{action, resource, effect}</code> rules with allow/ask/deny; the last match wins and the default is ask. A shell scanner checks subcommands separately. Approvals can be once, always or reject, and managed policies override the project.</li>
+      <li><strong>Two-step revert</strong> (stage, then commit) over filesystem snapshots. LSP servers and formatters run after edits.</li>
+      <li><strong>Compaction is token-based</strong> (<code>keep.tokens</code>, and a <code>buffer</code> of free context reserved before auto-compaction).</li>
+      <li><strong>MCP:</strong> stdio and Streamable HTTP with OAuth, server instructions injected into the prompt, elicitation rendered as forms, and “Code Mode” (MCP tools exposed as one JavaScript API).</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <h3>Goose</h3>
+    <span class="tag">Block, now Agentic AI Foundation · Rust + Electron · ACP, recipes</span>
+    <ul>
+      <li>A Rust workspace (core, CLI, server) plus an Electron desktop app that talks to its backend over <strong>ACP</strong>. <code>goose acp</code> serves ACP over stdio, and <code>goose serve</code> over HTTP/WebSocket with a secret key.</li>
+      <li><strong>Extensions are MCP servers</strong> (built-in, stdio, remote). MCP Apps render interactive UIs in the desktop app.</li>
+      <li><strong>Recipes</strong> are YAML files with instructions, a prompt, extensions, settings, <code>{{ parameters }}</code>, retries with shell checks, a <code>json_schema</code> structured response and sub-recipes. They can be shared, deep-linked and run on a cron schedule.</li>
+      <li><strong>Subagents</strong> come from the <code>summon</code> extension. They run sequentially or in parallel (up to 5), have turn and time limits, and can’t spawn further subagents.</li>
+      <li><strong>Adversary mode:</strong> a reviewer model sees the task and each shell call and returns ALLOW or BLOCK. It fails open.</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <h3>DeepSeek Harness (<code>dsh</code>)</h3>
+    <span class="tag">deepseek-ai · TypeScript/Node · everything is a plugin</span>
+    <ul>
+      <li><strong>Runtime</strong> with web, headless, SDK and ACP profiles, plus an Electron app. The model adapter, tool registry, session log and <em>agent loop itself</em> are swappable plugins.</li>
+      <li><strong>“Model-visible means logged”:</strong> every model request can be rebuilt from the append-only, versioned session log (<code>session.vN.jsonl</code>, with migrations). History is derived from the log rather than stored separately.</li>
+      <li><strong>Sandbox seam:</strong> every spawn goes through a sandbox backend, and approval policy is a plugin. Subagents, a shared task board (“Agent Teams”) and turn-boundary forks are also included.</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <h3>CodeWhale and Whale</h3>
+    <span class="tag">CodeWhale: Rust, ex-deepseek-tui · Whale: Go, now archived</span>
+    <ul>
+      <li><strong>Modes:</strong> Plan (read-only), Work, and Operate (runs until the goal is verified). Permission levels are Ask, Auto-Review (a reviewer model approves routine calls) and Full Access.</li>
+      <li><strong>OS sandbox:</strong> Seatbelt on macOS, bubblewrap on Linux. Inside it, the shell can’t read <code>~/.ssh</code>, <code>~/.aws</code> or <code>.env</code>.</li>
+      <li><strong>Receipts</strong> (<code>/receipts</code>) record every changed file, command, web or MCP call, subagent and approval. <code>/undo</code> reverts the last request, and <code>/restore</code> rolls back to a snapshot.</li>
+      <li><strong>Claude Code compatibility,</strong> opt-in: it can import <code>CLAUDE.md</code>, settings, MCP config and skill/command plugins.</li>
+      <li><strong>Front ends:</strong> <code>exec</code>, <code>web</code>, <code>review --pr N</code>, <code>app-server --http</code> and <code>serve --acp</code>.</li>
+      <li>Whale claimed very high prompt-cache hit rates from aggressive context reuse. It published no mechanism.</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <h3>Others</h3>
+    <span class="tag">From prior knowledge, not re-checked here</span>
+    <ul>
+      <li><strong>Codex CLI</strong> (Rust): OS sandboxing (Seatbelt/Landlock), an <code>apply_patch</code> edit tool, <code>AGENTS.md</code>, and an app-server JSON-RPC protocol.</li>
+      <li><strong>Claude Code:</strong> hooks, skills, subagents, plugins, MCP and checkpoints.</li>
+      <li><strong>Aider:</strong> repo maps and git-commit-per-edit.</li>
+    </ul>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="matrix">3. Comparison matrix</h2>
+
+<div class="legend">
+  <span><span class="m y">✓</span> built in</span>
+  <span><span class="m e">ext</span> via extension or plugin</span>
+  <span><span class="m p">~</span> partial</span>
+  <span><span class="m n">✗</span> none</span>
+  <span><span class="m u">?</span> not verified</span>
+</div>
+
+<div class="table-wrap">
+<table class="matrix">
+  <thead>
+    <tr><th>Capability</th><th class="syl">Syl</th><th>pi</th><th>opencode</th><th>Goose</th><th>dsh</th><th>CodeWhale</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Language</td><td class="syl-col">Rust</td><td>TS</td><td>TS (Bun)</td><td>Rust + Electron</td><td>TS</td><td>Rust</td></tr>
+    <tr><td>Headless core, separate from UI</td><td class="syl-col"><span class="m n">✗</span></td><td><span class="m y">✓ <small>SDK</small></span></td><td><span class="m y">✓ <small>server</small></span></td><td><span class="m y">✓ <small>server</small></span></td><td><span class="m y">✓</span></td><td><span class="m y">✓</span></td></tr>
+    <tr><td>One-shot / JSON event mode</td><td class="syl-col"><span class="m n">✗</span></td><td><span class="m y">✓</span></td><td><span class="m y">✓</span></td><td><span class="m y">✓</span></td><td><span class="m y">✓</span></td><td><span class="m y">✓</span></td></tr>
+    <tr><td>ACP server</td><td class="syl-col"><span class="m n">✗</span></td><td><span class="m n">✗</span></td><td><span class="m u">?</span></td><td><span class="m y">✓</span></td><td><span class="m y">✓</span></td><td><span class="m y">✓</span></td></tr>
+    <tr><td>HTTP/WebSocket API</td><td class="syl-col"><span class="m n">✗</span></td><td><span class="m n">✗</span></td><td><span class="m y">✓</span></td><td><span class="m y">✓</span></td><td><span class="m y">✓ <small>web</small></span></td><td><span class="m y">✓</span></td></tr>
+    <tr><td>Append-only session log</td><td class="syl-col"><span class="m n">✗</span></td><td><span class="m y">✓ <small>JSONL tree</small></span></td><td><span class="m y">✓</span></td><td><span class="m u">?</span></td><td><span class="m y">✓ <small>versioned</small></span></td><td><span class="m y">✓</span></td></tr>
+    <tr><td>Branch / fork sessions</td><td class="syl-col"><span class="m n">✗</span></td><td><span class="m y">✓</span></td><td><span class="m y">✓</span></td><td><span class="m u">?</span></td><td><span class="m y">✓</span></td><td><span class="m u">?</span></td></tr>
+    <tr><td>Undo / revert file changes</td><td class="syl-col"><span class="m n">✗</span></td><td><span class="m e">ext</span></td><td><span class="m y">✓</span></td><td><span class="m u">?</span></td><td><span class="m u">?</span></td><td><span class="m y">✓</span></td></tr>
+    <tr><td>Token-based compaction</td><td class="syl-col"><span class="m n">✗ <small>message count</small></span></td><td><span class="m y">✓</span></td><td><span class="m y">✓</span></td><td><span class="m u">?</span></td><td><span class="m u">?</span></td><td><span class="m u">?</span></td></tr>
+    <tr><td>Dedicated edit/write tools</td><td class="syl-col"><span class="m n">✗</span></td><td><span class="m y">✓</span></td><td><span class="m y">✓</span></td><td><span class="m y">✓</span></td><td><span class="m y">✓</span></td><td><span class="m y">✓</span></td></tr>
+    <tr><td>Parallel tool calls</td><td class="syl-col"><span class="m n">✗</span></td><td><span class="m u">?</span></td><td><span class="m u">?</span></td><td><span class="m u">?</span></td><td><span class="m u">?</span></td><td><span class="m u">?</span></td></tr>
+    <tr><td><code>AGENTS.md</code> / <code>CLAUDE.md</code></td><td class="syl-col"><span class="m n">✗</span></td><td><span class="m y">✓</span></td><td><span class="m y">✓</span></td><td><span class="m p">~ <small>.goosehints</small></span></td><td><span class="m u">?</span></td><td><span class="m y">✓ <small>opt-in</small></span></td></tr>
+    <tr><td>Permission rules</td><td class="syl-col"><span class="m n">✗</span></td><td><span class="m e">ext</span></td><td><span class="m y">✓</span></td><td><span class="m y">✓ <small>modes</small></span></td><td><span class="m y">✓ <small>plugin</small></span></td><td><span class="m y">✓</span></td></tr>
+    <tr><td>Reviewer-model approval</td><td class="syl-col"><span class="m n">✗</span></td><td><span class="m n">✗</span></td><td><span class="m n">✗</span></td><td><span class="m y">✓ <small>adversary</small></span></td><td><span class="m u">?</span></td><td><span class="m y">✓ <small>auto-review</small></span></td></tr>
+    <tr><td>Sandbox</td><td class="syl-col"><span class="m y">✓ <small>container</small></span></td><td><span class="m n">✗</span></td><td><span class="m n">✗</span></td><td><span class="m p">~</span></td><td><span class="m y">✓ <small>seam</small></span></td><td><span class="m y">✓ <small>OS</small></span></td></tr>
+    <tr><td>Audit trail / receipts</td><td class="syl-col"><span class="m p">~ <small>log file</small></span></td><td><span class="m p">~</span></td><td><span class="m y">✓ <small>diffs</small></span></td><td><span class="m u">?</span></td><td><span class="m y">✓ <small>log</small></span></td><td><span class="m y">✓</span></td></tr>
+    <tr><td>MCP client</td><td class="syl-col"><span class="m n">✗</span></td><td><span class="m e">ext</span></td><td><span class="m y">✓</span></td><td><span class="m y">✓ <small>core</small></span></td><td><span class="m u">?</span></td><td><span class="m y">✓</span></td></tr>
+    <tr><td>Agent Skills (<code>SKILL.md</code>)</td><td class="syl-col"><span class="m n">✗</span></td><td><span class="m y">✓</span></td><td><span class="m y">✓</span></td><td><span class="m u">?</span></td><td><span class="m u">?</span></td><td><span class="m y">✓</span></td></tr>
+    <tr><td>Hooks / plugins</td><td class="syl-col"><span class="m n">✗</span></td><td><span class="m y">✓ <small>TS</small></span></td><td><span class="m y">✓</span></td><td><span class="m y">✓ <small>MCP</small></span></td><td><span class="m y">✓</span></td><td><span class="m y">✓</span></td></tr>
+    <tr><td>Recipes / workflows</td><td class="syl-col"><span class="m p">~ <small>/workflow</small></span></td><td><span class="m p">~ <small>templates</small></span></td><td><span class="m y">✓ <small>commands</small></span></td><td><span class="m y">✓ <small>recipes</small></span></td><td><span class="m y">✓ <small>jobs</small></span></td><td><span class="m y">✓</span></td></tr>
+    <tr><td>Subagents</td><td class="syl-col"><span class="m p">~ <small>fetch-only</small></span></td><td><span class="m e">ext</span></td><td><span class="m y">✓</span></td><td><span class="m y">✓</span></td><td><span class="m y">✓</span></td><td><span class="m y">✓</span></td></tr>
+    <tr><td>Plan / read-only mode</td><td class="syl-col"><span class="m n">✗</span></td><td><span class="m e">ext</span></td><td><span class="m y">✓</span></td><td><span class="m p">~</span></td><td><span class="m u">?</span></td><td><span class="m y">✓</span></td></tr>
+    <tr><td>Persistent memory</td><td class="syl-col"><span class="m y">✓</span></td><td><span class="m e">ext</span></td><td><span class="m n">✗</span></td><td><span class="m y">✓</span></td><td><span class="m u">?</span></td><td><span class="m u">?</span></td></tr>
+    <tr><td>Scheduling</td><td class="syl-col"><span class="m n">✗</span></td><td><span class="m n">✗</span></td><td><span class="m y">✓ <small>exp.</small></span></td><td><span class="m y">✓ <small>cron</small></span></td><td><span class="m y">✓ <small>jobs</small></span></td><td><span class="m u">?</span></td></tr>
+    <tr><td>LSP / formatters</td><td class="syl-col"><span class="m n">✗</span></td><td><span class="m e">ext</span></td><td><span class="m y">✓</span></td><td><span class="m n">✗</span></td><td><span class="m u">?</span></td><td><span class="m u">?</span></td></tr>
+    <tr><td>Providers</td><td class="syl-col">Anthropic</td><td>~25</td><td>models.dev</td><td>85+</td><td><span class="m y">✓</span></td><td>40+</td></tr>
+    <tr><td>Cost tracking</td><td class="syl-col"><span class="m y">✓</span></td><td><span class="m y">✓</span></td><td><span class="m u">?</span></td><td><span class="m y">✓</span></td><td><span class="m u">?</span></td><td><span class="m y">✓</span></td></tr>
+    <tr><td>Desktop app</td><td class="syl-col"><span class="m n">✗ <small>Bondsmith</small></span></td><td><span class="m n">✗</span></td><td><span class="m y">✓</span></td><td><span class="m y">✓</span></td><td><span class="m y">✓</span></td><td><span class="m p">~ <small>web</small></span></td></tr>
+  </tbody>
+</table>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="principles">4. Principles for Syl</h2>
+<ol class="principles">
+  <li><strong>The container is the sandbox and the selling point.</strong> Build permissions, undo and receipts <em>around</em> the container rather than replacing it. Keep “runs everything in Podman” as the default experience, unlike pi and opencode.</li>
+  <li><strong>The core is a library; the TUI is a client.</strong> Every feature lands in the core and is exposed as events or commands. The TUI, <code>-p</code>, ACP and Bondsmith all consume the same stream.</li>
+  <li><strong>Model-visible means logged</strong> (from dsh). The session log is the source of truth. History, resume, fork, undo, receipts and Bondsmith’s timeline are all derived from it.</li>
+  <li><strong>Use standards before inventing formats.</strong> That means <code>AGENTS.md</code>, Agent Skills, MCP and ACP. Syl’s own formats (workflows, memories) should map onto them.</li>
+  <li><strong>Keep the prompt cache intact.</strong> Tool definitions and the system prompt stay frozen within a conversation, as Syl already does. Load skills and MCP instructions in ways that don’t invalidate the cached prefix (this is pi’s critique of MCP).</li>
+  <li><strong>Stay Anthropic-first, but keep a seam for other providers.</strong> One <code>ModelAdapter</code> trait, one implementation, no 80-provider matrix.</li>
+</ol>
+
+<!-- ============================================================ -->
+<h2 id="roadmap">5. Roadmap</h2>
+<p>Each phase ends in something shippable, and most phases unblock the next. Rough sizes assume one developer working with an agent.</p>
+
+<section class="phase" id="phase-0">
+  <div class="phase-head"><span class="phase-num">PHASE 0</span><h3>Core extraction</h3><span class="size">foundation · ~1–2 weeks</span></div>
+  <p>The goal is an agent loop that runs without a terminal.</p>
+  <ul>
+    <li>Create a <code>syl-core</code> crate (workspace or module) owning the agent loop, tools, sessions, compaction and the API client. <code>main.rs</code> shrinks to the TUI client.</li>
+    <li>Define an <code>AgentEvent</code> stream: <code>TurnStarted</code>, <code>TextDelta</code>, <code>ThinkingDelta</code>, <code>ToolCallStarted{id,name,input}</code>, <code>ToolCallFinished{id,output,is_error}</code>, <code>PermissionRequested</code>, <code>Usage</code>, <code>Compacted</code>, <code>TurnEnded{stop_reason}</code>, <code>Error</code>. Pair it with a command channel: <code>Prompt</code>, <code>Cancel</code>, <code>ApprovePermission</code>, <code>SetModel</code>.</li>
+    <li>Move the TUI onto that stream. It becomes the first client and stops calling into loop internals.</li>
+    <li>Add a <code>ModelAdapter</code> trait around <code>stream_turn</code>/<code>call_with_retry_shared</code>, with only the Anthropic implementation for now.</li>
+    <li>Add end-to-end tests that drive the core with a wiremock model and a fake <code>podman</code> (the pattern from <code>tests/bash_pipes.rs</code>), asserting on events.</li>
+  </ul>
+  <div class="done"><b>Done when:</b> a test runs a full tool-using turn with no TTY, and the TUI behaves exactly as before.</div>
+</section>
+
+<section class="phase" id="phase-1">
+  <div class="phase-head"><span class="phase-num">PHASE 1</span><h3>Session log and context</h3><span class="size">~1–2 weeks</span></div>
+  <ul>
+    <li>Replace <code>session.json</code> with an append-only JSONL log under <code>.syl/sessions/&lt;id&gt;.jsonl</code>. Entries carry <code>id</code>, <code>parentId</code>, <code>type</code> and a timestamp. Types are messages, tool calls and results, compaction summaries, model switches and approvals. Each line is fsynced.</li>
+    <li>Derive model history from the log (<code>derive_messages</code>). Compaction appends a summary entry instead of rewriting history, so the full transcript survives.</li>
+    <li>Add commands to list sessions, resume (<code>--continue</code>, <code>--resume</code>), fork from an entry and name sessions.</li>
+    <li>Make compaction <strong>token-based</strong>. Track the context size from <code>usage</code>, compact when within a buffer of the model’s window (for example 15%), and keep the most recent N tokens rather than 10 messages. Also run it when the API reports the context overflowed, then retry.</li>
+    <li>Spill large tool results: store the full output in the log or a file, give the model a preview plus a handle, and let <code>read_file</code> page through it.</li>
+  </ul>
+  <div class="done"><b>Done when:</b> killing Syl mid-turn loses nothing, and <code>syl --resume</code> / <code>/fork</code> work.</div>
+</section>
+
+<section class="phase" id="phase-2">
+  <div class="phase-head"><span class="phase-num">PHASE 2</span><h3>Tool parity</h3><span class="size">~1 week</span></div>
+  <ul>
+    <li>Add <code>edit_file</code> (exact string replace with a uniqueness check) and <code>write_file</code>, both executed in the container. Each returns a unified diff, which also becomes a receipt entry.</li>
+    <li>Add <code>grep</code> (ripgrep in the container), <code>glob</code> and <code>ls</code>. All three are cheap and read-only.</li>
+    <li>Run read-only tool calls (read, grep, glob, ls, memory_read) <strong>in parallel</strong>. Keep <code>run_bash</code> and edits sequential.</li>
+    <li>Load <code>AGENTS.md</code> (and <code>CLAUDE.md</code> as a fallback) from the project and its parent directories into the frozen system prompt.</li>
+    <li>Accept images in prompts (paste a path or <code>@file</code>). <code>show_image</code> already covers output.</li>
+    <li>Add a steering queue: messages typed while the agent works are delivered after the current tool calls, as in pi.</li>
+  </ul>
+  <div class="done"><b>Done when:</b> the model can work through a multi-file refactor with dedicated tools, and the TUI shows a diff for each edit.</div>
+</section>
+
+<section class="phase" id="phase-3">
+  <div class="phase-head"><span class="phase-num">PHASE 3</span><h3>Control and safety</h3><span class="size">~2 weeks</span></div>
+  <ul>
+    <li><strong>Permissions:</strong> ordered allow/ask/deny rules over <code>{tool, pattern}</code> in <code>.syl/config.toml</code>. The last match wins. <code>run_bash</code> gets a simple command splitter so <code>git status &amp;&amp; rm -rf x</code> is checked per command. Approvals can be once, always for this project, or reject. Defaults suit a container: allow everything except network egress and <code>git push</code> (ask), with deny for paths outside <code>/workspace</code>.</li>
+    <li><strong>Checkpoints and undo:</strong> before each turn that changes files, snapshot the workspace with a shadow git repository (<code>git --git-dir=.syl/shadow.git --work-tree=/workspace</code>) so the user’s own git history isn’t touched. <code>/undo</code> reverts the last turn, and <code>/restore &lt;n&gt;</code> goes back further. Revert is staged and then committed, as in opencode.</li>
+    <li><strong>Receipts:</strong> a <code>/receipts</code> view derived from the log, listing files changed, commands run, URLs fetched and approvals given for each turn.</li>
+    <li><strong>Modes:</strong> <code>plan</code> (read-only tools; edits and writing <code>run_bash</code> denied by rule) and <code>build</code>. Toggle with a key and show the mode in the status bar.</li>
+    <li><strong>Optional reviewer:</strong> a cheap-model ALLOW/BLOCK check for ask items, so they can be auto-approved (from Goose’s adversary mode and CodeWhale’s Auto-Review). Unlike Goose, it should fail <strong>closed</strong>.</li>
+    <li><strong>Container hardening:</strong> an optional network-off mode (<code>--network=none</code>, with an allowlist proxy later) and per-project resource limits in config.</li>
+  </ul>
+  <div class="done"><b>Done when:</b> <code>rm -rf</code> inside a turn can be undone in one keystroke, and plan mode can’t change files.</div>
+</section>
+
+<section class="phase key" id="phase-4">
+  <div class="phase-head"><span class="phase-num">PHASE 4</span><h3>Headless modes and ACP</h3><span class="size">the Bondsmith seam · ~2 weeks</span></div>
+  <ul>
+    <li><code>syl -p "prompt"</code> runs one turn and prints the answer. <code>--output json</code> streams <code>AgentEvent</code>s as JSONL, which also serves CI and scripting.</li>
+    <li><code>syl acp</code> runs an <strong>ACP agent over stdio</strong> supporting <code>initialize</code>, <code>session/new</code> (cwd, mcpServers), <code>session/prompt</code>, <code>session/load</code>, <code>session/cancel</code>, <code>session/request_permission</code>, and <code>session/update</code> notifications (message chunks, tool calls, tool call updates). Map <code>AgentEvent</code> onto it one to one.</li>
+    <li>Run one container per project, shared across sessions, and allow several sessions per process. This is needed once Bondsmith opens more than one tab on a project.</li>
+    <li>Test it against Zed’s ACP client and the ACP SDK’s test harness, so Bondsmith isn’t the first and only client.</li>
+    <li>Later: <code>syl serve</code> with ACP over WebSocket and a shared-secret header, as <code>goose serve</code> does, for a Bondsmith instance on another machine.</li>
+  </ul>
+  <div class="done"><b>Done when:</b> Zed can drive Syl as an external agent, including approvals and cancel.</div>
+</section>
+
+<section class="phase" id="phase-5">
+  <div class="phase-head"><span class="phase-num">PHASE 5</span><h3>Extensibility</h3><span class="size">~2–3 weeks</span></div>
+  <ul>
+    <li><strong>MCP client:</strong> stdio and Streamable HTTP servers configured in <code>.syl/config.toml</code>. Namespace tools as <code>server__tool</code>. Load them when a conversation starts and freeze them with the system prompt to protect the cache. Inject server instructions. Decide whether MCP servers run inside the container (the default, for safety) or on the host (opt-in, for things like browsers).</li>
+    <li><strong>Skills:</strong> discover <code>SKILL.md</code> directories in <code>.syl/skills/</code>, <code>~/.syl/skills/</code> and <code>.agents/skills/</code>. Put only names and descriptions in the system prompt, and load the full skill on demand, either through a <code>skill</code> tool or <code>/skill:name</code>.</li>
+    <li><strong>Hooks:</strong> shell commands configured for <code>pre_tool</code>, <code>post_tool</code>, <code>turn_end</code> and <code>session_start</code>. They get JSON on stdin, and a non-zero exit blocks. This is the simplest extension point and needs no plugin runtime.</li>
+    <li><strong>Workflows become recipes.</strong> Keep the markdown format, and add <code>{{params}}</code>, retry-with-check steps, the model and tools to use, and an optional JSON schema for structured output. Workflows that only run commands keep working as they do now.</li>
+    <li>Custom slash commands as prompt templates in <code>.syl/commands/*.md</code>.</li>
+    <li>Hold off on a full plugin runtime (pi-style TypeScript or Wasm) until hooks, MCP and skills prove insufficient.</li>
+  </ul>
+</section>
+
+<section class="phase" id="phase-6">
+  <div class="phase-head"><span class="phase-num">PHASE 6</span><h3>Multi-agent</h3><span class="size">~2 weeks</span></div>
+  <ul>
+    <li>A <code>task</code> tool that runs a <strong>subagent in a child session</strong>. It gets fresh context, the parent’s container, a restricted toolset (for example read-only <code>explore</code>) and its own turn and token budget, and returns only a summary. The depth limit is 1. Child sessions show up in the log and in ACP as nested sessions.</li>
+    <li>Agent definitions are markdown with frontmatter (<code>description</code>, <code>model</code>, <code>tools</code>, <code>permissions</code>) in <code>.syl/agents/</code>, the shape opencode and Claude Code use.</li>
+    <li>Parallel subagents (bounded, for example at 4) for fan-out research.</li>
+    <li>Make <code>dispatch_agent</code> an <code>explore</code>/<code>fetch</code> subagent instead of a special case.</li>
+  </ul>
+</section>
+
+<section class="phase" id="later">
+  <div class="phase-head"><span class="phase-num">LATER</span><h3>Optional</h3></div>
+  <ul>
+    <li><strong>LSP diagnostics after edits,</strong> run inside the container. These are high value for typed languages.</li>
+    <li><strong>Scheduled recipes</strong> (cron), which Bondsmith may own instead of Syl.</li>
+    <li><strong>More providers</strong> through the <code>ModelAdapter</code> seam: OpenAI-compatible and local models (Ollama/vLLM) for cheap subagents and compaction.</li>
+    <li><strong>Session export</strong> to HTML or markdown, and sharing.</li>
+    <li><strong>Code Mode:</strong> the model writes one script that calls several tools (opencode, CodeWhale). Worth trying once MCP is in place, since token savings on tool-heavy tasks can be large.</li>
+  </ul>
+</section>
+
+<!-- ============================================================ -->
+<h2 id="bondsmith">6. What Bondsmith needs from Syl</h2>
+<p>If Bondsmith is a meta-harness, its natural shape is an <strong>ACP client that hosts many agents</strong>. Syl would be the reference agent, with Goose, CodeWhale, Claude Code (via <code>claude-acp</code>) and Codex (via <code>codex-acp</code>) as peers. The contract Syl should meet:</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Bondsmith needs</th><th>Syl provides</th><th>Phase</th></tr></thead>
+  <tbody>
+    <tr><td>Start, stop and cancel agents in any project</td><td><code>syl acp</code> + one container per project</td><td>4</td></tr>
+    <tr><td>Streamed text, thinking and tool activity</td><td><code>AgentEvent</code> → <code>session/update</code></td><td>0, 4</td></tr>
+    <tr><td>Approval UI</td><td><code>session/request_permission</code> backed by the rule engine</td><td>3, 4</td></tr>
+    <tr><td>Session list, resume, fork and timeline</td><td>Append-only log + <code>session/load</code></td><td>1, 4</td></tr>
+    <tr><td>Diffs, undo and receipts per turn</td><td>Shadow-git checkpoints + receipts derived from the log</td><td>3</td></tr>
+    <tr><td>Shared MCP servers across agents</td><td><code>session/new</code> accepts <code>mcpServers</code></td><td>4, 5</td></tr>
+    <tr><td>Cost and usage per agent</td><td><code>Usage</code> events</td><td>0</td></tr>
+    <tr><td>Several sessions at once</td><td>Multi-session core</td><td>4</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h3>Two design questions to settle early</h3>
+<p>These shape Phases 0–4.</p>
+<ol>
+  <li><strong>Where does the sandbox live?</strong> If Bondsmith hosts agents that have no sandbox of their own (pi, Claude Code), it may want Syl’s container machinery as a shared service (“run any ACP agent inside a Syl container”). That argues for <code>syl-container</code> as a separate crate from the start.</li>
+  <li><strong>Who owns memory, workflows and schedules: Syl or Bondsmith?</strong> If Bondsmith shares them across agents, keep Syl’s formats plain files (they already are) and let Bondsmith read the same <code>.syl/</code> directory, rather than building Syl-specific APIs for them.</li>
+</ol>
+
+<!-- ============================================================ -->
+<h2 id="order">7. Suggested order</h2>
+
+<div class="flow" role="img" aria-label="Phase 0 comes first. Phases 1, 2 and 3 follow in parallel. Phase 4 follows them, and Bondsmith work can start there. Phases 5 and 6 come after Phase 4.">
+  <div class="flow-row"><div class="box"><b>PHASE 0</b>Core + events</div></div>
+  <div class="arrow">↓ then, in parallel</div>
+  <div class="flow-row">
+    <div class="box"><b>PHASE 1</b>Session log + token compaction</div>
+    <div class="box"><b>PHASE 2</b>Edit/grep/glob, AGENTS.md, parallel reads</div>
+    <div class="box"><b>PHASE 3</b>Permissions, undo, plan mode</div>
+  </div>
+  <div class="arrow">↓</div>
+  <div class="flow-row"><div class="box key"><b>PHASE 4</b>-p / JSON / ACP · Bondsmith can start here</div></div>
+  <div class="arrow">↓</div>
+  <div class="flow-row">
+    <div class="box"><b>PHASE 5</b>MCP, skills, hooks, recipes</div>
+    <div class="box"><b>PHASE 6</b>Subagents</div>
+  </div>
+</div>
+<p>Phases 1–3 can run in parallel once Phase 0 lands. Bondsmith work can begin against Phase 4 using <code>syl -p --output json</code> as a stopgap before ACP is finished.</p>
+
+<!-- ============================================================ -->
+<h2 id="sources">8. Sources and gaps</h2>
+<ul>
+  <li><strong>pi:</strong> <a href="https://unpkg.com/@mariozechner/pi-coding-agent@0.73.1/README.md">README (0.73.1)</a>, <a href="https://lucumr.pocoo.org/2026/1/31/pi.md">Armin Ronacher on pi</a></li>
+  <li><strong>opencode:</strong> <a href="https://opencode.ai/docs">docs</a>, <a href="https://opencode.ai/docs/agents">agents</a>, <a href="https://opencode.ai/docs/permissions">permissions</a>, <a href="https://opencode.ai/docs/server">server API</a></li>
+  <li><strong>Goose:</strong> <a href="https://goose-docs.ai">goose-docs.ai</a>, <a href="https://goose-docs.ai/docs/guides/recipes/session-recipes">recipes</a>, <a href="https://goose-docs.ai/docs/guides/context-engineering/subagents">subagents</a>, <a href="https://goose-docs.ai/docs/guides/security/adversary-mode">adversary mode</a>, <a href="https://goose-docs.ai/docs/oi-kit/acp/">ACP</a></li>
+  <li><strong>DeepSeek Harness:</strong> <a href="https://github.com/deepseek-ai/deepseek-harness">repo</a>, <a href="https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/architecture.md">architecture</a>, <a href="https://india.entrepreneur.com/business-news/deepseek-releases-open-source-coding-agent-to-rival-claude-code">Entrepreneur coverage</a></li>
+  <li><strong>CodeWhale and Whale:</strong> <a href="https://github.com/Hmbown/CodeWhale">CodeWhale</a>, <a href="https://github.com/usewhale/whale">Whale</a></li>
+</ul>
+<p class="small"><strong>Gaps:</strong> Goose’s internal architecture pages had been removed (HTTP 410), so its crate layout, compaction and session storage are unverified. The same goes for opencode’s LSP-diagnostic feedback and snapshot mechanism, and for dsh’s MCP and caching details. Cells marked “?” in the matrix are unverified, not missing.</p>
+
+<footer class="small">Syl · Sylphrena roadmap · <code>docs/roadmap.html</code></footer>
+
+</main>
+</body>
+</html>
