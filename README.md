@@ -50,11 +50,11 @@ On first run Syl pulls an Ubuntu base image, installs dev tools, and bakes a cac
 
 | Flag | Default | Description |
 |---|---|---|
-| `--model <name>` | `claude-opus-4-6` | Starting model (switch live with `/model`) |
+| `--model <name>` | `claude-opus-5-5` | Starting model (switch live with `/model`) |
 | `--backend <name>` | `anthropic` | `anthropic` or `bedrock` |
 | `--rate-limit <n>` | `60000` | Token-per-minute budget |
 | `--timeout <secs>` | `120` | Request timeout |
-| `--thinking <n>` | — | Extended thinking token budget |
+| `--thinking <n>` | — | Extended thinking token budget. On adaptive-thinking models (Opus 4.7+, all 5.x models, including the default) the budget is ignored and Syl streams summarized thinking instead |
 | `--image <mode>` | `auto` | `kitty` / `iterm2` / `sixel` / `symbols` |
 | `--resume` | — | Reload the saved session from `.syl/session.json` |
 | `--fresh` | — | Nuke the container and start clean |
@@ -105,7 +105,7 @@ Claude has eight built-in tools inside the container:
 ```bash
 syl                          # standard session
 syl --backend bedrock        # route through AWS Bedrock
-syl --thinking 8000          # enable extended thinking
+syl --thinking 8000          # show Claude's thinking as it streams
 syl --resume                 # continue previous conversation
 syl --fresh                  # clean slate (new container)
 syl --no-banner --model claude-haiku-4-5   # quick, lightweight session

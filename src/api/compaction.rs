@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use crate::api::client::{call_with_retry_shared, SystemBlock};
-use crate::api::types::{ContentBlock, Message, MessageContent};
+use crate::api::types::{ContentBlock, Message, MessageContent, StopReason};
 use crate::config::AppConfig;
 use crate::shared::SharedState;
 
@@ -16,19 +16,57 @@ pub const COMPACT_KEEP: usize = 10;
 const COMPACT_MODEL:    &str  = "claude-haiku-4-5-20251001";
 
 // ---------------------------------------------------------------------------
-// Existing helpers (unchanged)
+// History helpers
 // ---------------------------------------------------------------------------
 
-/// Drop leading messages until the first plain user text message.
-/// Returns empty vec if none found.
-pub fn find_valid_start(msgs: Vec<Message>) -> Vec<Message> {
-    let pos = msgs.iter().position(|m| {
-        m.role == "user" && matches!(m.content, MessageContent::Text(_))
-    });
-    match pos {
-        Some(i) => msgs[i..].to_vec(),
-        None    => vec![],
+/// The content to store in history for an assistant turn that stopped with
+/// `stop`. Only a `tool_use` stop gets its tools run and answered; any
+/// `tool_use` block in another turn (cut off by `max_tokens`, say) would be
+/// left without a `tool_result`, which fails every later request, so it is
+/// dropped. A turn left empty gets a placeholder text block.
+pub fn drop_unanswered_tool_uses(content: &[ContentBlock], stop: &StopReason) -> Vec<ContentBlock> {
+    if *stop == StopReason::ToolUse {
+        return content.to_vec();
     }
+    let mut kept: Vec<ContentBlock> = content
+        .iter()
+        .filter(|b| !matches!(b, ContentBlock::ToolUse { .. }))
+        .cloned()
+        .collect();
+    if !kept.iter().any(|b| !b.is_thinking()) {
+        kept.push(ContentBlock::Text { text: "(no response)".to_string(), cache_control: None });
+    }
+    kept
+}
+
+/// Remove every `thinking` and `redacted_thinking` block from `msgs`.
+///
+/// Thinking blocks are signed against everything that came before them. After
+/// history is rewritten (compaction, or a resumed session under a new system
+/// prompt) none of the old blocks would pass the prefix check on models with
+/// preserved thinking, so all of them are dropped: with no old thinking sent
+/// back there is nothing to fail, and new turns produce fresh blocks. An
+/// assistant message left empty gets a placeholder text block so roles keep
+/// alternating.
+pub fn strip_thinking(msgs: Vec<Message>) -> Vec<Message> {
+    msgs.into_iter()
+        .map(|m| match m.content {
+            MessageContent::Blocks(blocks) if m.role == "assistant" => {
+                let mut kept: Vec<ContentBlock> = blocks
+                    .into_iter()
+                    .filter(|b| !b.is_thinking())
+                    .collect();
+                if kept.is_empty() {
+                    kept.push(ContentBlock::Text {
+                        text: "(continued)".to_string(),
+                        cache_control: None,
+                    });
+                }
+                Message { role: m.role, content: MessageContent::Blocks(kept) }
+            }
+            content => Message { role: m.role, content },
+        })
+        .collect()
 }
 
 /// Build compacted message history from a summary + kept messages.
@@ -92,7 +130,8 @@ fn messages_to_text(msgs: &[Message]) -> String {
                     ContentBlock::Text { text, .. }              => Some(text.clone()),
                     ContentBlock::ToolUse { name, input, .. }    => Some(format!("[tool_use: {} {}]", name, input)),
                     ContentBlock::ToolResult { content, .. }     => Some(format!("[tool_result: {}]", content)),
-                    ContentBlock::Thinking { .. }                => None,
+                    ContentBlock::Thinking { .. }
+                    | ContentBlock::RedactedThinking { .. }      => None,
                 }).collect::<Vec<_>>().join("\n")
             }
         };
@@ -149,9 +188,39 @@ pub async fn summarize_messages(
 // Public compact_history entry point
 // ---------------------------------------------------------------------------
 
+/// Where the kept tail of the history starts, and how it must be framed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeepBoundary {
+    /// Tail starts at a plain user text message: use the usual
+    /// `[user summary, assistant ack, ...tail]` framing.
+    UserText(usize),
+    /// Tail starts at an assistant message (mid tool chain, no plain user
+    /// message in the window): frame as `[user summary, ...tail]` so roles
+    /// still alternate and every tool_result keeps its matching tool_use.
+    Assistant(usize),
+}
+
+/// Choose the absolute index at which the kept tail begins, searching forward
+/// from `len - COMPACT_KEEP`. Returns None if no safe boundary exists.
+pub fn choose_keep_boundary(messages: &[Message]) -> Option<KeepBoundary> {
+    let window_start = messages.len().saturating_sub(COMPACT_KEEP);
+    let window = &messages[window_start..];
+    if let Some(i) = window
+        .iter()
+        .position(|m| m.role == "user" && matches!(m.content, MessageContent::Text(_)))
+    {
+        return Some(KeepBoundary::UserText(window_start + i));
+    }
+    window
+        .iter()
+        .position(|m| m.role == "assistant")
+        .map(|i| KeepBoundary::Assistant(window_start + i))
+}
+
 /// Compact the conversation history when it exceeds MAX_HISTORY messages.
-/// Summarises the oldest messages via Haiku and keeps the COMPACT_KEEP most
-/// recent messages, preserving a valid user-first start.
+/// Summarises the oldest messages via Haiku and keeps (roughly) the
+/// COMPACT_KEEP most recent ones, always producing a valid user-first,
+/// role-alternating history. Safe to call mid-turn, inside a tool chain.
 pub async fn compact_history(
     messages: Vec<Message>,
     http:     &reqwest::Client,
@@ -163,9 +232,15 @@ pub async fn compact_history(
         return messages;
     }
 
-    let keep_start = messages.len() - COMPACT_KEEP;
+    let Some(boundary) = choose_keep_boundary(&messages) else {
+        tracing::warn!("compaction: no safe boundary in recent window — skipping");
+        return messages;
+    };
+    let keep_start = match boundary {
+        KeepBoundary::UserText(i) | KeepBoundary::Assistant(i) => i,
+    };
     let old  = messages[..keep_start].to_vec();
-    let keep = find_valid_start(messages[keep_start..].to_vec());
+    let keep = strip_thinking(messages[keep_start..].to_vec());
 
     tracing::info!(
         old = old.len(), keep = keep.len(),
@@ -176,5 +251,20 @@ pub async fn compact_history(
     if summary.is_none() {
         tracing::warn!("compaction summary failed — keeping recent messages only");
     }
-    build_compacted_messages(summary.as_deref(), keep)
+
+    match boundary {
+        KeepBoundary::UserText(_) => build_compacted_messages(summary.as_deref(), keep),
+        KeepBoundary::Assistant(_) => {
+            let lead = match summary.as_deref() {
+                Some(s) => format!("[Context summary of earlier conversation]\n{}", s),
+                None => "[Earlier conversation was dropped to save context.]".to_string(),
+            };
+            let mut result = vec![Message {
+                role:    "user".to_string(),
+                content: MessageContent::Text(lead),
+            }];
+            result.extend(keep);
+            result
+        }
+    }
 }

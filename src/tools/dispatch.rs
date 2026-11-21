@@ -1,6 +1,6 @@
 /// `dispatch_agent` tool — fetches a URL and processes it via a Haiku sub-agent.
 ///
-/// See `docs/dispatch-agent-rs-design.md` for the full design.
+/// See the "Output Handling" section of `docs/architecture.md`.
 use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
@@ -167,12 +167,12 @@ async fn fetch_source(
     let cmd = if is_pdf {
         format!(
             "ts=$(date +%s%N); f=/tmp/syl_dp_$ts.pdf; \
-             curl -sL -A 'Mozilla/5.0' --max-time 30 '{}' -o \"$f\" \
+             curl -sL -A 'Mozilla/5.0' --max-time 30 {} -o \"$f\" \
              && pdftotext \"$f\" - && rm -f \"$f\"",
-            source
+            crate::util::shell_quote(source)
         )
     } else {
-        format!("curl -sL -A 'Mozilla/5.0' --max-time 30 '{}'", source)
+        format!("curl -sL -A 'Mozilla/5.0' --max-time 30 {}", crate::util::shell_quote(source))
     };
 
     let running = std::sync::Arc::new(std::sync::Mutex::new(None));

@@ -3,7 +3,8 @@
 use std::path::Path;
 use std::process::Command;
 
-use crate::config::{AppConfig, BAKED_IMAGE, CONTAINER_NAME};
+use crate::config::{container_name, AppConfig, BAKED_IMAGE, LEGACY_CONTAINER_NAME};
+use crate::util::shell_quote;
 
 // ---------------------------------------------------------------------------
 // Marker file helpers
@@ -29,7 +30,7 @@ pub fn write_container_marker(session_dir: &Path) -> anyhow::Result<()> {
 
 fn podman_inspect_id() -> anyhow::Result<String> {
     let out = Command::new("podman")
-        .args(["inspect", "--format", "{{.Id}}", CONTAINER_NAME])
+        .args(["inspect", "--format", "{{.Id}}", container_name()])
         .output()?;
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
@@ -41,7 +42,7 @@ fn podman_inspect_id() -> anyhow::Result<String> {
 /// Returns `true` if the container is in Running state.
 pub fn container_alive() -> bool {
     let out = Command::new("podman")
-        .args(["inspect", "-f", "{{.State.Running}}", CONTAINER_NAME])
+        .args(["inspect", "-f", "{{.State.Running}}", container_name()])
         .output();
     match out {
         Ok(o) => String::from_utf8_lossy(&o.stdout).trim().contains("true"),
@@ -120,13 +121,13 @@ fn configure_git_and_ssh(config: &AppConfig) {
     let email = sh_output("git config --global user.email").unwrap_or_default();
     if !name.is_empty() {
         let _ = exec_command_raw(
-            &format!("git config --global user.name '{name}'"),
+            &format!("git config --global user.name {}", shell_quote(&name)),
             config,
         );
     }
     if !email.is_empty() {
         let _ = exec_command_raw(
-            &format!("git config --global user.email '{email}'"),
+            &format!("git config --global user.email {}", shell_quote(&email)),
             config,
         );
     }
@@ -135,7 +136,7 @@ fn configure_git_and_ssh(config: &AppConfig) {
 /// Check that /workspace is a live bind-mount inside the container.
 fn workspace_mounted(_config: &AppConfig) -> bool {
     let out = Command::new("podman")
-        .args(["exec", CONTAINER_NAME, "mountpoint", "-q", "/workspace"])
+        .args(["exec", container_name(), "mountpoint", "-q", "/workspace"])
         .output();
     matches!(out, Ok(o) if o.status.success())
 }
@@ -156,20 +157,31 @@ pub fn cold_start(config: &AppConfig) -> anyhow::Result<()> {
     }
 
     let ssh_vol = if Path::new(&ssh_dir).exists() {
-        format!("-v {ssh_dir}:/root/.ssh:ro ")
+        format!("-v {}:/root/.ssh:ro ", shell_quote(&ssh_dir))
     } else {
         String::new()
     };
 
+    // Mount .syl/ read-only over the workspace copy so code running in the
+    // container can't rewrite Syl's own memory (injected into the system
+    // prompt), workflows (run as commands), session or log.
+    let syl_dir = format!("{project_dir}/.syl");
+    let _ = std::fs::create_dir_all(&syl_dir);
+    let syl_vol = format!("-v {}:/workspace/.syl:ro ", shell_quote(&syl_dir));
+
+    let name = container_name();
     sh(&format!(
-        "podman run -d --name {CONTAINER_NAME} \
+        "podman run -d --name {name} \
          --memory=2g \
          -e TERM=xterm-256color \
-         -e TERM_PROGRAM={term_program} \
-         -v {project_dir}:/workspace:rw \
+         -e TERM_PROGRAM={term} \
+         -v {ws}:/workspace:rw \
+         {syl_vol}\
          {ssh_vol}\
          --workdir /workspace \
-         -it {base} /bin/bash"
+         -it {base} /bin/bash",
+        term = shell_quote(&term_program),
+        ws = shell_quote(&project_dir),
     ))?;
 
     configure_git_and_ssh(config);
@@ -179,15 +191,39 @@ pub fn cold_start(config: &AppConfig) -> anyhow::Result<()> {
         exec_command_raw(SETUP_TOOLS_CMD, config)
             .map_err(|e| anyhow::anyhow!("tool install failed: {}", e))?;
         println!("[Syl Setup] Baking image for fast restarts...");
-        sh(&format!("podman commit {CONTAINER_NAME} {BAKED_IMAGE}"))?;
+        sh(&format!("podman commit {} {BAKED_IMAGE}", container_name()))?;
         println!("[Syl Setup] Image cached as {BAKED_IMAGE}.");
     }
 
     Ok(())
 }
 
+/// Remove a container left by an older Syl that used the single shared name
+/// `syl-agent`, but only when its /workspace is *this* project, so another
+/// project's session is never touched.
+fn remove_legacy_container() {
+    let out = Command::new("podman")
+        .args([
+            "inspect",
+            "--format",
+            "{{range .Mounts}}{{if eq .Destination \"/workspace\"}}{{.Source}}{{end}}{{end}}",
+            LEGACY_CONTAINER_NAME,
+        ])
+        .output();
+    let Ok(out) = out else { return };
+    if !out.status.success() {
+        return;
+    }
+    let source = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let here = std::env::current_dir().unwrap_or_default();
+    let here = here.canonicalize().unwrap_or(here);
+    if !source.is_empty() && Path::new(&source) == here.as_path() {
+        let _ = Command::new("podman").args(["rm", "-f", LEGACY_CONTAINER_NAME]).output();
+    }
+}
+
 pub fn nuke_container(hard: bool) {
-    let _ = sh(&format!("podman rm -f {CONTAINER_NAME}"));
+    let _ = sh(&format!("podman rm -f {}", container_name()));
     if hard {
         let _ = sh(&format!("podman rmi -f {BAKED_IMAGE}"));
     }
@@ -214,7 +250,7 @@ pub fn start_or_resume(config: &AppConfig, session_dir: &Path) -> anyhow::Result
 
     if resume {
         println!("Resuming container...");
-        let _ = sh(&format!("podman start {CONTAINER_NAME}"));
+        let _ = sh(&format!("podman start {}", container_name()));
         configure_git_and_ssh(config);
 
         if !workspace_mounted(config) {
@@ -223,6 +259,7 @@ pub fn start_or_resume(config: &AppConfig, session_dir: &Path) -> anyhow::Result
             cold_start(config)?;
         }
     } else {
+        remove_legacy_container();
         nuke_container(fresh);
         cold_start(config)?;
     }
@@ -248,7 +285,7 @@ pub fn ensure_container(config: &AppConfig, session_dir: &Path) -> anyhow::Resul
 /// This is the synchronous path used by the setup helpers.
 pub fn exec_command_raw(cmd: &str, _config: &AppConfig) -> anyhow::Result<String> {
     let out = Command::new("podman")
-        .args(["exec", CONTAINER_NAME, "/bin/bash", "-c", cmd])
+        .args(["exec", container_name(), "/bin/bash", "-c", cmd])
         .output()?;
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
@@ -281,7 +318,7 @@ pub struct ContainerStats {
 /// Non-blocking stats poll. Returns None if the container is stopped or podman fails.
 pub fn poll_stats() -> Option<ContainerStats> {
     let out = Command::new("podman")
-        .args(["stats", "--no-stream", "--format", "json", CONTAINER_NAME])
+        .args(["stats", "--no-stream", "--format", "json", container_name()])
         .output()
         .ok()?;
     if !out.status.success() { return None; }

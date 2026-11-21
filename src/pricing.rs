@@ -7,6 +7,16 @@
 use crate::api::types::Usage;
 
 pub fn compute_cost_usd(usage: &Usage, model: &str) -> f64 {
+    // Claude Opus 5.5 publishes explicit cache rates that don't follow the
+    // ratios used below: $4 in / $20 out / $0.20 cache read / $5 5-min cache write.
+    if model.contains("opus-5-5") {
+        let m = 1_000_000.0_f64;
+        return usage.input_tokens as f64 / m * 4.0
+            + usage.output_tokens as f64 / m * 20.0
+            + usage.cache_read_tokens as f64 / m * 0.20
+            + usage.cache_write_tokens as f64 / m * 5.0;
+    }
+
     // Input/output prices per 1M tokens
     let (in_price, out_price): (f64, f64) = if model.contains("opus-4") {
         (5.0, 25.0)   // claude-opus-4-x
@@ -40,6 +50,18 @@ mod tests {
         let u = Usage { output_tokens: 1_000_000, ..Default::default() };
         let cost = compute_cost_usd(&u, "claude-opus-4-6");
         assert!((cost - 25.0).abs() < 1e-9, "expected $25.00, got {cost}");
+    }
+
+    #[test]
+    fn cost_opus_5_5() {
+        let u = Usage {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            cache_read_tokens: 1_000_000,
+            cache_write_tokens: 1_000_000,
+        };
+        let cost = compute_cost_usd(&u, "claude-opus-5-5");
+        assert!((cost - 29.20).abs() < 1e-9, "expected $29.20, got {cost}");
     }
 
     #[test]

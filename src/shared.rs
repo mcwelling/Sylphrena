@@ -49,6 +49,13 @@ pub struct SharedState {
     /// `api::models::fetch_models`; initialised to the static fallback list
     /// so the picker works even before the first API response arrives.
     pub available_models: Mutex<Vec<crate::api::models::DiscoveredModel>>,
+
+    /// System prompt frozen for the current conversation.  Built when the
+    /// conversation starts (no assistant turn in history yet) and then reused
+    /// unchanged, because models with preserved thinking (Opus 5.5 and other
+    /// 5.x models) reject or drop thinking blocks once `system` changes under
+    /// them.  Also keeps the prompt cache warm.
+    pub system_prompt: Mutex<Option<Vec<crate::api::client::SystemBlock>>>,
 }
 
 impl SharedState {
@@ -64,6 +71,7 @@ impl SharedState {
             current_cancel: Mutex::new(None),
             current_model: Mutex::new(String::new()),
             available_models: Mutex::new(crate::api::models::static_fallback()),
+            system_prompt: Mutex::new(None),
         })
     }
 }

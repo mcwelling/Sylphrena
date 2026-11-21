@@ -1,8 +1,18 @@
 use std::fs;
 use std::path::Path;
 
+use crate::util::is_safe_key;
+
+fn bad_key(key: &str) -> String {
+    format!("Error: invalid memory key '{}'. Use letters, digits, '-', '_' or '.' (no '..', no leading '.').", key)
+}
+
 /// Write a memory entry. Creates the directory if needed.
 pub fn memory_write(memory_dir: &Path, key: &str, content: &str) -> String {
+    let key = key.trim();
+    if !is_safe_key(key) {
+        return bad_key(key);
+    }
     if let Err(e) = fs::create_dir_all(memory_dir) {
         return format!("Error creating memory dir: {}", e);
     }
@@ -41,6 +51,9 @@ pub fn memory_read(memory_dir: &Path, key: &str) -> String {
             }
         }
     } else {
+        if !is_safe_key(key) {
+            return bad_key(key);
+        }
         let path = memory_dir.join(format!("{}.md", key));
         match fs::read_to_string(&path) {
             Ok(s)  => s,

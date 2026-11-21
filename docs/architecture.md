@@ -106,7 +106,7 @@ Three layers protect against rate limit errors:
 
 2. **Retry with exponential backoff** — On `429` / `529` responses, retries up to 4 times with base delay 500 ms, doubling each attempt (capped at 32 s). `retry-after` headers are respected.
 
-3. **Prompt caching** — The system prompt and tools schema are marked with `cache_control: {type: ephemeral}` breakpoints, reducing input tokens on repeat calls via Anthropic's server-side prompt cache.
+3. **Prompt caching** — `cache_control: {type: ephemeral}` breakpoints go on the system prompt and on the last text block of each of the two most recent assistant turns (at most three of the API's four), reducing input tokens on repeat calls via Anthropic's server-side prompt cache.
 
 The TPM bar in the top status bar is colour-coded: green < 50%, yellow 50–80%, red ≥ 80% (when proactive throttling is active).
 
@@ -130,7 +130,7 @@ Long conversations are summarised rather than naively truncated.
                      New compact history
 ```
 
-Triggered when `len(messages) > MAX_HISTORY` (30). Compaction uses a dedicated `claude-haiku` call with `max_tokens: 2048`. If summarisation fails, the oldest messages are simply dropped so the conversation continues uninterrupted.
+Checked before **every** model call, including mid-turn inside a tool chain, and triggered when `len(messages) > MAX_HISTORY` (30). If the recent window contains no plain user message (a long tool chain), the kept tail starts at the first assistant message instead and is framed as `[user: summary] + tail`, so every `tool_result` keeps its matching `tool_use`. Compaction uses a dedicated `claude-haiku` call with `max_tokens: 2048`. If summarisation fails, the oldest messages are simply dropped so the conversation continues uninterrupted.
 
 ---
 
@@ -141,7 +141,7 @@ syl starts
    │
    ├─ marker file (.syl/container-ready) present and matches live container ID?
    │     YES → podman start {name}; verify /workspace mount still live
-   │     NO  → podman rm -f; cold start
+   │     NO  → podman rm -f (plus any legacy `syl-agent` container for this project); cold start
    │
    └─ cold start
          ├─ syl-agent-ready:latest image exists? → run from baked image (fast)
@@ -150,9 +150,13 @@ syl starts
                → podman commit → syl-agent-ready:latest (baked for next time)
 ```
 
+**Container name:** `syl-agent-<hash>`, where `<hash>` is the first 10 hex characters of SHA-256 of the canonical project path. Each project gets its own container, so several Syl sessions can run side by side. The baked image (`syl-agent-ready:latest`) is shared.
+
 Before every tool execution `ensure_container()` runs `podman inspect`. If the container has died (OOM, sleep/wake, manual removal), it is automatically resummons before the tool runs.
 
-**Container constraints:** `--memory=2g`, `/workspace` bind-mounted read-write, `~/.ssh` bind-mounted read-only.
+**Container constraints:** `--memory=2g`, `/workspace` bind-mounted read-write, `/workspace/.syl` re-mounted **read-only** (so code in the container can't rewrite Syl's memory, workflows, session or log), `~/.ssh` bind-mounted read-only. Host paths are shell-quoted, so project paths with spaces work.
+
+**Host-side tools:** `memory_*` and `workflow_*` run on the host, not in the container. Their keys are validated (`[A-Za-z0-9._-]`, no `..`, no leading `.`, ≤128 chars) so a key can never resolve outside `.syl/memory/` or `.syl/workflows/`.
 
 ---
 
@@ -194,7 +198,7 @@ Memory entries are plain markdown files in `.syl/memory/`:
     └── ship.md
 ```
 
-`memory_write` stores a note by topic key (overwrites if the key exists). `memory_read` returns a specific entry or lists all keys. All memory files are injected into the system prompt at startup, before the first user turn, so Syl has full recall from turn one without burning a tool call.
+`memory_write` stores a note by topic key (overwrites if the key exists). `memory_read` returns a specific entry or lists all keys. All memory files are injected into the system prompt when a conversation starts (startup, or after `/clear`), so Syl has full recall from turn one without burning a tool call.
 
 ---
 
@@ -220,13 +224,17 @@ Run with `/workflow <name>`. List all with `/workflow`. Claude can create and de
 
 ## Output Handling
 
-Tool output is processed through three layers:
+Tool output is processed before it reaches the model (`process_tool_output` in `src/util.rs`):
 
-1. **Display cap** — `run_bash` output is shown capped at 40 lines in the TUI with a `... (N more lines)` trailer. The full output is still sent to the model.
+1. **HTML stripping** — Output that looks like HTML has `<script>`/`<style>` blocks and tags removed and whitespace collapsed.
 
-2. **History truncation** — Any tool result longer than `max-tool-output` is hard-truncated before being stored in conversation history to prevent context bloat.
+2. **Paging** — Output longer than 100 lines is replaced by a numbered 100-line preview with a hint to narrow the command or use `read_file`.
 
-3. **Haiku extraction** — When a command returns large or HTML output (e.g. `curl` returning a webpage), a `claude-haiku` sub-agent distils only the relevant content. The extracted summary replaces the raw output in history.
+3. **Hard truncation** — Anything still longer than `MAX_TOOL_OUTPUT` (8 000 bytes) is cut at the nearest UTF-8 character boundary with a `[truncated: N total chars]` trailer.
+
+Separately, the TUI shows `run_bash` output capped at 40 lines with a `... (N more lines)` trailer; this is display-only.
+
+For remote content, Claude can call `dispatch_agent`, which fetches a URL and has a `claude-haiku` sub-agent extract only what the task needs. That is an explicit tool call, not an automatic step applied to `run_bash` output.
 
 ---
 
@@ -249,7 +257,7 @@ Syl ── ↑ 1024  ↓ 512  · $0.0124 ── TPM ████░░ 42% ─�
 
 **Bottom bar:**
 ```
-─ claude-opus-4-6 · 120s ────────────────────────── /help  /save  /exit ─
+─ claude-opus-5-5 · 120s ────────────────────────── /help  /save  /exit ─
 ```
 
 Shows the active model, backend (when not `anthropic`), and request timeout. While a tool is running, it switches to a spinner showing the active tool name.
@@ -257,6 +265,14 @@ Shows the active model, backend (when not `anthropic`), and request timeout. Whi
 ---
 
 ## Thinking Animation
+
+**`--thinking` and adaptive models.** Models with manual extended thinking get `thinking: {type: "enabled", budget_tokens: N}`. Adaptive-thinking models (Opus 4.7 and later, and every 5.x model, including the default `claude-opus-5-5`) reject that with a 400 and always think; by default their thinking arrives *omitted* (an empty block with a signature). For those models `--thinking` sends `thinking: {type: "adaptive", display: "summarized"}` so the summarized reasoning streams in, and the budget number is ignored. See `supports_manual_thinking` in `src/config.rs`.
+
+**Thinking blocks and the prefix check.** Opus 5.5 and other models with preserved thinking sign each thinking block against everything before it, and reject (or drop) blocks if `system`, `tools` or an earlier message changed. Syl keeps conversations append-only:
+
+- Assistant turns are stored and sent back exactly as streamed, thinking blocks and signatures included.
+- The system prompt (persona, workspace snapshot, memories) is built when a conversation starts and then frozen in `SharedState::system_prompt`. It is rebuilt only while history has no assistant turn yet (new session, or after `/clear`). Memories written mid-session reach the model through the tool result, and appear in the system prompt from the next conversation.
+- Where history *is* rewritten (compaction, or `--resume` under a fresh system prompt) every old thinking block is removed with `compaction::strip_thinking`, so nothing stale is sent back.
 
 When extended thinking is enabled (`--thinking <budget>`), a windspren animation plays in the bottom status bar while Claude's thinking block streams in — an animated `≋` character drifts across a trail of `·` dots at 80 ms per frame. The animation stops the moment the first text delta arrives.
 

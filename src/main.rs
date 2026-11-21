@@ -1,6 +1,7 @@
 /// Syl — main entry point.  Phase 4: full REPL wire-up.
 use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
@@ -70,7 +71,10 @@ async fn main() -> anyhow::Result<()> {
     if config.resume && !cli.fresh && session_path.exists() {
         if let Some(msgs) = load_session(&session_path) {
             println!("[Syl] Resuming previous session...");
-            *state.messages.lock().unwrap() = msgs;
+            // The saved thinking blocks were bound to the old session's system
+            // prompt; replaying them under a new one fails the prefix check.
+            *state.messages.lock().unwrap() =
+                syl_rs::api::compaction::strip_thinking(msgs);
         }
     }
 
@@ -185,7 +189,7 @@ fn print_help() {
         "syl — AI coding assistant\n\n\
          Usage: syl [options]\n\n\
          Options:\n  \
-         --model <name>      Override model (default: claude-opus-4-6)\n  \
+         --model <name>      Override model (default: claude-opus-5-5)\n  \
          --backend <name>    anthropic | bedrock  (default: anthropic)\n  \
          --rate-limit <n>    TPM budget  (default: 60000)\n  \
          --timeout <secs>    Request timeout in seconds  (default: 120)\n  \
@@ -426,20 +430,6 @@ async fn main_loop(
         if let Err(e) = save_session(session_path, &msgs) {
             tracing::warn!("session save failed: {e}");
         }
-
-        // Compact history if it has grown too long
-        {
-            let msgs = state.messages.lock().unwrap().clone();
-            let compacted = syl_rs::api::compaction::compact_history(
-                msgs,
-                http,
-                config,
-                &state,
-                CancellationToken::new(),
-            )
-            .await;
-            *state.messages.lock().unwrap() = compacted;
-        }
     }
 
     Ok(())
@@ -553,56 +543,122 @@ async fn run_agent_turn(
     }
 
     loop {
-        // Build system prompt each iteration (memory/workspace may have changed)
-        let workspace = gather_workspace_context(project_dir);
-        let sys_blocks = build_system_blocks(&workspace, memory_dir);
-        let system: Vec<SystemBlock> = sys_blocks
-            .into_iter()
-            .filter_map(|b| match b {
-                ContentBlock::Text {
-                    text,
-                    cache_control,
-                } => Some(if cache_control.is_some() {
-                    SystemBlock::cached(text)
-                } else {
-                    SystemBlock::text(text)
-                }),
-                _ => None,
-            })
-            .collect();
+        // The system prompt (persona + workspace snapshot + memories) is built
+        // once per conversation and then frozen: editing `system` mid-
+        // conversation fails the thinking-block prefix check on Opus 5.5 and
+        // other models with preserved thinking.  It is rebuilt only while no
+        // assistant turn exists yet (new session or after /clear).
+        let system: Vec<SystemBlock> = {
+            let fresh_conversation = !state
+                .messages
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|m| m.role == "assistant");
+            let mut cached = state.system_prompt.lock().unwrap();
+            if fresh_conversation || cached.is_none() {
+                let workspace = gather_workspace_context(project_dir);
+                let blocks: Vec<SystemBlock> = build_system_blocks(&workspace, memory_dir)
+                    .into_iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::Text {
+                            text,
+                            cache_control,
+                        } => Some(if cache_control.is_some() {
+                            SystemBlock::cached(text)
+                        } else {
+                            SystemBlock::text(text)
+                        }),
+                        _ => None,
+                    })
+                    .collect();
+                *cached = Some(blocks);
+            }
+            cached.clone().unwrap_or_default()
+        };
+
+        // Compact before every model call, not just between user messages:
+        // a long tool chain inside one turn can otherwise grow without bound.
+        // (No-op until history exceeds MAX_HISTORY.)
+        {
+            let msgs = state.messages.lock().unwrap().clone();
+            if msgs.len() > syl_rs::api::compaction::MAX_HISTORY {
+                let compacted = syl_rs::api::compaction::compact_history(
+                    msgs,
+                    http,
+                    config,
+                    state,
+                    cancel.clone(),
+                )
+                .await;
+                *state.messages.lock().unwrap() = compacted;
+            }
+        }
 
         let messages = state.messages.lock().unwrap().clone();
 
+        // Rows are read live by the callbacks so a resize mid-stream is honoured
+        // without restarting the request.
+        let live_rows = Arc::new(AtomicU16::new(*rows));
+
         let notify_fn = {
             let st = state.clone();
-            let r = *rows;
+            let lr = live_rows.clone();
             move |msg: &str| {
+                let r = lr.load(Ordering::Relaxed);
                 let _ = terminal::print_to_scroll(&st.stdout, &format!("{msg}\r\n"), r);
             }
         };
 
         // Per-iteration flag: did any text deltas arrive this turn?
-        let streaming_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let streaming_started = Arc::new(AtomicBool::new(false));
 
         let on_delta = {
             let st = state.clone();
-            let r = *rows;
+            let lr = live_rows.clone();
             let ss = streaming_started.clone();
-            move |delta: BlockDeltaEvent| handle_stream_delta(&st, delta, r, &ss)
+            move |delta: BlockDeltaEvent| {
+                handle_stream_delta(&st, delta, lr.load(Ordering::Relaxed), &ss)
+            }
         };
 
-        let result = tokio::select! {
-            r = call_with_retry_shared(http, config, state, &messages, &system, cancel.clone(), notify_fn, on_delta) => r,
-            _ = drain_resize_during_turn(resize_rx, state, rows, cols) => {
-                if streaming_started.load(std::sync::atomic::Ordering::Relaxed) {
-                    let _ = terminal::end_streaming(&state.stdout, *rows);
+        // Keep the same in-flight request alive across terminal resizes.
+        // (Previously a resize dropped the stream and re-sent the whole call,
+        // which double-billed and printed partly duplicated text.)
+        let call = call_with_retry_shared(
+            http, config, state, &messages, &system, cancel.clone(), notify_fn, on_delta,
+        );
+        tokio::pin!(call);
+        let mut resize_open = true;
+        let result = loop {
+            tokio::select! {
+                r = &mut call => break r,
+                changed = resize_rx.changed(), if resize_open => {
+                    if changed.is_err() {
+                        // Resize sender gone; just wait for the call.
+                        resize_open = false;
+                        continue;
+                    }
+                    let (nc, nr) = *resize_rx.borrow_and_update();
+                    *cols = nc;
+                    *rows = nr;
+                    live_rows.store(nr, Ordering::Relaxed);
+                    let _ = handle_resize(nc, nr, state).await;
+                    if streaming_started.load(Ordering::Relaxed) {
+                        // Text is already flowing: no thinking animation, and
+                        // re-anchor the streaming line inside the new region.
+                        if let Some(anim) = state.anim.lock().unwrap().take() {
+                            anim.stop();
+                        }
+                        let _ = terminal::end_streaming(&state.stdout, nr);
+                        let _ = terminal::begin_streaming(&state.stdout, nr);
+                    }
                 }
-                continue;
             }
         };
 
         // Close streaming line before processing result
-        if streaming_started.load(std::sync::atomic::Ordering::Relaxed) {
+        if streaming_started.load(Ordering::Relaxed) {
             let _ = terminal::end_streaming(&state.stdout, *rows);
         }
 
@@ -634,12 +690,24 @@ async fn run_agent_turn(
             tok.cache_write_tokens += turn.usage.cache_write_tokens;
         }
 
-        // Append assistant turn to history
+        // Append assistant turn to history. A tool_use the model did not
+        // finish (stop_reason max_tokens etc.) gets no tool_result, and a
+        // tool_use without one makes every later request fail with a 400,
+        // so only a tool_use turn keeps its tool_use blocks.
         state
             .messages
             .lock()
             .unwrap()
-            .push(Message::assistant_blocks(turn.content.clone()));
+            .push(Message::assistant_blocks(
+                syl_rs::api::compaction::drop_unanswered_tool_uses(&turn.content, &turn.stop_reason),
+            ));
+        if turn.stop_reason == StopReason::MaxTokens {
+            let _ = terminal::print_to_scroll(
+                &state.stdout,
+                "\x1b[2m[response hit max_tokens and was cut off]\x1b[0m\r\n",
+                *rows,
+            );
+        }
 
         if turn.stop_reason != StopReason::ToolUse {
             break;
@@ -721,11 +789,11 @@ fn handle_stream_delta(
     state: &Arc<SharedState>,
     delta: BlockDeltaEvent,
     rows: u16,
-    started: &std::sync::atomic::AtomicBool,
+    started: &AtomicBool,
 ) {
     match delta {
         BlockDeltaEvent::ThinkingDelta { text } | BlockDeltaEvent::TextDelta { text } => {
-            if !started.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            if !started.swap(true, Ordering::Relaxed) {
                 // First text delta: stop animation and open a new scroll line
                 if let Some(anim) = state.anim.lock().unwrap().take() {
                     anim.stop();
@@ -899,22 +967,4 @@ async fn handle_resize(
     }
 
     Ok(())
-}
-
-/// Awaits resize events from `resize_rx`, calls `handle_resize`, and loops.
-/// Used inside `tokio::select!` in `run_agent_turn` so resizes are handled
-/// concurrently with the streaming HTTP call.
-async fn drain_resize_during_turn(
-    resize_rx: &mut tokio::sync::watch::Receiver<(u16, u16)>,
-    state: &Arc<SharedState>,
-    rows: &mut u16,
-    cols: &mut u16,
-) {
-    loop {
-        let _ = resize_rx.changed().await;
-        let (nc, nr) = *resize_rx.borrow_and_update();
-        *cols = nc;
-        *rows = nr;
-        let _ = handle_resize(nc, nr, state).await;
-    }
 }

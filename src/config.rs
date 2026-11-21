@@ -21,8 +21,13 @@ pub struct ModelInfo {
 
 pub const CLAUDE_MODELS: &[ModelInfo] = &[
     ModelInfo {
-        id: "claude-opus-4-6",
+        id: "claude-opus-5-5",
         description: "Most capable — complex reasoning, coding, deep analysis",
+        bedrock_id: "anthropic.claude-opus-5-5",
+    },
+    ModelInfo {
+        id: "claude-opus-4-6",
+        description: "Previous Opus — complex reasoning, coding, deep analysis",
         bedrock_id: "anthropic.claude-opus-4-6-20250514-v1:0",
     },
     ModelInfo {
@@ -41,7 +46,7 @@ pub const CLAUDE_MODELS: &[ModelInfo] = &[
 // Constants
 // ---------------------------------------------------------------------------
 
-pub const DEFAULT_MODEL: &str = "claude-opus-4-6";
+pub const DEFAULT_MODEL: &str = "claude-opus-5-5";
 pub const DEFAULT_BACKEND: &str = "anthropic";
 pub const DEFAULT_RATE_LIMIT: u64 = 60_000;
 /// Max *output* tokens sent in each API request.  Modern Claude models support
@@ -51,8 +56,45 @@ pub const DEFAULT_MAX_TOKENS: u32 = 16_384;
 pub const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 pub const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
 pub const ANTHROPIC_VERSION: &str = "2023-06-01";
+/// Whether `model` accepts manual extended thinking
+/// (`thinking: {type: "enabled", budget_tokens}`).
+///
+/// Claude Opus 4.7 and later, and every 5.x model, reject it with a 400:
+/// their thinking is adaptive, and depth is set with the `effort` parameter.
+/// Unknown/older models are assumed to support it.
+pub fn supports_manual_thinking(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    if m.contains("opus-4-7") || m.contains("opus-4-8") {
+        return false;
+    }
+    // claude-{opus,sonnet,haiku,fable,mythos}-5[...]
+    !["opus-5", "sonnet-5", "haiku-5", "fable-5", "mythos-5"]
+        .iter()
+        .any(|f| m.contains(f))
+}
+
 pub const BAKED_IMAGE: &str = "syl-agent-ready:latest";
-pub const CONTAINER_NAME: &str = "syl-agent";
+/// Container name used by Syl versions before per-project names existed.
+pub const LEGACY_CONTAINER_NAME: &str = "syl-agent";
+
+/// Podman container name for this project: `syl-agent-<hash>` where the hash is
+/// derived from the project directory. Each project gets its own container, so
+/// running Syl in two projects at once no longer collides.
+pub fn container_name() -> &'static str {
+    static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| {
+        let dir = std::env::current_dir().unwrap_or_default();
+        let dir = dir.canonicalize().unwrap_or(dir);
+        container_name_for(&dir)
+    })
+}
+
+/// Pure helper behind `container_name()` (exposed for tests).
+pub fn container_name_for(project_dir: &std::path::Path) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(project_dir.to_string_lossy().as_bytes());
+    format!("syl-agent-{}", &hex::encode(digest)[..10])
+}
 
 // ---------------------------------------------------------------------------
 // AppConfig

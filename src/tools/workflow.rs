@@ -4,6 +4,12 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
+use crate::util::is_safe_key;
+
+fn bad_key(key: &str) -> String {
+    format!("Error: invalid workflow name '{}'. Use letters, digits, '-', '_' or '.' (no '..', no leading '.').", key)
+}
+
 static STEP_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\s*[-*]\s+(.+?):\s*`(.+?)`\s*$").unwrap());
 
@@ -89,6 +95,9 @@ pub fn list_workflows(workflow_dir: &Path) -> Vec<WorkflowEntry> {
 
 /// Load and parse a workflow by key. Returns None if missing or invalid.
 pub fn load_workflow(workflow_dir: &Path, key: &str) -> Option<Workflow> {
+    if !is_safe_key(key) {
+        return None;
+    }
     let path = workflow_dir.join(format!("{}.md", key));
     let content = fs::read_to_string(path).ok()?;
     parse_workflow(&content)
@@ -96,6 +105,9 @@ pub fn load_workflow(workflow_dir: &Path, key: &str) -> Option<Workflow> {
 
 /// Create a new workflow. Refuses to overwrite an existing one.
 pub fn workflow_write(workflow_dir: &Path, key: &str, content: &str) -> String {
+    if !is_safe_key(key) {
+        return bad_key(key);
+    }
     if let Err(e) = fs::create_dir_all(workflow_dir) {
         return format!("Error creating workflow dir: {}", e);
     }
@@ -116,6 +128,9 @@ pub fn workflow_write(workflow_dir: &Path, key: &str, content: &str) -> String {
 
 /// Delete a workflow by key.
 pub fn workflow_delete(workflow_dir: &Path, key: &str) -> String {
+    if !is_safe_key(key) {
+        return bad_key(key);
+    }
     let path = workflow_dir.join(format!("{}.md", key));
     if !path.exists() {
         return format!("Error: Workflow '{}' not found.", key);

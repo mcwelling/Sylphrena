@@ -7,6 +7,14 @@ pub struct StreamHandler {
     output_tokens:      u64,
     cache_read_tokens:  u64,
     cache_write_tokens: u64,
+    error: Option<StreamError>,
+}
+
+/// An `error` event received after the stream started (e.g. `overloaded_error`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct StreamError {
+    pub kind:    String,
+    pub message: String,
 }
 
 #[derive(Debug)]
@@ -14,6 +22,7 @@ enum BlockState {
     Text { text: String },
     ToolUse { id: String, name: String, input_str: String },
     Thinking { thinking: String, signature: Option<String> },
+    RedactedThinking { data: String },
     Unknown,
 }
 
@@ -26,7 +35,14 @@ impl StreamHandler {
             output_tokens:      0,
             cache_read_tokens:  0,
             cache_write_tokens: 0,
+            error: None,
         }
+    }
+
+    /// The `error` event the stream ended with, if any. A turn that hit one is
+    /// incomplete and must not be used.
+    pub fn stream_error(&self) -> Option<&StreamError> {
+        self.error.as_ref()
     }
 
     pub fn on_event(&mut self, data: &serde_json::Value) {
@@ -51,6 +67,9 @@ impl StreamHandler {
                         input_str: String::new(),
                     },
                     "thinking" => BlockState::Thinking { thinking: String::new(), signature: None },
+                    "redacted_thinking" => BlockState::RedactedThinking {
+                        data: block["data"].as_str().unwrap_or("").to_string(),
+                    },
                     _          => BlockState::Unknown,
                 };
                 self.blocks.insert(idx, state);
@@ -92,6 +111,12 @@ impl StreamHandler {
                     }
                 }
             }
+            "error" => {
+                self.error = Some(StreamError {
+                    kind:    data["error"]["type"].as_str().unwrap_or("unknown_error").to_string(),
+                    message: data["error"]["message"].as_str().unwrap_or("").to_string(),
+                });
+            }
             _ => {}
         }
     }
@@ -103,16 +128,18 @@ impl StreamHandler {
             match state {
                 BlockState::Text { text } => Some(ContentBlock::Text { text, cache_control: None }),
                 BlockState::ToolUse { id, name, input_str } => {
-                    let input = if input_str.is_empty() {
-                        serde_json::Value::Object(serde_json::Map::new())
-                    } else {
-                        serde_json::from_str(&input_str).unwrap_or(serde_json::Value::Null)
+                    // `input` must be an object when sent back. JSON cut off by
+                    // max_tokens (or otherwise not an object) becomes `{}`.
+                    let input = match serde_json::from_str::<serde_json::Value>(&input_str) {
+                        Ok(v @ serde_json::Value::Object(_)) => v,
+                        _ => serde_json::Value::Object(serde_json::Map::new()),
                     };
                     Some(ContentBlock::ToolUse { id, name, input })
                 }
                 BlockState::Thinking { thinking, signature } => {
                     Some(ContentBlock::Thinking { thinking, signature })
                 }
+                BlockState::RedactedThinking { data } => Some(ContentBlock::RedactedThinking { data }),
                 BlockState::Unknown => None,
             }
         }).collect();

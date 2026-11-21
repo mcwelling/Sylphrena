@@ -6,7 +6,7 @@ use tokio::process::Command;
 use tokio::time::{timeout, Duration};
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{AppConfig, CONTAINER_NAME};
+use crate::config::{container_name, AppConfig};
 use crate::util::process_tool_output;
 
 /// In-flight child process handle. Stored so Ctrl+C can kill the subprocess.
@@ -29,7 +29,7 @@ pub async fn run_bash(
     };
 
     let mut child = match Command::new("podman")
-        .args(["exec", CONTAINER_NAME, "/bin/bash", "-c", cmd])
+        .args(["exec", container_name(), "/bin/bash", "-c", cmd])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -53,8 +53,10 @@ pub async fn run_bash(
 
     tokio::select! {
         result = timeout(timeout_dur, async {
-            let stdout = read_all(&mut stdout_pipe).await;
-            let stderr = read_all(&mut stderr_pipe).await;
+            // Drain both pipes concurrently: reading them one after the other
+            // deadlocks once the unread pipe fills its ~64 KB OS buffer.
+            let (stdout, stderr) =
+                tokio::join!(read_all(&mut stdout_pipe), read_all(&mut stderr_pipe));
             let status = child.wait().await;
             (stdout, stderr, status)
         }) => {

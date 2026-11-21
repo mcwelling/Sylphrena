@@ -1,12 +1,11 @@
 /// Async HTTP API client for Anthropic (and Bedrock via SigV4).
 /// `stream_turn` sends a streaming POST and reassembles the SSE into a `TurnResult`.
-/// `call_with_retry` wraps it with rate-limit throttle + 429/529 retry.
+/// `call_with_retry_shared` wraps it with rate-limit throttle + 429/529 retry.
 use anyhow::Context;
 use futures_util::StreamExt;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use tokio_util::sync::CancellationToken;
 
-use crate::api::rate_limit::{maybe_throttle, record_rate_call, RateCall};
 use crate::api::sse::StreamHandler;
 use crate::api::types::{Message, TurnResult};
 use crate::config::{AppConfig, ANTHROPIC_VERSION};
@@ -88,11 +87,7 @@ fn build_payload(
     system: &[SystemBlock],
     config: &AppConfig,
 ) -> serde_json::Value {
-    let max_tokens = if let Some(budget) = config.thinking_budget {
-        config.max_tokens as u64 + budget
-    } else {
-        config.max_tokens as u64
-    };
+    let max_tokens = request_max_tokens(config);
 
     let mut body = serde_json::json!({
         "model": config.model,
@@ -103,14 +98,47 @@ fn build_payload(
         "messages": messages,
     });
 
-    if let Some(budget) = config.thinking_budget {
-        body["thinking"] = serde_json::json!({
-            "type": "enabled",
-            "budget_tokens": budget,
-        });
+    if let Some(thinking) = thinking_param(config) {
+        body["thinking"] = thinking;
     }
 
     body
+}
+
+/// The `thinking` request field for `--thinking <budget>`, or None when the
+/// flag isn't set.
+///
+/// Models with manual thinking get `{type: enabled, budget_tokens}`. Adaptive
+/// models (Opus 4.7+, all 5.x) reject that with a 400 and always think anyway,
+/// returning *omitted* (empty) thinking by default, so for them `--thinking`
+/// asks for summarized thinking to be streamed instead.
+pub fn thinking_param(config: &AppConfig) -> Option<serde_json::Value> {
+    let budget = config.thinking_budget?;
+    Some(if crate::config::supports_manual_thinking(&config.model) {
+        serde_json::json!({ "type": "enabled", "budget_tokens": manual_thinking_budget(budget) })
+    } else {
+        serde_json::json!({ "type": "adaptive", "display": "summarized" })
+    })
+}
+
+/// The API rejects `budget_tokens` below this.
+pub const MIN_THINKING_BUDGET: u64 = 1024;
+
+fn manual_thinking_budget(budget: u64) -> u64 {
+    budget.max(MIN_THINKING_BUDGET)
+}
+
+/// `max_tokens` for a request. Manual thinking spends `budget_tokens` out of
+/// `max_tokens`, so the budget is added on top to leave room for the answer.
+/// Adaptive models ignore the budget, so it must not inflate `max_tokens`
+/// (a large `--thinking` value would otherwise exceed the model's output cap).
+pub fn request_max_tokens(config: &AppConfig) -> u64 {
+    match config.thinking_budget {
+        Some(budget) if crate::config::supports_manual_thinking(&config.model) => {
+            config.max_tokens as u64 + manual_thinking_budget(budget)
+        }
+        _ => config.max_tokens as u64,
+    }
 }
 
 /// Build a Bedrock-compatible request body (no `stream` flag; requires
@@ -120,11 +148,7 @@ fn build_bedrock_payload(
     system:   &[SystemBlock],
     config:   &AppConfig,
 ) -> serde_json::Value {
-    let max_tokens = if let Some(budget) = config.thinking_budget {
-        config.max_tokens as u64 + budget
-    } else {
-        config.max_tokens as u64
-    };
+    let max_tokens = request_max_tokens(config);
 
     let mut body = serde_json::json!({
         "anthropic_version": "bedrock-2023-05-31",
@@ -134,11 +158,8 @@ fn build_bedrock_payload(
         "messages": messages,
     });
 
-    if let Some(budget) = config.thinking_budget {
-        body["thinking"] = serde_json::json!({
-            "type":          "enabled",
-            "budget_tokens": budget,
-        });
+    if let Some(thinking) = thinking_param(config) {
+        body["thinking"] = thinking;
     }
 
     body
@@ -300,6 +321,9 @@ pub async fn stream_turn(
                 handler.on_event(&event_data);
             },
         );
+        if let Some(err) = handler.stream_error() {
+            return Err(stream_error_to_anyhow(err));
+        }
         return Ok(handler.build_result());
     }
 
@@ -353,7 +377,22 @@ pub async fn stream_turn(
         }
     }
 
+    if let Some(err) = handler.stream_error() {
+        return Err(stream_error_to_anyhow(err));
+    }
     Ok(handler.build_result())
+}
+
+/// Map an `error` event received mid-stream to an error. `overloaded_error`
+/// and `rate_limit_error` become retryable `rate_limit:` errors, like an HTTP
+/// 529 / 429 before the stream started; anything else is surfaced as-is
+/// instead of being returned as a silently truncated turn.
+fn stream_error_to_anyhow(err: &crate::api::sse::StreamError) -> anyhow::Error {
+    match err.kind.as_str() {
+        "overloaded_error" => anyhow::anyhow!("rate_limit:529 (overloaded mid-stream: {})", err.message),
+        "rate_limit_error" => anyhow::anyhow!("rate_limit:429 (mid-stream: {})", err.message),
+        _ => anyhow::anyhow!("API stream error {}: {}", err.kind, err.message),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -369,48 +408,12 @@ fn backoff_delay(attempt: u32) -> std::time::Duration {
     std::time::Duration::from_millis(ms)
 }
 
-/// Calls `stream_turn` with pre-call token-budget throttle and retry on 429/529.
-///
-/// `rate_calls` is the mutable sliding-window buffer from `SharedState` (Phase 4)
-/// or a local `Vec` for callers that don't yet have shared state.
-#[tracing::instrument(skip_all, fields(model = %config.model))]
-pub async fn call_with_retry(
-    client:      &reqwest::Client,
-    config:      &AppConfig,
-    messages:    &[Message],
-    system:      &[SystemBlock],
-    cancel:      CancellationToken,
-    rate_calls:  &mut Vec<RateCall>,
-) -> anyhow::Result<TurnResult> {
-    // Pre-call throttle: sleep if within 80% of the token budget window
-    maybe_throttle(rate_calls, config.rate_limit).await;
-
-    let mut attempts = 0u32;
-    loop {
-        match stream_turn(client, config, messages, system, cancel.clone(), &|_| {}).await {
-            Ok(result) => {
-                // Record this call in the rate-limit window
-                let input_tokens = result.usage.input_tokens;
-                record_rate_call(rate_calls, input_tokens);
-                tracing::debug!(input_tokens, output_tokens = result.usage.output_tokens, "turn complete");
-                return Ok(result);
-            }
-            Err(e) if is_rate_limit_error(&e) && attempts < MAX_RETRIES => {
-                let delay = backoff_delay(attempts);
-                tracing::warn!(attempt = attempts, delay_ms = delay.as_millis(), "rate limited, retrying");
-                tokio::time::sleep(delay).await;
-                attempts += 1;
-            }
-            Err(e) => return Err(e),
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Shared-state retry wrapper (Phase 4)
 // ---------------------------------------------------------------------------
 
-/// Like `call_with_retry` but pulls `recent_calls` from `SharedState`.
+/// Calls `stream_turn` with a pre-call token-budget throttle (sliding window
+/// in `SharedState::recent_calls`) and retry on 429/529.
 ///
 /// Critical invariant: the `recent_calls` mutex is released **before** any
 /// `.await`.  The block-scope pattern below enforces this.
@@ -444,7 +447,10 @@ pub async fn call_with_retry_shared(
         if !dur.is_zero() {
             tracing::info!(wait_ms = dur.as_millis(), "token budget at 80% — cooling down");
             notify_fn(&format!("[Token budget] Cooling down for {}s...", dur.as_secs().max(1)));
-            tokio::time::sleep(dur).await;
+            tokio::select! {
+                _ = tokio::time::sleep(dur) => {}
+                _ = cancel.cancelled() => return Err(CancelledError.into()),
+            }
         }
     }
 
@@ -467,7 +473,10 @@ pub async fn call_with_retry_shared(
             Err(e) if is_rate_limit_error(&e) && attempts < MAX_RETRIES => {
                 let delay = backoff_delay(attempts);
                 tracing::warn!(attempt = attempts, delay_ms = delay.as_millis(), "rate limited, retrying");
-                tokio::time::sleep(delay).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    _ = cancel.cancelled() => return Err(CancelledError.into()),
+                }
                 attempts += 1;
             }
             Err(e) => return Err(e),
