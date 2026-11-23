@@ -42,6 +42,7 @@ client ── AgentCommand ──▶ agent loop ── AgentEvent ──▶ clie
           Cancel                        RequestStarted        (each model call)
           ApprovePermission             TextDelta / ThinkingDelta
           SetModel                      ToolCallStarted {id, name, input}
+          Shutdown
                                         ToolCallFinished {id, name, output, is_error}
                                         PermissionRequested   (reserved for Phase 3)
                                         Usage {request, session}
@@ -50,7 +51,7 @@ client ── AgentCommand ──▶ agent loop ── AgentEvent ──▶ clie
                                         TurnEnded {reason}
 ```
 
-Every `Prompt` produces `TurnStarted`, then other events, then exactly one `TurnEnded` (`Completed(stop_reason)`, `Cancelled` or `Failed`). Prompts sent during a turn run after it, in order. `SetModel` takes effect from the next turn. The session file is saved after every turn.
+Every `Prompt` produces `TurnStarted`, then other events, then exactly one `TurnEnded` (`Completed(stop_reason)`, `Cancelled` or `Failed`). Prompts sent during a turn run after it, in order. `SetModel` takes effect from the next turn. `Shutdown` cancels any turn in progress and stops the loop. The session file is saved after every turn.
 
 The TUI is the first client. It renders events and never calls into the loop. Slash commands still read and edit `SharedState` directly, but only between turns. `show_image` is split in two: the core tool checks that the file exists, and the TUI draws it when it sees the successful `ToolCallFinished`.
 

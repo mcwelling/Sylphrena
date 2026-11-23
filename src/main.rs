@@ -170,9 +170,17 @@ async fn main() -> anyhow::Result<()> {
     let result = repl.run(&mut handle.events, resize_rx).await;
 
     // 15. Teardown: stop the agent, disable raw mode, reset DECSTBM
+    // The Ctrl+C task holds a sender clone, so dropping ours isn't enough
+    // to end the loop: ask it to stop, and don't wait on it forever.
     drop(repl);
-    drop(handle.commands);
-    let _ = handle.task.await;
+    let _ = handle.commands.send(AgentCommand::Shutdown);
+    if tokio::time::timeout(std::time::Duration::from_secs(5), &mut handle.task)
+        .await
+        .is_err()
+    {
+        tracing::warn!("agent did not stop within 5s; aborting it");
+        handle.task.abort();
+    }
     crossterm::terminal::disable_raw_mode()?;
     {
         let mut out = tui.stdout.lock().unwrap();

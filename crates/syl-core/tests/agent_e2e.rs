@@ -256,3 +256,49 @@ async fn prompts_sent_during_a_turn_run_after_it() {
     let msgs = bodies[1]["messages"].as_array().unwrap();
     assert_eq!(msgs.len(), 3, "one, first, two");
 }
+
+#[tokio::test]
+async fn shutdown_stops_the_loop_even_while_a_sender_clone_is_alive() {
+    // The TUI's Ctrl+C task keeps a clone of the command sender for the
+    // whole session; exit used to wait for every sender to drop and hung.
+    let server = model_server(vec![ok(text_stream("ok"))]).await;
+    let h = start(&server);
+    let _signal_handler_clone = h.handle.commands.clone();
+
+    h.handle.commands.send(AgentCommand::Shutdown).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), h.handle.task)
+        .await
+        .expect("agent loop did not stop")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn shutdown_during_a_turn_cancels_it_and_still_ends_the_turn() {
+    let slow = ok(text_stream("too late")).set_delay(Duration::from_secs(30));
+    let server = model_server(vec![slow]).await;
+    let mut h = start(&server);
+    let _clone = h.handle.commands.clone();
+
+    h.handle.commands.send(AgentCommand::Prompt("hi".into())).unwrap();
+    h.handle.commands.send(AgentCommand::Prompt("queued".into())).unwrap();
+    loop {
+        if h.handle.events.recv().await.unwrap() == AgentEvent::RequestStarted {
+            break;
+        }
+    }
+    h.handle.commands.send(AgentCommand::Shutdown).unwrap();
+
+    let events = until_turn_ended(&mut h).await;
+    assert_eq!(events.last(), Some(&AgentEvent::TurnEnded { reason: TurnEnd::Cancelled }));
+    tokio::time::timeout(Duration::from_secs(5), h.handle.task)
+        .await
+        .expect("agent loop did not stop")
+        .unwrap();
+    // The queued prompt was dropped, not run: no second turn, and the
+    // event channel closed with the loop.
+    let mut rest = Vec::new();
+    while let Some(ev) = h.handle.events.recv().await {
+        rest.push(ev);
+    }
+    assert!(rest.is_empty(), "{rest:?}");
+}

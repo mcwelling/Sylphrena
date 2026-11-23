@@ -67,6 +67,11 @@ pub enum AgentCommand {
     ApprovePermission { id: String, approved: bool },
     /// Use this model from the next turn on.
     SetModel(String),
+    /// Stop the loop: cancel any turn in progress (it still ends with
+    /// `TurnEnded` and is saved), drop queued prompts, and return. The loop
+    /// also stops once every command sender is dropped, but a client that
+    /// hands clones to signal handlers should send this instead.
+    Shutdown,
 }
 
 /// Where a session keeps its files.
@@ -109,7 +114,8 @@ pub struct AgentHandle {
     pub task: tokio::task::JoinHandle<()>,
 }
 
-/// Start the agent loop. It runs until every command sender is dropped.
+/// Start the agent loop. It runs until `Shutdown` or until every command
+/// sender is dropped.
 pub fn spawn(agent: Agent) -> AgentHandle {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (ev_tx, ev_rx) = mpsc::unbounded_channel();
@@ -127,7 +133,7 @@ async fn run(
         let prompt = match queued.pop_front() {
             Some(p) => p,
             None => match commands.recv().await {
-                None => break,
+                None | Some(AgentCommand::Shutdown) => break,
                 Some(AgentCommand::Prompt(p)) => p,
                 Some(AgentCommand::SetModel(m)) => {
                     *agent.state.current_model.lock().unwrap() = m;
@@ -143,11 +149,16 @@ async fn run(
         let cancel = CancellationToken::new();
         let turn = run_turn(&agent, &events, cancel.clone());
         tokio::pin!(turn);
+        let mut shutting_down = false;
         let reason = loop {
             tokio::select! {
                 reason = &mut turn => break reason,
-                cmd = commands.recv() => match cmd {
-                    Some(AgentCommand::Cancel) | None => cancel.cancel(),
+                cmd = commands.recv(), if !shutting_down => match cmd {
+                    Some(AgentCommand::Shutdown) | None => {
+                        shutting_down = true;
+                        cancel.cancel();
+                    }
+                    Some(AgentCommand::Cancel) => cancel.cancel(),
                     Some(AgentCommand::Prompt(p)) => queued.push_back(p),
                     // Takes effect next turn; this one already chose its model.
                     Some(AgentCommand::SetModel(m)) => *agent.state.current_model.lock().unwrap() = m,
@@ -163,6 +174,9 @@ async fn run(
             }
         }
         let _ = events.send(AgentEvent::TurnEnded { reason });
+        if shutting_down {
+            break;
+        }
     }
 }
 
