@@ -207,7 +207,7 @@ pub fn make_top_bar(data: &BarData, p: &Palette) -> String {
 
 /// Build the bottom status bar: model + timeout + right-aligned shortcuts.
 ///
-/// Layout: `─ model · Ns timeout ──────────────── /help  /save  /exit ─`
+/// Layout: `─ model · Ns timeout ──────────────── /help  /sessions  /exit ─`
 pub fn make_bottom_bar(data: &BarData, p: &Palette) -> String {
     let w = data.width as usize;
 
@@ -231,7 +231,7 @@ pub fn make_bottom_bar(data: &BarData, p: &Palette) -> String {
     };
 
     // Right-aligned shortcuts
-    let shortcuts = format!("{dim}/help  /save  /exit ─{r}", dim = p.dim, r = p.r);
+    let shortcuts = format!("{dim}/help  /sessions  /exit ─{r}", dim = p.dim, r = p.r);
     let shortcuts_vis = ansi_visible_len(&shortcuts);
 
     let left_vis  = ansi_visible_len(&content);

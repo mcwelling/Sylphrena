@@ -9,11 +9,11 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use syl_container::Container;
-use syl_core::agent::{self, Agent, AgentCommand, AgentEvent, SessionPaths, TurnEnd};
+use syl_core::agent::{self, Agent, AgentCommand, AgentEvent, SessionPaths, SessionStart, TurnEnd};
 use syl_core::api::types::StopReason;
 use syl_core::config::{build_config, parse_cli_args, AppConfig};
 use syl_core::model::AnthropicAdapter;
-use syl_core::session::load_session;
+use syl_core::session::{find_session, one_line, SessionInfo};
 use syl_core::shared::SharedState;
 use syl_rs::slash::{handle_slash, SlashAction, SlashContext};
 use syl_rs::tui::{
@@ -47,7 +47,7 @@ async fn main() -> anyhow::Result<()> {
     let syl_dir = project_dir.join(".syl");
     std::fs::create_dir_all(&syl_dir)?;
     let paths = SessionPaths::for_project(&project_dir);
-    let session_path = paths.session_path.clone().expect("standard layout has a session file");
+    let sessions_dir = paths.sessions_dir.clone().expect("standard layout saves sessions");
 
     // 3. Init logging (keep guard alive until process exit)
     let _log_guard = syl_core::logging::init_logging(&syl_dir)?;
@@ -65,22 +65,26 @@ async fn main() -> anyhow::Result<()> {
     *state.current_model.lock().unwrap() = config.model.clone();
     let tui = TuiState::new();
 
+    // 6b. Which session to start in: resolved before the slow container
+    // start so a bad --resume fails fast.
+    let start = match &cli.resume {
+        Some(query) if !cli.fresh => match find_session(&sessions_dir, query) {
+            Ok(id) => SessionStart::Resume(id),
+            Err(_) if query.is_empty() => {
+                println!("[Syl] No saved session to continue; starting a new one.");
+                SessionStart::New
+            }
+            Err(e) => anyhow::bail!("--resume: {e}"),
+        },
+        _ => SessionStart::New,
+    };
+
     // 7. Container lifecycle
     let container = Arc::new(Container::for_project(&project_dir));
     if cli.fresh {
         container.remove(false);
     }
     container.start_or_resume(config.fresh, &|msg| println!("{msg}"))?;
-
-    // 8. Load session on --resume (or if --fresh, start clean)
-    if config.resume && !cli.fresh && session_path.exists() {
-        if let Some(msgs) = load_session(&session_path) {
-            println!("[Syl] Resuming previous session...");
-            // The saved thinking blocks were bound to the old session's system
-            // prompt; replaying them under a new one fails the prefix check.
-            *state.messages.lock().unwrap() = syl_core::api::compaction::strip_thinking(msgs);
-        }
-    }
 
     // 9. Enter raw mode
     crossterm::terminal::enable_raw_mode()?;
@@ -127,6 +131,7 @@ async fn main() -> anyhow::Result<()> {
         model,
         container: container.clone(),
         paths,
+        start,
     });
 
     // 13. Signals and background polling
@@ -165,9 +170,13 @@ async fn main() -> anyhow::Result<()> {
         rows,
         cols,
         syl_dir: &syl_dir,
-        session_path: &session_path,
+        sessions_dir: &sessions_dir,
+        session: None,
     };
-    let result = repl.run(&mut handle.events, resize_rx).await;
+    let result = match repl.await_session_reply(&mut handle.events).await {
+        true => repl.run(&mut handle.events, resize_rx).await,
+        false => Err(anyhow::anyhow!("the agent stopped unexpectedly")),
+    };
 
     // 15. Teardown: stop the agent, disable raw mode, reset DECSTBM
     // The Ctrl+C task holds a sender clone, so dropping ours isn't enough
@@ -205,7 +214,9 @@ fn print_help() {
          --timeout <secs>    Request timeout in seconds  (default: 120)\n  \
          --thinking <n>      Thinking budget in tokens\n  \
          --image <mode>      auto | kitty | iterm2 | sixel | symbols\n  \
-         --resume            Resume previous conversation session\n  \
+         --continue, -c      Continue the most recent session\n  \
+         --resume [id]       Resume a session by id, id prefix, number or name\n  \
+                             (the most recent with no id)\n  \
          --fresh             Nuke container + start a new session\n  \
          --no-banner         Suppress startup banner\n  \
          --light             Light colour theme\n  \
@@ -313,7 +324,9 @@ struct Repl<'a> {
     rows: u16,
     cols: u16,
     syl_dir: &'a Path,
-    session_path: &'a Path,
+    sessions_dir: &'a Path,
+    /// The current session, as the agent last reported it.
+    session: Option<SessionInfo>,
 }
 
 impl Repl<'_> {
@@ -323,6 +336,48 @@ impl Repl<'_> {
 
     fn redraw_bars(&self) {
         draw_bars(&self.tui, &self.state, self.config, &self.model, self.cols, self.rows);
+    }
+
+    /// Show the agent's answer to a session command: wait for the
+    /// `SessionChanged` or `Error` it sends. Returns false if the agent went
+    /// away.
+    async fn await_session_reply(&mut self, events: &mut mpsc::UnboundedReceiver<AgentEvent>) -> bool {
+        loop {
+            match events.recv().await {
+                None => return false,
+                Some(AgentEvent::SessionChanged { info }) => {
+                    self.show_session(&info);
+                    self.session = Some(info);
+                    return true;
+                }
+                Some(AgentEvent::Error { message }) => {
+                    self.print(&format!("[Error: {message}]\r\n"));
+                    // A failed resume at startup is followed by the new
+                    // session the agent fell back to.
+                    if self.session.is_some() {
+                        return true;
+                    }
+                }
+                Some(AgentEvent::Notice { message }) => self.print(&format!("{message}\r\n")),
+                Some(_) => {}
+            }
+        }
+    }
+
+    fn show_session(&self, info: &SessionInfo) {
+        let name = info.name.as_deref().map(|n| format!(" \"{}\"", one_line(n, 60))).unwrap_or_default();
+        let line = if self.session.as_ref().is_some_and(|s| s.id == info.id) {
+            format!("Session {}{name}", info.id)
+        } else if info.resumed {
+            format!("Resumed session {}{name} ({} messages)", info.id, info.message_count)
+        } else if let Some(from) = &info.forked_from {
+            format!("Forked {from} into session {}{name} ({} messages)", info.id, info.message_count)
+        } else if self.session.is_some() {
+            format!("New session {}", info.id)
+        } else {
+            return;
+        };
+        self.print(&format!("\x1b[2m[{line}]\x1b[0m\r\n"));
     }
 
     fn apply_resize(&mut self, cols: u16, rows: u16, turn_active: bool) {
@@ -377,13 +432,14 @@ impl Repl<'_> {
 
                 // Slash commands only run between turns, so editing history
                 // here can't race the agent.
-                let msgs = self.state.messages.lock().unwrap().clone();
+                let message_count = self.state.messages.lock().unwrap().len();
                 let (input_tokens, output_tokens) = {
                     let tok = self.state.session_tokens.lock().unwrap();
                     (tok.input_tokens, tok.output_tokens)
                 };
                 let slash_ctx = SlashContext {
-                    session_path: self.session_path,
+                    sessions_dir: self.sessions_dir,
+                    session_id: self.session.as_ref().map(|s| s.id.as_str()),
                     workflow_dir: &workflow_dir,
                     memory_dir: &memory_dir,
                     log_path: &log_path,
@@ -392,18 +448,24 @@ impl Repl<'_> {
                     rate_limit: self.config.rate_limit,
                     input_tokens,
                     output_tokens,
-                    message_count: msgs.len(),
+                    message_count,
                     config: self.config,
                     container: &self.container,
                 };
-                match handle_slash(&line, msgs, &slash_ctx).await {
+                match handle_slash(&line, &slash_ctx).await {
                     Some(result) => {
-                        *self.state.messages.lock().unwrap() = result.messages;
                         if let Some(text) = result.output {
-                            self.print(&format!("{text}\r\n"));
+                            self.print(&format!("{}\r\n", text.replace('\n', "\r\n")));
                         }
-                        if result.action == SlashAction::Exit {
-                            break;
+                        match result.action {
+                            SlashAction::Exit => break,
+                            SlashAction::Continue => {}
+                            SlashAction::Agent(cmd) => {
+                                let _ = self.commands.send(cmd);
+                                if !self.await_session_reply(events).await {
+                                    anyhow::bail!("the agent stopped unexpectedly");
+                                }
+                            }
                         }
                     }
                     None => self.print(&format!("Unknown command: {line}\r\n")),
@@ -502,7 +564,9 @@ impl Repl<'_> {
                 }
                 AgentEvent::Compacted { before, after } => {
                     tracing::info!(before, after, "history compacted");
+                    self.print(&format!("\x1b[2m[context compacted: {before} → {after} messages]\x1b[0m\r\n"));
                 }
+                AgentEvent::SessionChanged { info } => self.session = Some(info),
                 AgentEvent::Notice { message } => self.print(&format!("{message}\r\n")),
                 AgentEvent::Error { message } => self.print(&format!("[Error: {message}]\r\n")),
                 AgentEvent::TurnEnded { reason } => {
@@ -510,6 +574,9 @@ impl Repl<'_> {
                         TurnEnd::Completed(StopReason::MaxTokens) => {
                             self.print("\x1b[2m[response hit max_tokens and was cut off]\x1b[0m\r\n")
                         }
+                        TurnEnd::Completed(StopReason::ContextWindowExceeded) => self.print(
+                            "\x1b[2m[the context window filled up; it will be compacted before the next request]\x1b[0m\r\n",
+                        ),
                         TurnEnd::Cancelled => self.print("[cancelled]\r\n"),
                         TurnEnd::Completed(_) | TurnEnd::Failed => {}
                     }

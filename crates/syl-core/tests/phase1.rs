@@ -1,14 +1,13 @@
 /// Phase 1 test suite — ported from test_syl.bb
 ///
-/// Covers: truncate_output, build_compacted_messages, memory I/O, session
-/// persistence, workflow CRUD, system prompt, stream handler, cache
+/// Covers: truncate_output, build_compacted_messages, memory I/O,
+/// workflow CRUD, system prompt, stream handler, cache
 /// breakpoints, fmt_num, workspace context. CLI/config, slash commands, rate
 /// limiting have their own test files.
 use syl_core::api::cache::attach_cache_breakpoints;
 use syl_core::api::compaction::build_compacted_messages;
 use syl_core::api::sse::StreamHandler;
 use syl_core::api::types::{ContentBlock, Message, MessageContent, StopReason};
-use syl_core::session::{load_session, save_session};
 use syl_core::system_prompt::build_system_blocks;
 use syl_core::tools::memory::{load_all_memories, memory_read, memory_write};
 use syl_core::tools::workflow::{
@@ -129,36 +128,7 @@ fn test_memory_read_empty_dir() {
     assert!(load_all_memories(dir).is_none());
 }
 
-// ============================================================
-// 5. Session Persistence
-// ============================================================
-
-#[test]
-fn test_session_save_and_load() {
-    let tmp = tempfile::tempdir().unwrap();
-    let path = tmp.path().join("session.json");
-
-    let msgs = vec![user_text("hello"), asst_text("hi there")];
-
-    save_session(&path, &msgs).unwrap();
-    assert!(path.exists());
-
-    let loaded = load_session(&path).unwrap();
-    assert_eq!(loaded.len(), 2);
-    assert_eq!(loaded[0].role, "user");
-    if let MessageContent::Text(ref t) = loaded[0].content {
-        assert_eq!(t, "hello");
-    } else {
-        panic!("expected text");
-    }
-}
-
-#[test]
-fn test_load_session_missing_file() {
-    let tmp = tempfile::tempdir().unwrap();
-    let path = tmp.path().join("nonexistent.json");
-    assert!(load_session(&path).is_none());
-}
+// 5. Session persistence: see session_log.rs.
 
 // ============================================================
 // 6. Workflow Parsing

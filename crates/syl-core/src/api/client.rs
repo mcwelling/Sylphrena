@@ -87,9 +87,11 @@ fn build_payload(
         "max_tokens": max_tokens,
         "stream": true,
         "system": system,
-        "tools": syl_tools(),
         "messages": messages,
     });
+    if config.tools {
+        body["tools"] = syl_tools();
+    }
 
     if let Some(thinking) = thinking_param(config) {
         body["thinking"] = thinking;

@@ -182,6 +182,8 @@ async fn fetch_source(
         &serde_json::json!({ "command": cmd }),
         config,
         container,
+        None,
+        "dispatch",
         cancel,
     ).await;
 

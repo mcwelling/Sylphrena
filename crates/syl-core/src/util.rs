@@ -77,6 +77,91 @@ pub fn process_tool_output(raw: &str) -> String {
     truncate_output(raw)
 }
 
+/// Where `run_bash` saves output too large to show the model: a directory
+/// on the host and the same directory as seen inside the container.
+#[derive(Debug, Clone)]
+pub struct SpillDir {
+    pub host: std::path::PathBuf,
+    pub container: String,
+}
+
+/// Lines longer than this are wrapped in a spill file, so that
+/// `read_file`, which pages by line, can reach all of it.
+pub const SPILL_LINE_CHARS: usize = 2_000;
+
+fn wrap_long_lines(text: &str, max: usize) -> String {
+    let mut out = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        let (body, nl) = match line.strip_suffix('\n') {
+            Some(b) => (b, "\n"),
+            None => (line, ""),
+        };
+        let mut rest = body;
+        while rest.len() > max {
+            let mut cut = max;
+            while !rest.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            out.push_str(&rest[..cut]);
+            out.push('\n');
+            rest = &rest[cut..];
+        }
+        out.push_str(rest);
+        out.push_str(nl);
+    }
+    out
+}
+
+/// `process_tool_output`, except that output too long to show in full is
+/// saved to `<spill>/<name>.txt` and the model gets a preview plus the path,
+/// which it can page with `read_file`. The file holds the raw output (HTML
+/// included, so it keeps its lines), with lines over `SPILL_LINE_CHARS`
+/// wrapped. Without a spill directory, or if the file can't be written, the
+/// output is cut as `process_tool_output` does.
+pub fn process_tool_output_spilled(raw: &str, spill: Option<&SpillDir>, name: &str) -> String {
+    let html = is_html(raw);
+    let shown_text = if html { strip_html(raw) } else { raw.to_string() };
+    if shown_text.lines().count() <= 100 && shown_text.len() <= MAX_TOOL_OUTPUT {
+        return shown_text;
+    }
+    let Some(spill) = spill else {
+        return process_tool_output(raw);
+    };
+    let file: String = name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    let file = format!("{}.txt", if file.is_empty() { "output".to_string() } else { file });
+    let saved = wrap_long_lines(raw, SPILL_LINE_CHARS);
+    let host = spill.host.join(&file);
+    let written = std::fs::create_dir_all(&spill.host).and_then(|()| std::fs::write(&host, &saved));
+    if let Err(e) = written {
+        tracing::warn!(path = %host.display(), "could not save large tool output: {e}");
+        return process_tool_output(raw);
+    }
+    let lines: Vec<&str> = saved.lines().collect();
+    let (what, preview) = if html {
+        ("Showing the page as text".to_string(), truncate_output(&shown_text))
+    } else {
+        let shown = lines.len().min(100);
+        let numbered = lines[..shown]
+            .iter()
+            .enumerate()
+            .map(|(i, l)| format!("{:>5}: {}", i + 1, l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        (format!("Showing lines 1-{shown}"), truncate_output(&numbered))
+    };
+    format!(
+        "[Output: {} lines, {} chars. {what}. The full output is saved at {}/{file} \
+         (lines over {SPILL_LINE_CHARS} chars wrapped); page through it with read_file \
+         (start_line/end_line) or search it with grep.]\n\n{preview}",
+        lines.len(),
+        raw.len(),
+        spill.container.trim_end_matches('/'),
+    )
+}
+
 pub use syl_container::shell_quote;
 
 /// Validate a memory / workflow key before it becomes a file name on the HOST.

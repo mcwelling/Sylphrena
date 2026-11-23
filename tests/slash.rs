@@ -3,7 +3,7 @@ use tempfile::TempDir;
 
 use std::sync::LazyLock;
 
-use syl_core::api::types::{Message, MessageContent};
+use syl_core::agent::AgentCommand;
 use syl_core::config::AppConfig;
 use syl_core::container::Container;
 use syl_rs::slash::{handle_slash, SlashAction, SlashContext};
@@ -16,14 +16,14 @@ static CONTAINER: LazyLock<Container> =
 // Helpers
 // ============================================================
 
-/// Returns (session_path, workflow_dir, memory_dir, log_path) — all owned.
+/// Returns (sessions_dir, workflow_dir, memory_dir, log_path) — all owned.
 fn make_paths(tmp: &TempDir) -> (
     std::path::PathBuf,
     std::path::PathBuf,
     std::path::PathBuf,
     std::path::PathBuf,
 ) {
-    let session_path = tmp.path().join("session.json");
+    let session_path = tmp.path().join("sessions");
     let workflow_dir = tmp.path().join("workflows");
     let memory_dir   = tmp.path().join("memories");
     let log_path     = tmp.path().join("syl.log");
@@ -33,7 +33,7 @@ fn make_paths(tmp: &TempDir) -> (
 }
 
 fn build_ctx<'a>(
-    session_path:  &'a std::path::PathBuf,
+    sessions_dir:  &'a std::path::PathBuf,
     workflow_dir:  &'a std::path::PathBuf,
     memory_dir:    &'a std::path::PathBuf,
     log_path:      &'a std::path::PathBuf,
@@ -46,7 +46,8 @@ fn build_ctx<'a>(
     config:        &'a AppConfig,
 ) -> SlashContext<'a> {
     SlashContext {
-        session_path,
+        sessions_dir,
+        session_id: None,
         workflow_dir,
         memory_dir,
         log_path,
@@ -61,14 +62,6 @@ fn build_ctx<'a>(
     }
 }
 
-fn empty_messages() -> Vec<Message> {
-    vec![]
-}
-
-fn some_messages() -> Vec<Message> {
-    vec![Message { role: "user".to_string(), content: MessageContent::Text("hi".to_string()) }]
-}
-
 // ============================================================
 // Tests
 // ============================================================
@@ -79,7 +72,7 @@ async fn slash_exit_returns_exit_action() {
     let (sp, wd, md, lp) = make_paths(&tmp);
     let cfg = AppConfig::default();
     let ctx = build_ctx(&sp, &wd, &md, &lp, "claude-opus-4-6", 120_000, 0, 0, 0, 0, &cfg);
-    let result = handle_slash("/exit", empty_messages(), &ctx).await.unwrap();
+    let result = handle_slash("/exit", &ctx).await.unwrap();
     assert_eq!(result.action, SlashAction::Exit);
 }
 
@@ -89,19 +82,18 @@ async fn slash_quit_also_exits() {
     let (sp, wd, md, lp) = make_paths(&tmp);
     let cfg = AppConfig::default();
     let ctx = build_ctx(&sp, &wd, &md, &lp, "claude-opus-4-6", 120_000, 0, 0, 0, 0, &cfg);
-    let result = handle_slash("/quit", empty_messages(), &ctx).await.unwrap();
+    let result = handle_slash("/quit", &ctx).await.unwrap();
     assert_eq!(result.action, SlashAction::Exit);
 }
 
 #[tokio::test]
-async fn slash_clear_empties_messages() {
+async fn slash_clear_starts_a_new_session() {
     let tmp = TempDir::new().unwrap();
     let (sp, wd, md, lp) = make_paths(&tmp);
     let cfg = AppConfig::default();
     let ctx = build_ctx(&sp, &wd, &md, &lp, "claude-opus-4-6", 120_000, 0, 0, 0, 1, &cfg);
-    let result = handle_slash("/clear", some_messages(), &ctx).await.unwrap();
-    assert!(result.messages.is_empty());
-    assert_eq!(result.action, SlashAction::Continue);
+    let result = handle_slash("/clear", &ctx).await.unwrap();
+    assert_eq!(result.action, SlashAction::Agent(AgentCommand::NewSession));
 }
 
 #[tokio::test]
@@ -110,7 +102,7 @@ async fn slash_help_has_output() {
     let (sp, wd, md, lp) = make_paths(&tmp);
     let cfg = AppConfig::default();
     let ctx = build_ctx(&sp, &wd, &md, &lp, "claude-opus-4-6", 120_000, 0, 0, 0, 0, &cfg);
-    let result = handle_slash("/help", empty_messages(), &ctx).await.unwrap();
+    let result = handle_slash("/help", &ctx).await.unwrap();
     assert!(result.output.is_some());
     let text = result.output.unwrap();
     assert!(text.contains("/status"), "help should list /status");
@@ -123,7 +115,7 @@ async fn slash_status_output_contains_model() {
     let (sp, wd, md, lp) = make_paths(&tmp);
     let cfg = AppConfig::default();
     let ctx = build_ctx(&sp, &wd, &md, &lp, "claude-opus-4-6", 120_000, 60_000, 100, 50, 4, &cfg);
-    let result = handle_slash("/status", some_messages(), &ctx).await.unwrap();
+    let result = handle_slash("/status", &ctx).await.unwrap();
     let text = result.output.unwrap();
     assert!(text.contains("claude-opus-4-6"), "status should show model");
     assert!(text.contains("120"),             "status should show timeout");
@@ -138,35 +130,20 @@ async fn slash_status_unlimited_rate() {
     let (sp, wd, md, lp) = make_paths(&tmp);
     let cfg = AppConfig::default();
     let ctx = build_ctx(&sp, &wd, &md, &lp, "claude-opus-4-6", 60_000, 0, 0, 0, 0, &cfg);
-    let result = handle_slash("/status", empty_messages(), &ctx).await.unwrap();
+    let result = handle_slash("/status", &ctx).await.unwrap();
     let text = result.output.unwrap();
     assert!(text.contains("unlimited"));
 }
 
 #[tokio::test]
-async fn slash_save_writes_file() {
-    let tmp = TempDir::new().unwrap();
-    let (session_path, wd, md, lp) = make_paths(&tmp);
-    let cfg = AppConfig::default();
-    let ctx = build_ctx(&session_path, &wd, &md, &lp, "claude-opus-4-6", 120_000, 0, 0, 0, 1, &cfg);
-    let result = handle_slash("/save", some_messages(), &ctx).await.unwrap();
-    assert!(result.output.is_some());
-    let text = result.output.unwrap().to_lowercase();
-    assert!(text.contains("saved") || text.contains("session"), "save should confirm success");
-    // File must exist with non-trivial content
-    let data = fs::read(&session_path).expect("session file should exist after /save");
-    assert!(data.len() > 2, "session file should have content");
-}
-
-#[tokio::test]
-async fn slash_save_output_confirms() {
+async fn slash_save_says_saving_is_automatic() {
     let tmp = TempDir::new().unwrap();
     let (sp, wd, md, lp) = make_paths(&tmp);
     let cfg = AppConfig::default();
     let ctx = build_ctx(&sp, &wd, &md, &lp, "claude-opus-4-6", 120_000, 0, 0, 0, 0, &cfg);
-    let result = handle_slash("/save", empty_messages(), &ctx).await.unwrap();
-    let text = result.output.unwrap().to_lowercase();
-    assert!(text.contains("saved") || text.contains("session"));
+    let result = handle_slash("/save", &ctx).await.unwrap();
+    assert_eq!(result.action, SlashAction::Continue);
+    assert!(result.output.unwrap().contains("automatically"));
 }
 
 #[tokio::test]
@@ -175,7 +152,7 @@ async fn slash_memory_empty_dir() {
     let (sp, wd, md, lp) = make_paths(&tmp);
     let cfg = AppConfig::default();
     let ctx = build_ctx(&sp, &wd, &md, &lp, "claude-opus-4-6", 120_000, 0, 0, 0, 0, &cfg);
-    let result = handle_slash("/memory", empty_messages(), &ctx).await.unwrap();
+    let result = handle_slash("/memory", &ctx).await.unwrap();
     assert_eq!(result.output.as_deref(), Some("No memories."));
 }
 
@@ -187,7 +164,7 @@ async fn slash_memory_lists_keys() {
     let ctx = build_ctx(&sp, &wd, &memory_dir, &lp, "claude-opus-4-6", 120_000, 0, 0, 0, 0, &cfg);
     fs::write(memory_dir.join("alpha.md"), "content a").unwrap();
     fs::write(memory_dir.join("beta.md"),  "content b").unwrap();
-    let result = handle_slash("/memory", empty_messages(), &ctx).await.unwrap();
+    let result = handle_slash("/memory", &ctx).await.unwrap();
     let text = result.output.unwrap();
     assert!(text.contains("alpha"), "should list alpha");
     assert!(text.contains("beta"),  "should list beta");
@@ -200,7 +177,7 @@ async fn slash_memory_named_key() {
     let cfg = AppConfig::default();
     let ctx = build_ctx(&sp, &wd, &memory_dir, &lp, "claude-opus-4-6", 120_000, 0, 0, 0, 0, &cfg);
     fs::write(memory_dir.join("mykey.md"), "the memory contents").unwrap();
-    let result = handle_slash("/memory mykey", empty_messages(), &ctx).await.unwrap();
+    let result = handle_slash("/memory mykey", &ctx).await.unwrap();
     let text = result.output.unwrap();
     assert!(text.contains("the memory contents"));
 }
@@ -211,7 +188,7 @@ async fn slash_memory_missing_key() {
     let (sp, wd, md, lp) = make_paths(&tmp);
     let cfg = AppConfig::default();
     let ctx = build_ctx(&sp, &wd, &md, &lp, "claude-opus-4-6", 120_000, 0, 0, 0, 0, &cfg);
-    let result = handle_slash("/memory nonexistent", empty_messages(), &ctx).await.unwrap();
+    let result = handle_slash("/memory nonexistent", &ctx).await.unwrap();
     let text = result.output.unwrap().to_lowercase();
     assert!(text.contains("not found"));
 }
@@ -222,7 +199,7 @@ async fn slash_workflow_empty_dir() {
     let (sp, wd, md, lp) = make_paths(&tmp);
     let cfg = AppConfig::default();
     let ctx = build_ctx(&sp, &wd, &md, &lp, "claude-opus-4-6", 120_000, 0, 0, 0, 0, &cfg);
-    let result = handle_slash("/workflow", empty_messages(), &ctx).await.unwrap();
+    let result = handle_slash("/workflow", &ctx).await.unwrap();
     assert_eq!(result.output.as_deref(), Some("No workflows."));
 }
 
@@ -232,7 +209,7 @@ async fn slash_log_missing_file() {
     let (sp, wd, md, lp) = make_paths(&tmp);
     let cfg = AppConfig::default();
     let ctx = build_ctx(&sp, &wd, &md, &lp, "claude-opus-4-6", 120_000, 0, 0, 0, 0, &cfg);
-    let result = handle_slash("/log", empty_messages(), &ctx).await.unwrap();
+    let result = handle_slash("/log", &ctx).await.unwrap();
     assert_eq!(result.output.as_deref(), Some("No log entries yet."));
 }
 
@@ -244,7 +221,7 @@ async fn slash_log_reads_last_lines() {
     let ctx = build_ctx(&sp, &wd, &md, &log_path, "claude-opus-4-6", 120_000, 0, 0, 0, 0, &cfg);
     let lines: Vec<String> = (1..=25).map(|i| format!("line {}", i)).collect();
     fs::write(&log_path, lines.join("\n")).unwrap();
-    let result = handle_slash("/log", empty_messages(), &ctx).await.unwrap();
+    let result = handle_slash("/log", &ctx).await.unwrap();
     let text = result.output.unwrap();
     // Should contain line 25 (last) but not line 1 (before last-20 window)
     assert!(text.contains("line 25"), "should include last line");
@@ -258,7 +235,7 @@ async fn slash_unknown_returns_none() {
     let (sp, wd, md, lp) = make_paths(&tmp);
     let cfg = AppConfig::default();
     let ctx = build_ctx(&sp, &wd, &md, &lp, "claude-opus-4-6", 120_000, 0, 0, 0, 0, &cfg);
-    let result = handle_slash("/notacommand", empty_messages(), &ctx).await;
+    let result = handle_slash("/notacommand", &ctx).await;
     assert!(result.is_none());
 }
 
@@ -268,6 +245,6 @@ async fn slash_command_tolerates_surrounding_whitespace() {
     let (sp, wd, md, lp) = make_paths(&tmp);
     let cfg = AppConfig::default();
     let ctx = build_ctx(&sp, &wd, &md, &lp, "claude-opus-4-6", 120_000, 0, 0, 0, 0, &cfg);
-    let result = handle_slash("  /exit  ", empty_messages(), &ctx).await.unwrap();
+    let result = handle_slash("  /exit  ", &ctx).await.unwrap();
     assert_eq!(result.action, SlashAction::Exit);
 }

@@ -1,9 +1,9 @@
 use std::path::Path;
 
 use syl_container::Container;
-use syl_core::api::types::Message;
+use syl_core::agent::AgentCommand;
 use syl_core::config::AppConfig;
-use syl_core::session::save_session;
+use syl_core::session::{self, find_session, format_utc, list_sessions, load_entries, one_line, user_prompts};
 use syl_core::tools::memory::{list_memories, memory_read};
 use syl_core::tools::workflow::{list_workflows, load_workflow, Workflow};
 
@@ -11,17 +11,32 @@ use syl_core::tools::workflow::{list_workflows, load_workflow, Workflow};
 pub enum SlashAction {
     Continue,
     Exit,
+    /// Send this to the agent and show its answer (`SessionChanged` or
+    /// `Error`).
+    Agent(AgentCommand),
 }
 
 #[derive(Debug, Clone)]
 pub struct SlashResult {
     pub action: SlashAction,
-    pub messages: Vec<Message>,
     pub output: Option<String>,
 }
 
+impl SlashResult {
+    fn say(output: impl Into<String>) -> Option<Self> {
+        Some(SlashResult { action: SlashAction::Continue, output: Some(output.into()) })
+    }
+
+    fn agent(cmd: AgentCommand) -> Option<Self> {
+        Some(SlashResult { action: SlashAction::Agent(cmd), output: None })
+    }
+}
+
 pub struct SlashContext<'a> {
-    pub session_path: &'a Path,
+    /// Where session logs live.
+    pub sessions_dir: &'a Path,
+    /// The current session, once the agent has reported it.
+    pub session_id: Option<&'a str>,
     pub workflow_dir: &'a Path,
     pub memory_dir: &'a Path,
     pub log_path: &'a Path,
@@ -36,11 +51,7 @@ pub struct SlashContext<'a> {
 }
 
 /// Handle a slash command. Returns None if the input is not a slash command.
-pub async fn handle_slash(
-    input: &str,
-    messages: Vec<Message>,
-    ctx: &SlashContext<'_>,
-) -> Option<SlashResult> {
+pub async fn handle_slash(input: &str, ctx: &SlashContext<'_>) -> Option<SlashResult> {
     let trimmed = input.trim();
 
     if trimmed == "/help" {
@@ -48,26 +59,111 @@ pub async fn handle_slash(
 Slash commands:
   /model [name]     Interactive model picker, or switch directly by name
   /status           Session stats
-  /save             Save session now
+  /sessions         List saved sessions
+  /resume <n|id>    Switch to a saved session (number from /sessions, id or name)
+  /history          Prompts in this session, numbered for /fork
+  /fork [n]         Continue in a copy of this session (before prompt n)
+  /name <name>      Name this session
+  /clear            Start a new session
   /memory [key]     List memories or show one
   /workflow [name]  List workflows or run one
   /log              Last 20 lines of syl.log
-  /clear            Clear conversation history
-  /exit             Exit"
-            .to_string();
-        return Some(SlashResult {
-            action: SlashAction::Continue,
-            messages,
-            output: Some(output),
-        });
+  /exit             Exit";
+        return SlashResult::say(output);
     }
 
-    if trimmed == "/clear" {
-        return Some(SlashResult {
-            action: SlashAction::Continue,
-            messages: vec![],
-            output: None,
-        });
+    if trimmed == "/clear" || trimmed == "/new" {
+        return SlashResult::agent(AgentCommand::NewSession);
+    }
+
+    if trimmed == "/save" {
+        return SlashResult::say("Sessions are saved automatically as they happen.");
+    }
+
+    if trimmed == "/sessions" {
+        let all = list_sessions(ctx.sessions_dir);
+        if all.is_empty() {
+            return SlashResult::say("No saved sessions.");
+        }
+        let lines: Vec<String> = all
+            .iter()
+            .take(30)
+            .enumerate()
+            .map(|(i, s)| {
+                let current = if ctx.session_id == Some(s.id.as_str()) { "*" } else { " " };
+                let label = match &s.name {
+                    Some(n) => format!("[{n}] {}", s.title),
+                    None => s.title.clone(),
+                };
+                format!(
+                    "{current}{:>3}  {}  {}  {:>3} prompts  {}",
+                    i + 1,
+                    s.id,
+                    format_utc(s.updated_ms),
+                    s.prompt_count,
+                    one_line(&label, 60),
+                )
+            })
+            .collect();
+        let more = all.len().saturating_sub(30);
+        let mut out = lines.join("\n");
+        if more > 0 {
+            out.push_str(&format!("\n  … {more} older"));
+        }
+        return SlashResult::say(out);
+    }
+
+    if trimmed == "/resume" || trimmed.starts_with("/resume ") {
+        let query = trimmed.strip_prefix("/resume").unwrap_or("").trim();
+        if query.is_empty() {
+            return SlashResult::say("Usage: /resume <n|id|name>  (see /sessions)");
+        }
+        return match find_session(ctx.sessions_dir, query) {
+            Ok(id) => SlashResult::agent(AgentCommand::LoadSession(id)),
+            Err(e) => SlashResult::say(format!("{e}")),
+        };
+    }
+
+    if trimmed == "/history" {
+        let prompts = current_prompts(ctx);
+        if prompts.is_empty() {
+            return SlashResult::say("No prompts in this session yet.");
+        }
+        let lines: Vec<String> = prompts
+            .iter()
+            .enumerate()
+            .map(|(i, p)| format!("{:>3}  {}", i + 1, one_line(&p.text, 70)))
+            .collect();
+        return SlashResult::say(lines.join("\n"));
+    }
+
+    if trimmed == "/fork" || trimmed.starts_with("/fork ") {
+        let arg = trimmed.strip_prefix("/fork").unwrap_or("").trim();
+        if arg.is_empty() {
+            return SlashResult::agent(AgentCommand::Fork { at: None });
+        }
+        let Ok(n) = arg.parse::<usize>() else {
+            return SlashResult::say("Usage: /fork [n]  (n from /history)");
+        };
+        let prompts = current_prompts(ctx);
+        return match n.checked_sub(1).and_then(|i| prompts.get(i)) {
+            Some(p) => {
+                let at = p.parent.clone();
+                Some(SlashResult {
+                    action: SlashAction::Agent(AgentCommand::Fork { at }),
+                    output: Some(format!("Forking before prompt {n}: {}", one_line(&p.text, 70))),
+                })
+            }
+            None => SlashResult::say(format!("No prompt {n}; this session has {}.", prompts.len())),
+        };
+    }
+
+    if trimmed == "/name" || trimmed.starts_with("/name ") {
+        let name = trimmed.strip_prefix("/name").unwrap_or("").trim();
+        if name.is_empty() {
+            return SlashResult::say("Usage: /name <name>");
+        }
+        return SlashResult::agent(AgentCommand::SetSessionName(name.to_string()));
     }
 
     if trimmed == "/status" {
@@ -85,25 +181,9 @@ Slash commands:
             ctx.message_count,
             ctx.input_tokens,
             ctx.output_tokens,
-            ctx.session_path.display(),
+            ctx.session_id.unwrap_or("(none)"),
         );
-        return Some(SlashResult {
-            action: SlashAction::Continue,
-            messages,
-            output: Some(output),
-        });
-    }
-
-    if trimmed == "/save" {
-        let output = match save_session(ctx.session_path, &messages) {
-            Ok(()) => "Session saved.".to_string(),
-            Err(e) => format!("Save failed: {}", e),
-        };
-        return Some(SlashResult {
-            action: SlashAction::Continue,
-            messages,
-            output: Some(output),
-        });
+        return SlashResult::say(output);
     }
 
     if trimmed == "/memory" || trimmed.starts_with("/memory ") {
@@ -123,11 +203,7 @@ Slash commands:
                 content
             }
         };
-        return Some(SlashResult {
-            action: SlashAction::Continue,
-            messages,
-            output: Some(output),
-        });
+        return SlashResult::say(output);
     }
 
     if trimmed == "/log" {
@@ -139,11 +215,7 @@ Slash commands:
             }
             _ => "No log entries yet.".to_string(),
         };
-        return Some(SlashResult {
-            action: SlashAction::Continue,
-            messages,
-            output: Some(output),
-        });
+        return SlashResult::say(output);
     }
 
     if trimmed == "/workflow" || trimmed.starts_with("/workflow ") {
@@ -165,19 +237,11 @@ Slash commands:
                 Some(wf) => run_workflow(&wf, ctx.container),
             }
         };
-        return Some(SlashResult {
-            action: SlashAction::Continue,
-            messages,
-            output: Some(output),
-        });
+        return SlashResult::say(output);
     }
 
     if trimmed == "/exit" || trimmed == "/quit" {
-        return Some(SlashResult {
-            action: SlashAction::Exit,
-            messages,
-            output: None,
-        });
+        return Some(SlashResult { action: SlashAction::Exit, output: None });
     }
 
     if trimmed.starts_with('/') {
@@ -186,6 +250,14 @@ Slash commands:
     }
 
     None
+}
+
+/// The typed prompts of the current session, read from its log.
+fn current_prompts(ctx: &SlashContext<'_>) -> Vec<session::Prompt> {
+    ctx.session_id
+        .and_then(|id| load_entries(ctx.sessions_dir, id).ok())
+        .map(|entries| user_prompts(&entries))
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------

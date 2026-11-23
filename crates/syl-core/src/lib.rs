@@ -14,5 +14,5 @@ pub mod tools;
 pub mod util;
 pub mod workspace;
 
-pub use agent::{AgentCommand, AgentEvent, AgentHandle, TurnEnd};
+pub use agent::{AgentCommand, AgentEvent, AgentHandle, SessionStart, TurnEnd};
 pub use syl_container as container;
