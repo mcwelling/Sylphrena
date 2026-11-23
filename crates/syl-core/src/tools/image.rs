@@ -4,9 +4,10 @@
 //! successful `ToolCallFinished` event; headless clients just report it.
 use syl_container::Container;
 
-/// Normalise a workspace-relative or `/workspace/`-prefixed path.
-pub fn container_path(rel_path: &str) -> String {
-    format!("/workspace/{}", rel_path.trim().trim_start_matches('/'))
+/// The in-container path of an image: relative paths are under the
+/// workspace; absolute ones are taken as they are.
+pub fn container_path(container: &Container, rel_path: &str) -> String {
+    container.resolve(rel_path)
 }
 
 /// Run `show_image`. Returns `(status_message, is_error)`.
@@ -16,7 +17,7 @@ pub fn show_image(input: &serde_json::Value, container: &Container) -> (String, 
         return ("[Tool error: show_image requires 'path']".to_string(), true);
     }
     let exists = container
-        .exec_program(&[], &["test", "-f", &container_path(rel_path)])
+        .exec_program(&[], &["test", "-f", &container_path(container, rel_path)])
         .map(|o| o.status.success())
         .unwrap_or(false);
     if !exists {

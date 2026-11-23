@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::api::client::{syl_tools, BlockDeltaEvent, CancelledError, SystemBlock};
 use crate::api::compaction;
-use crate::api::types::{ContentBlock, Message, StopReason, Usage};
+use crate::api::types::{ContentBlock, ImageSource, Message, MessageContent, StopReason, Usage};
 use crate::config::AppConfig;
 use crate::model::{ModelAdapter, ModelRequest};
 use crate::session::{EntryKind, PromptBlock, SessionInfo, SessionLog};
@@ -55,6 +55,15 @@ pub enum AgentEvent {
     /// The current session, sent when the loop starts and after every
     /// session command that succeeds.
     SessionChanged { info: SessionInfo },
+    /// Steering reached the model, after the tool results of this turn.
+    /// Every `Steer` is answered by exactly one of these three events.
+    SteerDelivered { text: String },
+    /// Steering arrived too late for its turn (or with no turn running):
+    /// `count` steering messages run together as the next prompt, and a
+    /// `TurnStarted` for it follows.
+    SteerQueued { text: String, count: usize },
+    /// Steering was dropped because its turn was cancelled or failed.
+    SteerDropped { text: String, count: usize },
 }
 
 /// How a turn ended.
@@ -72,6 +81,14 @@ pub enum TurnEnd {
 pub enum AgentCommand {
     /// Send a user message. Prompts sent during a turn run after it, in order.
     Prompt(String),
+    /// A prompt with images (see `attachments`), placed before the text.
+    PromptWithImages { text: String, images: Vec<ImageSource> },
+    /// A message for the turn in progress: delivered after the tool calls
+    /// running now finish, alongside their results, so the model sees it
+    /// before its next step. If the turn ends first, it runs as the next
+    /// prompt (a cancelled turn drops it, with a `Notice`). When idle, it
+    /// is just a prompt.
+    Steer(String),
     /// Stop the turn in progress. Ignored when idle.
     Cancel,
     /// Answer a `PermissionRequested` event. Ignored until Phase 3.
@@ -164,6 +181,18 @@ pub fn spawn(agent: Agent) -> AgentHandle {
 
 type Events = mpsc::UnboundedSender<AgentEvent>;
 
+/// Images kept in the history before older ones are dropped: the API
+/// takes about 100 per request, and 32 MB in all.
+const MAX_HISTORY_IMAGES: usize = 80;
+const MAX_HISTORY_IMAGE_BYTES: usize = 24_000_000;
+
+/// Whether an API error is about the images in the request (too large in
+/// all, or one it can't read).
+fn is_image_rejection(error: &str) -> bool {
+    let e = error.to_ascii_lowercase();
+    e.contains("413") || e.contains("request_too_large") || (e.contains("400") && e.contains("image"))
+}
+
 /// What the loop knows about the size of the current context.
 #[derive(Default)]
 struct ContextState {
@@ -255,18 +284,27 @@ async fn run(agent: Agent, mut commands: mpsc::UnboundedReceiver<AgentCommand>, 
                 emit(AgentEvent::SessionChanged { info: session.info() });
                 continue;
             }
-            AgentCommand::Prompt(p) => p,
+            AgentCommand::Steer(p) => {
+                emit(AgentEvent::SteerQueued { text: p.clone(), count: 1 });
+                Message::user_text(p)
+            }
+            AgentCommand::Prompt(p) => Message::user_text(p),
+            AgentCommand::PromptWithImages { text, images } => {
+                let mut blocks: Vec<ContentBlock> =
+                    images.into_iter().map(|source| ContentBlock::Image { source }).collect();
+                blocks.push(ContentBlock::Text { text, cache_control: None });
+                Message { role: "user".to_string(), content: MessageContent::Blocks(blocks) }
+            }
         };
 
         emit(AgentEvent::TurnStarted);
-        record(&agent, &mut session, &mut ctx, &events, EntryKind::Message {
-            message: Message::user_text(&prompt),
-        });
+        record(&agent, &mut session, &mut ctx, &events, EntryKind::Message { message: prompt });
+        let steer: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
         let cancel = CancellationToken::new();
         let mut shutting_down = false;
         let reason = {
-            let turn = run_turn(&agent, &mut session, &mut ctx, &events, cancel.clone());
+            let turn = run_turn(&agent, &mut session, &mut ctx, &events, &steer, cancel.clone());
             tokio::pin!(turn);
             loop {
                 tokio::select! {
@@ -283,13 +321,26 @@ async fn run(agent: Agent, mut commands: mpsc::UnboundedReceiver<AgentCommand>, 
                             *agent.state.current_model.lock().unwrap() = m
                         }
                         Some(AgentCommand::ApprovePermission { .. }) => {}
+                        Some(AgentCommand::Steer(text)) => steer.lock().unwrap().push(text),
                         // Prompts and session commands wait for the turn.
                         Some(other) => deferred.push_back(other),
                     },
                 }
             }
         };
-        emit(AgentEvent::TurnEnded { reason });
+        let undelivered = std::mem::take(&mut *steer.lock().unwrap());
+        emit(AgentEvent::TurnEnded { reason: reason.clone() });
+        if !undelivered.is_empty() {
+            let count = undelivered.len();
+            let text = undelivered.join("\n\n");
+            if matches!(reason, TurnEnd::Completed(_)) && !shutting_down {
+                // The turn ended before it could hear it: it's the next prompt.
+                emit(AgentEvent::SteerQueued { text: text.clone(), count });
+                deferred.push_front(AgentCommand::Prompt(text));
+            } else {
+                emit(AgentEvent::SteerDropped { text, count });
+            }
+        }
         if shutting_down {
             break;
         }
@@ -316,8 +367,8 @@ fn switch_to(agent: &Agent, session: &SessionLog, ctx: &mut ContextState, events
 /// write is reported once per session; the entry still takes effect.
 fn record(agent: &Agent, session: &mut SessionLog, ctx: &mut ContextState, events: &Events, kind: EntryKind) {
     let sync = match &kind {
-        EntryKind::Message { .. } | EntryKind::ToolResult { .. } => Some(false),
-        EntryKind::Compaction { .. } | EntryKind::Resumed => Some(true),
+        EntryKind::Message { .. } | EntryKind::ToolResult { .. } | EntryKind::Steer { .. } => Some(false),
+        EntryKind::Compaction { .. } | EntryKind::Resumed | EntryKind::ImagesDropped { .. } => Some(true),
         _ => None,
     };
     if let Err(e) = session.append(kind) {
@@ -361,7 +412,8 @@ fn system_prompt(
         return blocks;
     }
     let workspace = gather_workspace_context(&agent.paths.project_dir);
-    let blocks: Vec<SystemBlock> = build_system_blocks(&workspace, &agent.paths.memory_dir)
+    let instructions = crate::system_prompt::load_project_instructions(&agent.paths.project_dir);
+    let blocks: Vec<SystemBlock> = build_system_blocks(&workspace, &agent.paths.memory_dir, instructions.as_deref())
         .into_iter()
         .filter_map(|b| match b {
             ContentBlock::Text { text, cache_control } => Some(if cache_control.is_some() {
@@ -469,6 +521,7 @@ async fn run_turn(
     session: &mut SessionLog,
     ctx: &mut ContextState,
     events: &Events,
+    steer: &std::sync::Mutex<Vec<String>>,
     cancel: CancellationToken,
 ) -> TurnEnd {
     let emit = |e: AgentEvent| {
@@ -493,6 +546,7 @@ async fn run_turn(
     });
 
     let mut overflow_retries = 0;
+    let mut images_dropped = false;
     // The error of a request rejected as too long, while it is retried.
     let mut overflow: Option<String> = None;
     loop {
@@ -527,6 +581,14 @@ async fn run_turn(
         if cancel.is_cancelled() {
             return TurnEnd::Cancelled;
         }
+        // The API caps a request at 32 MB and ~100 images: keep well under.
+        let (images, image_bytes) = crate::session::image_load(session.messages());
+        if images > MAX_HISTORY_IMAGES || image_bytes > MAX_HISTORY_IMAGE_BYTES {
+            record(agent, session, ctx, events, EntryKind::ImagesDropped { all: false });
+            emit(AgentEvent::Notice {
+                message: "[Syl] Older images were removed from the context to keep requests under the API's size limit.".to_string(),
+            });
+        }
 
         let messages = session.messages().to_vec();
         let on_notice = |msg: &str| emit(AgentEvent::Notice { message: msg.to_string() });
@@ -554,6 +616,18 @@ async fn run_turn(
                 ctx.compacted_len = None;
                 ctx.measured = None;
                 overflow = Some(text);
+                continue;
+            }
+            Err(e) if !images_dropped && is_image_rejection(&e.to_string()) && crate::session::image_load(session.messages()).0 > 0 => {
+                // An image the API won't take would fail every later
+                // request too: take them all out and try once more.
+                images_dropped = true;
+                tracing::warn!("request rejected over images, retrying without them: {e}");
+                record(agent, session, ctx, events, EntryKind::ImagesDropped { all: true });
+                emit(AgentEvent::Notice {
+                    message: format!("[Syl] The API rejected a request with images ({}); retrying without them.", crate::session::one_line(&e.to_string(), 160)),
+                });
+                ctx.measured = None;
                 continue;
             }
             Err(e) => {
@@ -610,39 +684,65 @@ async fn run_turn(
             emit(AgentEvent::Notice { message: format!("[Syl] Container recovery failed: {e}") });
         }
 
-        for (id, name, input) in calls {
-            // Every tool_use must get a tool_result, even after a cancel.
-            let (output, is_error) = if cancel.is_cancelled() {
-                ("[Tool error: cancelled by user]".to_string(), true)
+        let tool_ctx = ToolContext {
+            config: &config,
+            model: agent.model.as_ref(),
+            container: &agent.container,
+            memory_dir: &agent.paths.memory_dir,
+            workflow_dir: &agent.paths.workflow_dir,
+            spill: spill.as_ref(),
+        };
+        // Consecutive read-only calls run together; anything else runs alone.
+        let mut i = 0;
+        while i < calls.len() {
+            let j = if tools::is_read_only(&calls[i].1) {
+                calls[i..].iter().position(|c| !tools::is_read_only(&c.1)).map_or(calls.len(), |n| i + n)
             } else {
-                emit(AgentEvent::ToolCallStarted {
-                    id: id.clone(),
-                    name: name.clone(),
-                    input: input.clone(),
-                });
-                let tool_ctx = ToolContext {
-                    config: &config,
-                    model: agent.model.as_ref(),
-                    container: &agent.container,
-                    memory_dir: &agent.paths.memory_dir,
-                    workflow_dir: &agent.paths.workflow_dir,
-                    spill: spill.as_ref(),
-                };
-                let (output, is_error) = tools::execute(&name, &id, &input, &tool_ctx, cancel.clone()).await;
+                i + 1
+            };
+            let group = &calls[i..j];
+            i = j;
+            // Every tool_use must get a tool_result, even after a cancel.
+            if cancel.is_cancelled() {
+                for (id, _, _) in group {
+                    record(agent, session, ctx, events, EntryKind::ToolResult {
+                        tool_use_id: id.clone(),
+                        content: "[Tool error: cancelled by user]".to_string(),
+                        is_error: true,
+                    });
+                }
+                continue;
+            }
+            for (id, name, input) in group {
+                emit(AgentEvent::ToolCallStarted { id: id.clone(), name: name.clone(), input: input.clone() });
+            }
+            let outputs = futures_util::future::join_all(
+                group.iter().map(|(id, name, input)| tools::execute(name, id, input, &tool_ctx, cancel.clone())),
+            )
+            .await;
+            for ((id, name, _), (output, is_error)) in group.iter().zip(outputs) {
                 emit(AgentEvent::ToolCallFinished {
                     id: id.clone(),
-                    name,
+                    name: name.clone(),
                     output: output.clone(),
                     is_error,
                 });
-                (output, is_error)
-            };
-            // Logged as soon as it exists, so a crash keeps finished work.
-            record(agent, session, ctx, events, EntryKind::ToolResult {
-                tool_use_id: id,
-                content: output,
-                is_error,
-            });
+                // Logged as soon as it exists, so a crash keeps finished work.
+                record(agent, session, ctx, events, EntryKind::ToolResult {
+                    tool_use_id: id.clone(),
+                    content: output,
+                    is_error,
+                });
+            }
+        }
+
+        // Steering typed during these calls goes in with their results.
+        if !cancel.is_cancelled() {
+            let pending = std::mem::take(&mut *steer.lock().unwrap());
+            for text in pending {
+                record(agent, session, ctx, events, EntryKind::Steer { text: text.clone() });
+                emit(AgentEvent::SteerDelivered { text });
+            }
         }
 
         if cancel.is_cancelled() {

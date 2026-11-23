@@ -18,6 +18,15 @@ pub const BASE_IMAGE: &str = "mcr.microsoft.com/devcontainers/base:ubuntu";
 /// Container name used by Syl versions before per-project names existed.
 pub const LEGACY_CONTAINER_NAME: &str = "syl-agent";
 
+/// Where the project is mounted inside the container.
+pub const WORKDIR: &str = "/workspace";
+
+/// The `timeout` argument that bounds a command inside the container: a
+/// little past the host's own limit, so the host normally reports it first.
+fn in_container_limit(timeout: Duration) -> String {
+    format!("{}s", timeout.as_secs() + 2)
+}
+
 /// Container name for a project: `syl-agent-<hash>`, where the hash is the
 /// first 10 hex characters of SHA-256 of the project path. Each project gets
 /// its own container.
@@ -101,6 +110,23 @@ pub struct Container {
     project_dir: PathBuf,
     state_dir: PathBuf,
     podman: PathBuf,
+    /// Where the project is mounted inside the container.
+    workdir: String,
+}
+
+/// What `exec_argv` returns: stdout as bytes (file contents need not be
+/// UTF-8), stderr as text.
+#[derive(Debug, Clone)]
+pub struct RawOutput {
+    pub stdout: Vec<u8>,
+    pub stderr: String,
+    pub code: Option<i32>,
+}
+
+impl RawOutput {
+    pub fn success(&self) -> bool {
+        self.code == Some(0)
+    }
 }
 
 impl Container {
@@ -116,6 +142,34 @@ impl Container {
             state_dir: dir.join(".syl"),
             project_dir: dir,
             podman: PathBuf::from("podman"),
+            workdir: WORKDIR.to_string(),
+        }
+    }
+
+    /// Treat `dir` as the in-container project path. Tests pair this with a
+    /// stand-in podman that runs commands on the host.
+    pub fn with_workdir(mut self, dir: impl Into<String>) -> Self {
+        self.workdir = dir.into();
+        self
+    }
+
+    /// The project's path inside the container (`/workspace`).
+    pub fn workdir(&self) -> &str {
+        &self.workdir
+    }
+
+    /// `path` inside the container: relative paths are under `workdir`.
+    pub fn resolve(&self, path: &str) -> String {
+        let path = path.trim();
+        if path.starts_with('/') {
+            path.to_string()
+        } else {
+            let rel = path.trim_start_matches("./");
+            if rel.is_empty() || rel == "." {
+                self.workdir.clone()
+            } else {
+                format!("{}/{}", self.workdir.trim_end_matches('/'), rel)
+            }
         }
     }
 
@@ -416,7 +470,11 @@ impl Container {
         cancel: &CancellationToken,
     ) -> Result<ExecOutput, ExecError> {
         let mut child = tokio::process::Command::new(&self.podman)
-            .args(["exec", &self.name, "/bin/bash", "-c", cmd])
+            .args(["exec", "--workdir", &self.workdir, &self.name])
+            // Killing the host-side podman client doesn't stop the process
+            // in the container, so it is bounded in there too.
+            .args(["timeout", "-s", "KILL", &in_container_limit(timeout)])
+            .args(["/bin/bash", "-c", cmd])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
@@ -450,6 +508,68 @@ impl Container {
                 let _ = child.kill().await;
                 Err(ExecError::Cancelled)
             }
+        }
+    }
+
+    /// Run `argv` (no shell) in the container, in the project directory,
+    /// feeding it `stdin` when given. Output is drained concurrently; the
+    /// process is killed on timeout or cancellation.
+    pub async fn exec_argv(
+        &self,
+        argv: &[&str],
+        stdin: Option<&[u8]>,
+        timeout: Duration,
+        cancel: &CancellationToken,
+    ) -> Result<RawOutput, ExecError> {
+        use tokio::io::AsyncWriteExt;
+        let mut cmd = tokio::process::Command::new(&self.podman);
+        cmd.arg("exec");
+        if stdin.is_some() {
+            cmd.arg("-i");
+        }
+        let mut child = cmd
+            .args(["--workdir", &self.workdir, &self.name])
+            .args(["timeout", "-s", "KILL", &in_container_limit(timeout)])
+            .args(argv)
+            .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(ExecError::Spawn)?;
+
+        let input = stdin.map(|b| b.to_vec());
+        let mut stdin_pipe = child.stdin.take();
+        let mut stdout_pipe = child.stdout.take().expect("piped stdout");
+        let mut stderr_pipe = child.stderr.take().expect("piped stderr");
+
+        let work = async {
+            let feed = async {
+                if let (Some(pipe), Some(bytes)) = (stdin_pipe.as_mut(), input.as_deref()) {
+                    let _ = pipe.write_all(bytes).await;
+                }
+                drop(stdin_pipe.take());
+            };
+            let read_out = async {
+                let mut buf = Vec::new();
+                let _ = stdout_pipe.read_to_end(&mut buf).await;
+                buf
+            };
+            let read_err = async {
+                let mut buf = Vec::new();
+                let _ = stderr_pipe.read_to_end(&mut buf).await;
+                String::from_utf8_lossy(&buf).into_owned()
+            };
+            let ((), stdout, stderr) = tokio::join!(feed, read_out, read_err);
+            (stdout, stderr, child.wait().await)
+        };
+        tokio::select! {
+            result = tokio::time::timeout(timeout, work) => match result {
+                Ok((stdout, stderr, Ok(status))) => Ok(RawOutput { stdout, stderr, code: status.code() }),
+                Ok((_, _, Err(e))) => Err(ExecError::Wait(e)),
+                Err(_) => Err(ExecError::TimedOut(timeout)),
+            },
+            _ = cancel.cancelled() => Err(ExecError::Cancelled),
         }
     }
 
@@ -501,7 +621,7 @@ fn parse_mem_str(s: &str) -> f64 {
 const SETUP_TOOLS_CMD: &str = concat!(
     "apt-get update -qq && ",
     "apt-get install -y --no-install-recommends ",
-    "python3 perl jq poppler-utils chafa python3-pil ",
+    "python3 perl jq poppler-utils chafa python3-pil ripgrep ",
     "git curl wget unzip build-essential pkg-config libssl-dev && ",
     // timg is arch-specific — install best-effort so it never blocks the chain
     "apt-get install -y timg 2>/dev/null || echo '[Syl Setup] timg not available in repos, skipping' && ",

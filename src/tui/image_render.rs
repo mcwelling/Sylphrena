@@ -13,7 +13,7 @@ use crate::tui::{image_proto, terminal};
 
 /// Render `rel_path`. Returns false if neither renderer produced output.
 pub fn render_image(rel_path: &str, container: &Container, tui: &TuiState, rows: u16, cols: u16) -> bool {
-    let path = container_path(rel_path);
+    let path = container_path(container, rel_path);
     let protocol = image_proto::detect_image_protocol();
     let (img_cols, img_rows) = image_size_chars(cols, rows);
 

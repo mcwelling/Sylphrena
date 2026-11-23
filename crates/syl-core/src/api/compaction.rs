@@ -41,10 +41,27 @@ pub fn default_context_window(model: &str) -> u64 {
     }
 }
 
-/// A rough token count for a message: about three bytes of JSON per token.
+/// What an image costs in context, roughly (the API bills about
+/// width × height / 750 tokens, and scales large images down to ~1.6K).
+pub const IMAGE_TOKENS: u64 = 1_600;
+
+/// A rough token count for a message: about three bytes of JSON per token,
+/// with images counted at `IMAGE_TOKENS` rather than by their base64 size.
 /// Only used for the parts of the context the API hasn't counted yet.
 pub fn estimate_tokens(msg: &Message) -> u64 {
-    serde_json::to_string(msg).map_or(0, |s| s.len() as u64 / 3) + 4
+    match &msg.content {
+        MessageContent::Blocks(blocks) if blocks.iter().any(|b| matches!(b, ContentBlock::Image { .. })) => {
+            blocks
+                .iter()
+                .map(|b| match b {
+                    ContentBlock::Image { .. } => IMAGE_TOKENS,
+                    other => serde_json::to_string(other).map_or(0, |s| s.len() as u64 / 3),
+                })
+                .sum::<u64>()
+                + 4
+        }
+        _ => serde_json::to_string(msg).map_or(0, |s| s.len() as u64 / 3) + 4,
+    }
 }
 
 pub fn estimate_text_tokens(text: &str) -> u64 {
@@ -217,6 +234,7 @@ fn message_to_text(m: &Message) -> String {
                 ContentBlock::ToolResult { content, .. } => {
                     Some(format!("[tool_result: {}]", clip(content, SUMMARY_BLOCK_CHARS)))
                 }
+                ContentBlock::Image { .. } => Some("[image]".to_string()),
                 ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => None,
             })
             .collect::<Vec<_>>()

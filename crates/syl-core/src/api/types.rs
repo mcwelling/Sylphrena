@@ -45,6 +45,25 @@ pub enum ContentBlock {
     /// assistant turn, like a `thinking` block.
     #[serde(rename = "redacted_thinking")]
     RedactedThinking { data: String },
+    /// An image in a user prompt.
+    #[serde(rename = "image")]
+    Image { source: ImageSource },
+}
+
+/// Image data sent inline.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImageSource {
+    /// Always `"base64"`.
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub media_type: String,
+    pub data: String,
+}
+
+impl ImageSource {
+    pub fn base64(media_type: impl Into<String>, data: impl Into<String>) -> Self {
+        ImageSource { kind: "base64".to_string(), media_type: media_type.into(), data: data.into() }
+    }
 }
 
 impl ContentBlock {

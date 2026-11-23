@@ -16,6 +16,8 @@ This document covers the implementation details behind Syl's main subsystems.
 - [SSH & Git Forwarding](#ssh--git-forwarding)
 - [Persistent Memory](#persistent-memory)
 - [Workflows](#workflows)
+- [File Tools](#file-tools)
+- [Steering and Images](#steering-and-images)
 - [Output Handling](#output-handling)
 - [Status Bars & Token Tracking](#status-bars--token-tracking)
 - [Thinking Animation](#thinking-animation)
@@ -249,6 +251,26 @@ Run with `/workflow <name>`. List all with `/workflow`. Claude can create and de
 
 ---
 
+## File Tools
+
+`read_file`, `edit_file`, `write_file`, `grep`, `glob` and `ls` live in `crates/syl-core/src/tools/fs.rs` and run **inside the container** through `Container::exec_argv` (a program and its arguments, no shell string, with optional stdin). Paths resolve in the container's filesystem, so a symlink planted by code in the container can't make Syl write outside it. File contents travel over stdin and come back as bytes, so size and quoting don't matter.
+
+- `edit_file` reads the file, requires `old_string` to occur exactly once (or `replace_all`), writes the result, and returns a unified diff (`similar`, computed off the async runtime with a deadline). On a CRLF file, `\n` line breaks in `old_string` match `\r\n`. `write_file` creates parent directories and returns a diff against the old contents. The TUI shows both diffs in colour, with control characters made visible.
+- Writes go to a temp file beside the target, are checked for length, take the old file's mode, and are renamed over it, so a cancel, timeout or full disk leaves the old file whole. A symlink is written through to its target.
+- Every command in the container runs under `timeout -s KILL`, because killing the host-side `podman exec` doesn't stop the process inside.
+- `grep` uses ripgrep (installed in new images) and falls back to `grep -rnE` in older ones, which skips `.git`, `.syl`, `target`, `node_modules` and similar by name and matches `glob` against base names. `glob` uses bash `globstar`, expands `{a,b}` itself, and lists only paths that exist. Paths in results are relative to `/workspace`.
+- `tools::is_read_only` names the tools with no side effects. The agent loop runs a consecutive run of them with `join_all` and everything else one at a time, in the order the model asked; results always go back in call order, in one user message.
+
+## Steering and Images
+
+**Steering.** `AgentCommand::Steer(text)` during a turn queues the text. After the tool calls running now finish and their results are logged, the queue is logged as `steer` entries and becomes text blocks after those `tool_result` blocks, in the same user message, so the model reads it before its next step. Every `Steer` gets exactly one answer: `SteerDelivered`; `SteerQueued` when the turn ended first (or none was running) and it runs as the next prompt, whose `TurnStarted` follows; or `SteerDropped` when the turn was cancelled or failed. The TUI keeps rendering until every steering message it sent is answered, so a follow-on turn is never left unseen. It reads keys (with bracketed paste, so a paste is one message) on a blocking thread only while a turn renders, draws the line being typed on the terminal's last row with autowrap off, and when the turn ends, stops the reader and carries any unsent text into the next prompt.
+
+**Images.** `attachments::attach_images` finds image paths in a prompt (`@file.png`, dragged paths with quotes or `\ ` escapes, or any word that is an existing image file), checks the file's magic bytes and size, and turns each into an image block placed before the prompt text (`AgentCommand::PromptWithImages`). Without `@`, only full paths count (what dragging a file in gives), and the text keeps the path. A prompt's images are capped at 15 MB in all. Images are logged like everything else the model sees; compaction counts each at about 1,600 tokens rather than by its base64 size.
+
+The API takes about 100 images and 32 MB per request, and images stay in history. Before a request, if the history holds more than 80 images or 24 MB of them, an `images_dropped` entry replaces all but the newest prompt's images with a text marker. If the API rejects a request over its images (a 413, or a 400 about an image), they are all dropped the same way and the request is sent once more. Both also strip thinking blocks, since they edit earlier messages.
+
+---
+
 ## Output Handling
 
 Tool output is processed before it reaches the model (`process_tool_output` in `crates/syl-core/src/util.rs`):
@@ -320,11 +342,12 @@ src/                       # syl-rs: the terminal client (binary `syl`)
     ├── animation.rs       # windspren thinking animation
     ├── spinner.rs         # tool execution spinner
     ├── input.rs           # rustyline InputEditor
+    ├── steer.rs           # typing during a turn: key reader, steering line
     ├── image_proto.rs     # terminal image protocol detection
     └── image_render.rs    # draws show_image output (timg / chafa)
 
 crates/syl-container/src/
-└── lib.rs                 # Container: lifecycle, exec, stats, shell_quote
+└── lib.rs                 # Container: lifecycle, exec, exec_argv (stdin), stats
 
 crates/syl-core/src/
 ├── agent.rs               # AgentEvent, AgentCommand, spawn, the loop
@@ -333,7 +356,8 @@ crates/syl-core/src/
 ├── shared.rs              # SharedState (history, tokens, model, system prompt)
 ├── pricing.rs             # cost estimation from token usage
 ├── session.rs             # append-only session log, derived history, listing
-├── system_prompt.rs       # system prompt assembly
+├── system_prompt.rs       # system prompt assembly, AGENTS.md / CLAUDE.md loading
+├── attachments.rs         # images named in prompts
 ├── workspace.rs           # workspace context (ls + git status)
 ├── logging.rs             # file logger to .syl/syl.log
 ├── util.rs                # output processing, HTML stripping, key checks
@@ -346,9 +370,9 @@ crates/syl-core/src/
 │   ├── rate_limit.rs      # sliding-window TPM tracking
 │   └── types.rs           # ContentBlock, Message, TurnResult, Usage
 └── tools/
-    ├── mod.rs             # ToolContext, execute (tool dispatch)
+    ├── mod.rs             # ToolContext, execute, is_read_only
     ├── bash.rs            # run_bash
-    ├── files.rs           # read_file (paginated)
+    ├── fs.rs              # read_file, edit_file, write_file, grep, glob, ls
     ├── image.rs           # show_image (existence check)
     ├── dispatch.rs        # dispatch_agent (URL fetch + Haiku sub-agent)
     ├── memory.rs          # memory_read / memory_write

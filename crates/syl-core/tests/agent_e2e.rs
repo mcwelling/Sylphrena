@@ -261,6 +261,8 @@ fn kind_name(e: &Entry) -> &'static str {
         EntryKind::Name { .. } => "name",
         EntryKind::Resumed => "resumed",
         EntryKind::Approval { .. } => "approval",
+        EntryKind::Steer { .. } => "steer",
+        EntryKind::ImagesDropped { .. } => "images_dropped",
     }
 }
 
@@ -668,4 +670,219 @@ async fn set_model_behind_a_queued_prompt_waits_for_it() {
     until_turn_ended(&mut h).await;
     let bodies = request_bodies(&server).await;
     assert_ne!(bodies[1]["model"], "claude-haiku-5-5", "prompt two was sent before the model change");
+}
+
+// ---------------------------------------------------------------------------
+// Tool parity (Phase 2)
+// ---------------------------------------------------------------------------
+
+/// One assistant turn making these tool calls, in order.
+fn tool_calls_stream(calls: &[(&str, &str, Value)]) -> String {
+    let mut events = vec![json!({"type":"message_start","message":{"usage":{"input_tokens":20,"output_tokens":0}}})];
+    for (i, (id, name, input)) in calls.iter().enumerate() {
+        events.push(json!({"type":"content_block_start","index":i,"content_block":{"type":"tool_use","id":id,"name":name}}));
+        events.push(json!({"type":"content_block_delta","index":i,"delta":{"type":"input_json_delta","partial_json":input.to_string()}}));
+        events.push(json!({"type":"content_block_stop","index":i}));
+    }
+    events.push(json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":7}}));
+    sse(&events)
+}
+
+#[tokio::test]
+async fn edit_file_changes_the_project_through_the_container() {
+    let server = model_server(vec![
+        ok(tool_calls_stream(&[(
+            "e1",
+            "edit_file",
+            json!({"path": "src/main.rs", "old_string": "println!(\"hi\")", "new_string": "println!(\"hello\")"}),
+        )])),
+        ok(text_stream("done")),
+    ])
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("project/src")).unwrap();
+    std::fs::write(tmp.path().join("project/src/main.rs"), "fn main() { println!(\"hi\") }\n").unwrap();
+    let mut h = start_with(test_config(&server), tmp, SessionStart::New).await;
+    h.send(AgentCommand::Prompt("say hello".into()));
+    let events = until_turn_ended(&mut h).await;
+    let out = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::ToolCallFinished { output, is_error: false, .. } => Some(output.clone()),
+            _ => None,
+        })
+        .expect("edit succeeded");
+    assert!(out.contains("+fn main() { println!(\"hello\") }"), "{out}");
+    assert_eq!(
+        std::fs::read_to_string(h.project().join("src/main.rs")).unwrap(),
+        "fn main() { println!(\"hello\") }\n"
+    );
+}
+
+#[tokio::test]
+async fn read_only_calls_run_together_and_others_one_at_a_time() {
+    let server = model_server(vec![
+        ok(tool_calls_stream(&[
+            ("r1", "ls", json!({})),
+            ("r2", "grep", json!({"pattern": "x"})),
+            ("w1", "write_file", json!({"path": "a.txt", "content": "x\n"})),
+            ("r3", "read_file", json!({"path": "a.txt"})),
+        ])),
+        ok(text_stream("done")),
+    ])
+    .await;
+    let mut h = start(&server).await;
+    h.send(AgentCommand::Prompt("go".into()));
+    let order: Vec<String> = until_turn_ended(&mut h)
+        .await
+        .into_iter()
+        .filter_map(|e| match e {
+            AgentEvent::ToolCallStarted { id, .. } => Some(format!("start {id}")),
+            AgentEvent::ToolCallFinished { id, .. } => Some(format!("end {id}")),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        order,
+        ["start r1", "start r2", "end r1", "end r2", "start w1", "end w1", "start r3", "end r3"]
+    );
+    // The read after the write saw it, and all four results went back together.
+    let bodies = request_bodies(&server).await;
+    let results = bodies[1]["messages"].as_array().unwrap().last().unwrap()["content"].as_array().unwrap().clone();
+    let ids: Vec<&str> = results.iter().map(|r| r["tool_use_id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["r1", "r2", "w1", "r3"]);
+    assert!(results[3]["content"].as_str().unwrap().contains("1: x"));
+}
+
+#[tokio::test]
+async fn steering_is_delivered_with_the_tool_results() {
+    let server = model_server(vec![
+        ok(tool_use_stream("slow", "sleep 1; echo working")),
+        ok(text_stream("adjusted")),
+    ])
+    .await;
+    let mut h = start(&server).await;
+    h.send(AgentCommand::Prompt("start".into()));
+    loop {
+        if let AgentEvent::ToolCallStarted { .. } = next_event(&mut h).await {
+            break;
+        }
+    }
+    h.send(AgentCommand::Steer("use the other approach".into()));
+    let events = until_turn_ended(&mut h).await;
+    assert!(events.contains(&AgentEvent::SteerDelivered { text: "use the other approach".into() }), "{events:?}");
+
+    let bodies = request_bodies(&server).await;
+    assert_eq!(bodies.len(), 2, "steering doesn't start another turn");
+    let last = bodies[1]["messages"].as_array().unwrap().last().unwrap().clone();
+    assert_eq!(last["content"][0]["type"], "tool_result");
+    assert_eq!(last["content"][1], json!({"type": "text", "text": "use the other approach"}));
+    // It is in the log, and survives a reload.
+    let msgs = History::from_entries(&h.log(&h.session.id)).messages;
+    assert_eq!(serde_json::to_value(&msgs[2]).unwrap(), last);
+}
+
+#[tokio::test]
+async fn steering_after_the_last_tool_call_becomes_the_next_prompt() {
+    let slow_text = ok(text_stream("finished")).set_delay(Duration::from_millis(300));
+    let server = model_server(vec![slow_text, ok(text_stream("about that"))]).await;
+    let mut h = start(&server).await;
+    h.send(AgentCommand::Prompt("one".into()));
+    loop {
+        if next_event(&mut h).await == AgentEvent::RequestStarted {
+            break;
+        }
+    }
+    h.send(AgentCommand::Steer("and another thing".into()));
+    until_turn_ended(&mut h).await;
+    until_turn_ended(&mut h).await;
+    let bodies = request_bodies(&server).await;
+    assert_eq!(bodies[1]["messages"].as_array().unwrap().last().unwrap()["content"], "and another thing");
+}
+
+#[tokio::test]
+async fn agents_md_is_in_the_system_prompt() {
+    let server = model_server(vec![ok(text_stream("ok"))]).await;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("project")).unwrap();
+    std::fs::write(tmp.path().join("CLAUDE.md"), "Outer rule: be brief.").unwrap();
+    std::fs::write(tmp.path().join("project/AGENTS.md"), "Run `make check` before finishing.").unwrap();
+    std::fs::write(tmp.path().join("project/CLAUDE.md"), "IGNORED when AGENTS.md exists").unwrap();
+    let mut h = start_with(test_config(&server), tmp, SessionStart::New).await;
+    h.send(AgentCommand::Prompt("hi".into()));
+    until_turn_ended(&mut h).await;
+    let system = request_bodies(&server).await[0]["system"][0]["text"].as_str().unwrap().to_string();
+    let outer = system.find("Outer rule: be brief.").expect("parent CLAUDE.md");
+    let inner = system.find("Run `make check` before finishing.").expect("project AGENTS.md");
+    assert!(outer < inner, "the project's own file comes last");
+    assert!(!system.contains("IGNORED"));
+}
+
+#[tokio::test]
+async fn image_prompts_send_image_blocks() {
+    use syl_core::api::types::ImageSource;
+    let server = model_server(vec![ok(text_stream("a cat"))]).await;
+    let mut h = start(&server).await;
+    h.send(AgentCommand::PromptWithImages {
+        text: "what is in [image: cat.png]?".into(),
+        images: vec![ImageSource::base64("image/png", "iVBORw0KGgo=")],
+    });
+    until_turn_ended(&mut h).await;
+    let content = request_bodies(&server).await[0]["messages"][0]["content"].clone();
+    assert_eq!(content[0]["type"], "image");
+    assert_eq!(content[0]["source"], json!({"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}));
+    assert_eq!(content[1]["text"], "what is in [image: cat.png]?");
+    let prompts = session::user_prompts(&h.log(&h.session.id));
+    assert_eq!(prompts[0].text, "what is in [image: cat.png]?");
+}
+
+#[tokio::test]
+async fn a_request_rejected_over_images_is_retried_without_them() {
+    use syl_core::api::types::ImageSource;
+    let too_big = ResponseTemplate::new(413).set_body_string(
+        r#"{"type":"error","error":{"type":"request_too_large","message":"Request exceeds the maximum allowed number of bytes."}}"#,
+    );
+    let server = model_server(vec![too_big, ok(text_stream("ok without it"))]).await;
+    let mut h = start(&server).await;
+    h.send(AgentCommand::PromptWithImages {
+        text: "look".into(),
+        images: vec![ImageSource::base64("image/png", "AAAA")],
+    });
+    let events = until_turn_ended(&mut h).await;
+    assert_eq!(events.last(), Some(&AgentEvent::TurnEnded { reason: TurnEnd::Completed(StopReason::EndTurn) }));
+    let bodies = request_bodies(&server).await;
+    assert_eq!(bodies[1]["messages"][0]["content"][0]["type"], "text", "the image was taken out");
+    // ... and stays out: it is in the log.
+    let log = h.log(&h.session.id);
+    assert!(log.iter().any(|e| matches!(e.kind, EntryKind::ImagesDropped { all: true })));
+}
+
+#[tokio::test]
+async fn late_steering_is_announced_then_run_as_the_next_prompt() {
+    let slow_text = ok(text_stream("finished")).set_delay(Duration::from_millis(300));
+    let server = model_server(vec![slow_text, ok(text_stream("about that"))]).await;
+    let mut h = start(&server).await;
+    h.send(AgentCommand::Prompt("one".into()));
+    loop {
+        if next_event(&mut h).await == AgentEvent::RequestStarted {
+            break;
+        }
+    }
+    h.send(AgentCommand::Steer("late".into()));
+    let first = until_turn_ended(&mut h).await;
+    assert!(matches!(first.last(), Some(AgentEvent::TurnEnded { .. })));
+    // Right after TurnEnded: the queued notice, then the new turn.
+    assert_eq!(next_event(&mut h).await, AgentEvent::SteerQueued { text: "late".into(), count: 1 });
+    assert_eq!(next_event(&mut h).await, AgentEvent::TurnStarted);
+    until_turn_ended(&mut h).await;
+}
+
+#[tokio::test]
+async fn steering_when_idle_is_a_prompt_and_says_so() {
+    let server = model_server(vec![ok(text_stream("hi"))]).await;
+    let mut h = start(&server).await;
+    h.send(AgentCommand::Steer("hello".into()));
+    assert_eq!(next_event(&mut h).await, AgentEvent::SteerQueued { text: "hello".into(), count: 1 });
+    assert_eq!(next_event(&mut h).await, AgentEvent::TurnStarted);
+    until_turn_ended(&mut h).await;
 }

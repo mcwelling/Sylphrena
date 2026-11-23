@@ -8,7 +8,8 @@ use syl_core::container::Container;
 /// A stand-in `podman` that runs `exec` commands on the host and reports the
 /// container as running, so tools work without a real container:
 ///
-/// - `podman exec [--env K=V]... <name> <argv...>` runs `<argv...>` locally
+/// - `podman exec [-i] [--env K=V]... [--workdir D] <name> <argv...>` runs
+///   `<argv...>` locally (in D)
 /// - `podman inspect ...` prints `true`
 /// - anything else succeeds silently
 pub fn fake_podman(dir: &Path) -> std::path::PathBuf {
@@ -19,8 +20,18 @@ pub fn fake_podman(dir: &Path) -> std::path::PathBuf {
 case "$1" in
   exec)
     shift
-    while [ "$1" = "--env" ]; do shift 2; done
+    while :; do
+      case "$1" in
+        --env) shift 2 ;;
+        --workdir) cd "$2" || exit 125; shift 2 ;;
+        -i) shift ;;
+        *) break ;;
+      esac
+    done
     shift
+    # The real container bounds commands with `timeout -s KILL N`; macOS
+    # has no timeout(1), so drop it here.
+    if [ "$1" = timeout ]; then shift 4; fi
     exec "$@"
     ;;
   inspect) echo true ;;
@@ -33,7 +44,11 @@ esac
     fake
 }
 
-/// A container for `project_dir` backed by `fake_podman`.
+/// A container for `project_dir` backed by `fake_podman`, whose workspace
+/// is the project directory itself (commands run on the host).
 pub fn fake_container(project_dir: &Path, bin_dir: &Path) -> Container {
-    Container::for_project(project_dir).with_podman(fake_podman(bin_dir))
+    let dir = project_dir.canonicalize().unwrap_or_else(|_| project_dir.to_path_buf());
+    Container::for_project(project_dir)
+        .with_podman(fake_podman(bin_dir))
+        .with_workdir(dir.to_string_lossy().into_owned())
 }
