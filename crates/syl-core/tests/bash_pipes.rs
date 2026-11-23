@@ -18,7 +18,7 @@ async fn large_stderr_does_not_deadlock() {
     let cmd = "head -c 262144 /dev/zero | tr '\\0' x >&2; echo done";
     let started = std::time::Instant::now();
     let (out, is_err) =
-        run_bash(&json!({ "command": cmd }), &config, &container, CancellationToken::new()).await;
+        run_bash(&json!({ "command": cmd }), &config, &container, None, "t", CancellationToken::new()).await;
 
     assert!(!is_err, "unexpected error: {out}");
     assert!(out.contains("done"), "{out}");

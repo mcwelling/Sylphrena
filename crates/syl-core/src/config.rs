@@ -82,6 +82,19 @@ pub struct AppConfig {
     pub fresh: bool,
     pub no_banner: bool,
     pub light: bool,
+    /// Context window override in tokens (`context_window` in config.toml).
+    /// When unset, the Models API's `max_input_tokens` is used, then a
+    /// per-model default.
+    pub context_window: Option<u64>,
+    /// Compact once the context is within this fraction of the window
+    /// (`compact_buffer`, default 0.15).
+    pub compact_buffer: f64,
+    /// Estimated tokens of recent history kept verbatim when compacting
+    /// (`compact_keep_tokens`, default 40000).
+    pub compact_keep_tokens: u64,
+    /// Offer Syl's tools in requests. Sub-calls that must answer in text,
+    /// like the compaction summarizer, turn this off.
+    pub tools: bool,
 }
 
 impl Default for AppConfig {
@@ -100,6 +113,10 @@ impl Default for AppConfig {
             fresh: false,
             no_banner: false,
             light: false,
+            context_window: None,
+            compact_buffer: crate::api::compaction::DEFAULT_COMPACT_BUFFER,
+            compact_keep_tokens: crate::api::compaction::DEFAULT_KEEP_TOKENS,
+            tools: true,
         }
     }
 }
@@ -115,6 +132,9 @@ struct FileConfig {
     rate_limit: Option<u64>,
     theme: Option<String>,
     image: Option<String>,
+    context_window: Option<u64>,
+    compact_buffer: Option<f64>,
+    compact_keep_tokens: Option<u64>,
 }
 
 /// Load the TOML config file. Returns `Default` if missing or unparseable.
@@ -137,7 +157,9 @@ pub struct CliArgs {
     pub thinking: Option<u64>,
     pub rate_limit: Option<u64>,
     pub image: Option<String>,
-    pub resume: bool,
+    /// `--resume [id]` or `--continue`: Some("") means the most recent
+    /// session, otherwise an id, id prefix, list position or name.
+    pub resume: Option<String>,
     pub fresh: bool,
     pub no_banner: bool,
     pub light: bool,
@@ -189,9 +211,21 @@ pub fn parse_cli_args(args: &[&str]) -> CliArgs {
                     i += 1;
                 }
             }
-            "--resume" => {
-                out.resume = true;
+            "--continue" | "-c" => {
+                out.resume = Some(String::new());
                 i += 1;
+            }
+            "--resume" => {
+                match args.get(i + 1) {
+                    Some(q) if !q.starts_with('-') => {
+                        out.resume = Some(q.to_string());
+                        i += 2;
+                    }
+                    _ => {
+                        out.resume = Some(String::new());
+                        i += 1;
+                    }
+                }
             }
             "--fresh" => {
                 out.fresh = true;
@@ -273,10 +307,19 @@ pub fn build_config(cli: &CliArgs, syl_dir: &Path) -> AppConfig {
     cfg.thinking_budget = cli.thinking;
 
     // boolean flags
-    cfg.resume = cli.resume;
+    cfg.resume = cli.resume.is_some();
     cfg.fresh = cli.fresh;
     cfg.no_banner = cli.no_banner;
     cfg.light = cli.light || cfg.theme == "light";
+
+    // context and compaction (config file only)
+    cfg.context_window = file.context_window;
+    if let Some(v) = file.compact_buffer {
+        cfg.compact_buffer = v;
+    }
+    if let Some(v) = file.compact_keep_tokens {
+        cfg.compact_keep_tokens = v;
+    }
 
     // API key from environment
     cfg.api_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();

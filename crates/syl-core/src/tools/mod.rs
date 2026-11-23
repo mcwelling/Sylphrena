@@ -12,6 +12,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::AppConfig;
 use crate::model::ModelAdapter;
+use crate::util::SpillDir;
 
 /// What a tool call needs from the session.
 pub struct ToolContext<'a> {
@@ -20,18 +21,21 @@ pub struct ToolContext<'a> {
     pub container: &'a Container,
     pub memory_dir: &'a Path,
     pub workflow_dir: &'a Path,
+    /// Where `run_bash` saves output too long to show in full.
+    pub spill: Option<&'a SpillDir>,
 }
 
 /// Run one tool call. Returns `(output, is_error)`.
 pub async fn execute(
     name: &str,
+    call_id: &str,
     input: &serde_json::Value,
     ctx: &ToolContext<'_>,
     cancel: CancellationToken,
 ) -> (String, bool) {
     let str_field = |key: &str| input[key].as_str().unwrap_or("").to_string();
     match name {
-        "run_bash" => bash::run_bash(input, ctx.config, ctx.container, cancel).await,
+        "run_bash" => bash::run_bash(input, ctx.config, ctx.container, ctx.spill, call_id, cancel).await,
         "memory_read" => (memory::memory_read(ctx.memory_dir, &str_field("key")), false),
         "memory_write" => (
             memory::memory_write(ctx.memory_dir, &str_field("key"), &str_field("content")),

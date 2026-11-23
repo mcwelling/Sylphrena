@@ -84,6 +84,8 @@ pub enum StopReason {
     EndTurn,
     ToolUse,
     MaxTokens,
+    /// The context window filled up mid-response (Claude 4.5 and later).
+    ContextWindowExceeded,
     Other(String),
 }
 
@@ -93,6 +95,7 @@ impl From<&str> for StopReason {
             "end_turn"  => StopReason::EndTurn,
             "tool_use"  => StopReason::ToolUse,
             "max_tokens"=> StopReason::MaxTokens,
+            "model_context_window_exceeded" => StopReason::ContextWindowExceeded,
             other       => StopReason::Other(other.to_string()),
         }
     }

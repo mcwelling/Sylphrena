@@ -4,7 +4,9 @@
 use std::path::Path;
 
 use serde_json::json;
-use syl_core::api::compaction::{choose_keep_boundary, KeepBoundary, COMPACT_KEEP};
+use syl_core::api::compaction::{choose_keep_boundary, KeepBoundary};
+
+const WINDOW: usize = 10;
 use syl_core::api::types::{ContentBlock, Message, MessageContent};
 use syl_core::container::name_for as container_name_for;
 use syl_core::tools::memory::{memory_read, memory_write};
@@ -138,17 +140,24 @@ fn tool_result(id: &str) -> Message {
 }
 
 #[test]
-fn boundary_prefers_plain_user_message() {
+fn boundary_keeps_the_whole_window_not_just_the_last_prompt() {
+    // A long tool turn, then a new prompt. The kept tail must start at the
+    // window, inside that turn, not jump forward to the new prompt (which
+    // would keep almost nothing).
     let mut msgs = vec![Message::user_text("start")];
     for i in 0..15 {
         msgs.push(tool_use(&format!("t{i}")));
         msgs.push(tool_result(&format!("t{i}")));
     }
     msgs.push(Message::user_text("next question"));
-    msgs.push(tool_use("z"));
-    msgs.push(tool_result("z"));
-    let b = choose_keep_boundary(&msgs).unwrap();
-    assert_eq!(b, KeepBoundary::UserText(msgs.len() - 3));
+    let start = msgs.len() - WINDOW;
+    assert_eq!(msgs[start].role, "user", "window starts on a tool result");
+    let b = choose_keep_boundary(&msgs, start).unwrap();
+    assert_eq!(b, KeepBoundary::Assistant(start + 1));
+
+    // On a plain user message, it starts right there.
+    let b = choose_keep_boundary(&msgs, msgs.len() - 1).unwrap();
+    assert_eq!(b, KeepBoundary::UserText(msgs.len() - 1));
 }
 
 #[test]
@@ -160,9 +169,9 @@ fn boundary_inside_long_tool_chain_starts_at_assistant() {
         msgs.push(tool_use(&format!("t{i}")));
         msgs.push(tool_result(&format!("t{i}")));
     }
-    let b = choose_keep_boundary(&msgs).unwrap();
+    let b = choose_keep_boundary(&msgs, msgs.len() - WINDOW).unwrap();
     let KeepBoundary::Assistant(i) = b else { panic!("expected Assistant, got {b:?}") };
-    assert!(i >= msgs.len() - COMPACT_KEEP);
+    assert!(i >= msgs.len() - WINDOW);
     assert_eq!(msgs[i].role, "assistant");
     // Every tool_result in the tail is preceded by its tool_use.
     assert_eq!(msgs[i + 1].role, "user");

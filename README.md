@@ -54,7 +54,8 @@ On first run Syl pulls an Ubuntu base image, installs dev tools, and bakes a cac
 | `--timeout <secs>` | `120` | Request timeout |
 | `--thinking <n>` | — | Extended thinking token budget. On adaptive-thinking models (Opus 4.7+, all 5.x models, including the default) the budget is ignored and Syl streams summarized thinking instead |
 | `--image <mode>` | `auto` | `kitty` / `iterm2` / `sixel` / `symbols` |
-| `--resume` | — | Reload the saved session from `.syl/session.json` |
+| `--continue`, `-c` | — | Continue the most recent session that has messages |
+| `--resume [id]` | — | Resume a session by id, id prefix, number from `/sessions`, or name (the most recent without one) |
 | `--fresh` | — | Nuke the container and start clean |
 | `--no-banner` | — | Skip the startup portrait |
 | `--light` | — | Light terminal colour theme |
@@ -67,6 +68,11 @@ On first run Syl pulls an Ubuntu base image, installs dev tools, and bakes a cac
 model      = "claude-sonnet-4-6"
 rate_limit = 40000
 image      = "kitty"
+
+# Context compaction (optional)
+context_window      = 1000000  # override the model's window, in tokens
+compact_buffer      = 0.15     # compact when within 15% of the window
+compact_keep_tokens = 40000    # recent history kept verbatim
 ```
 
 Priority: **CLI flag > environment variable > `.syl/config.toml` > default**
@@ -77,11 +83,15 @@ Priority: **CLI flag > environment variable > `.syl/config.toml` > default**
 |---|---|
 | `/model [name]` | Interactive picker (↑↓ / jk + Enter), or direct: `/model sonnet` |
 | `/status` | Model, timeout, rate limit, token counts, cost |
-| `/save` | Save conversation to `.syl/session.json` |
+| `/sessions` | List saved sessions (`*` marks the current one) |
+| `/resume <n\|id\|name>` | Switch to a saved session |
+| `/history` | Prompts in this session, numbered for `/fork` |
+| `/fork [n]` | Continue in a copy of this session, from just before prompt *n* |
+| `/name <name>` | Name this session |
 | `/memory [key]` | List persistent memory keys or show one |
 | `/workflow [name]` | List pipelines or run one |
 | `/log` | Last 20 lines of `.syl/syl.log` |
-| `/clear` | Reset conversation history (container is preserved) |
+| `/clear` | Start a new session (container is preserved; the old one stays in `/sessions`) |
 | `/help` | Show all commands |
 | `/exit` / `/quit` | Shut down Syl and remove the container |
 
@@ -103,7 +113,8 @@ Claude has eight built-in tools inside the container:
 ```bash
 syl                          # standard session
 syl --thinking 8000          # show Claude's thinking as it streams
-syl --resume                 # continue previous conversation
+syl --continue               # continue the most recent session
+syl --resume 20261122-1530   # resume a particular one
 syl --fresh                  # clean slate (new container)
 syl --no-banner --model claude-haiku-4-5   # quick, lightweight session
 ```

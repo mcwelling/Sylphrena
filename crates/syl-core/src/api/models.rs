@@ -28,6 +28,8 @@ pub struct DiscoveredModel {
     pub id: String,
     /// Human-readable label for the picker UI (e.g. `"Claude Opus 4.6"`).
     pub display_name: String,
+    /// The context window, when the API reports it.
+    pub max_input_tokens: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -96,7 +98,8 @@ async fn fetch_anthropic_models(
                 .as_str()
                 .unwrap_or(id.as_str())
                 .to_string();
-            Some(DiscoveredModel { id, display_name })
+            let max_input_tokens = m["max_input_tokens"].as_u64();
+            Some(DiscoveredModel { id, display_name, max_input_tokens })
         })
         .collect();
 
@@ -114,6 +117,7 @@ pub fn static_fallback() -> Vec<DiscoveredModel> {
         .map(|m| DiscoveredModel {
             id: m.id.to_string(),
             display_name: m.id.to_string(),
+            max_input_tokens: None,
         })
         .collect()
 }

@@ -10,6 +10,7 @@ This document covers the implementation details behind Syl's main subsystems.
 - [Model Discovery](#model-discovery)
 - [Streaming](#streaming)
 - [Rate Limiting](#rate-limiting)
+- [Session Log](#session-log)
 - [Context Compaction](#context-compaction)
 - [Container Lifecycle](#container-lifecycle)
 - [SSH & Git Forwarding](#ssh--git-forwarding)
@@ -51,7 +52,9 @@ client ── AgentCommand ──▶ agent loop ── AgentEvent ──▶ clie
                                         TurnEnded {reason}
 ```
 
-Every `Prompt` produces `TurnStarted`, then other events, then exactly one `TurnEnded` (`Completed(stop_reason)`, `Cancelled` or `Failed`). Prompts sent during a turn run after it, in order. `SetModel` takes effect from the next turn. `Shutdown` cancels any turn in progress and stops the loop. The session file is saved after every turn.
+Every `Prompt` produces `TurnStarted`, then other events, then exactly one `TurnEnded` (`Completed(stop_reason)`, `Cancelled` or `Failed`). Prompts sent during a turn run after it, in order. `SetModel` takes effect from the next turn. `Shutdown` cancels any turn in progress and stops the loop.
+
+Session commands (`NewSession`, `LoadSession(id)`, `Fork { at }`, `SetSessionName`) wait for a turn in progress to end, and answer with `SessionChanged { info }` or, on failure, an `Error` outside any turn. The loop also sends `SessionChanged` once when it starts.
 
 The TUI is the first client. It renders events and never calls into the loop. Slash commands still read and edit `SharedState` directly, but only between turns. `show_image` is split in two: the core tool checks that the file exists, and the TUI draws it when it sees the successful `ToolCallFinished`.
 
@@ -109,25 +112,51 @@ The TPM bar in the top status bar is colour-coded: green < 50%, yellow 50–80%,
 
 ---
 
+## Session Log
+
+Each session is an append-only JSONL file, `.syl/sessions/<id>.jsonl`, owned by the agent loop (`crates/syl-core/src/session.rs`). Ids look like `20261122-153012-a1b2c3` (UTC creation time, then random), so they sort by age. Every line is an entry:
+
+```json
+{"id":"3f2a9c01b7de","parentId":"a91c0e44f210","ts":1763820000000,"type":"message","message":{"role":"user","content":"hi"}}
+```
+
+| `type` | Written when |
+|---|---|
+| `session` | First entry: log version, working directory, and `forked_from` for a fork |
+| `system_prompt` | The system prompt is built for a conversation (then frozen) |
+| `message` | A user prompt is accepted, or an assistant turn finishes streaming |
+| `tool_result` | Each tool call finishes (consecutive results form one user message) |
+| `compaction` | Older history is replaced by a summary; `first_kept` names the first kept message |
+| `model_change` | A turn starts on a different model |
+| `name` | `/name` |
+| `resumed` | A saved session is loaded by a new process |
+| `approval` | Reserved for permissions (Phase 3) |
+
+**Durability.** Each entry is written and `fsync`ed before the loop moves on, so killing Syl loses at most the entry being written. An unreadable line is skipped on load and costs only itself: where an entry's parent is missing, the chain carries on from the line before it. A torn tail, or a write that failed partway, is cut off before the next write. A new session's file appears with its first prompt; an unused session leaves nothing behind.
+
+**One writer.** An open session's file is locked (`flock`), so a second Syl process can't resume it and interleave appends; it gets an error and a new session instead.
+
+**History is derived, not stored.** `History::apply` folds the entries of the chain from the last entry back through `parentId` to the root into the messages sent to the model. Nothing is ever rewritten in place: compaction appends an entry, so the full transcript stays on disk. Everything the model sees is in the log, including the frozen system prompt, which a resumed session reuses.
+
+**Resuming.** Loading a session answers any tool call a crash left without a result (an "interrupted" error result) and queues a `resumed` marker; both are written with the next entry. Thinking blocks from before the marker are not sent again, because the new process can't vouch that what they were signed against (tools included) is unchanged.
+
+**Forking** copies the chain up to an entry into a new session, keeping entry ids, and hangs it off a new header. `/fork n` forks just before prompt *n*, so the prompt can be asked differently; `/fork` alone copies everything. The fork doesn't inherit the original's name.
+
+**Large tool output.** `run_bash` output over 100 lines or 8,000 characters is saved to `.syl/spill/<session>/<tool_use_id>.txt`, which the container sees read-only under `/workspace/.syl/spill/`. The file holds the raw output (HTML too, so it keeps its lines), with lines over 2,000 characters wrapped so `read_file`, which pages by line, can reach everything. The model gets the first 100 lines (or the page as text) and that path.
+
+Older `.syl/session.json` files are not migrated and are ignored.
+
+---
+
 ## Context Compaction
 
-Long conversations are summarised rather than naively truncated.
+Long conversations are summarised rather than naively truncated, and compaction is driven by tokens, not message counts.
 
-```
-[msg 1] [msg 2] ... [msg N-K]  |  [msg N-K+1] ... [msg N]
- \_________________________/       \____________________/
-         summarised                      kept verbatim
-         by claude-haiku                 (COMPACT_KEEP = 10)
-               │                               │
-               ▼                               ▼
-  [user: "Context summary..."]     Role-boundary correction:
-  [asst: "Understood..."]          scan forward past tool_result
-               └───────────────────────────────┘
-                              │
-                     New compact history
-```
+**When.** Before **every** model call, including mid-turn inside a tool chain, the loop estimates the size of the next request: the token count the API reported for the last request (input, cache reads and writes, plus its output), plus an estimate (about three bytes of JSON per token) for messages added since. It adds room for the response (`max_tokens`) and compacts when the total is within `compact_buffer` (default 15%, at most 50%) of the context window. In the middle of a tool chain the buffer is halved, because compacting there strips thinking from the turn in progress. It doesn't compact again until something has been added since the last compaction. The window comes from a "prompt is too long" error seen this session for the same model, else from `context_window` in `.syl/config.toml`, else from the Models API's `max_input_tokens`, else a per-model default (1M for 4.6 and later and every 5.x model, 200K otherwise).
 
-Checked before **every** model call, including mid-turn inside a tool chain, and triggered when `len(messages) > MAX_HISTORY` (30). If the recent window contains no plain user message (a long tool chain), the kept tail starts at the first assistant message instead and is framed as `[user: summary] + tail`, so every `tool_result` keeps its matching `tool_use`. Compaction uses a dedicated `claude-haiku` call with `max_tokens: 2048`. If summarisation fails, the oldest messages are simply dropped so the conversation continues uninterrupted.
+It also compacts when the API rejects a request as too long, then sends it again (at most twice per turn, and only if compaction shortened the history; otherwise the turn fails with the API's error), and before the next request after a response stops with `model_context_window_exceeded`.
+
+**What.** The most recent `compact_keep_tokens` (default 40,000, estimated, and at most half the trigger) are kept verbatim. The cut moves forward to the first message a tail can start with: a plain user message, or an assistant message (framed as `[user: summary] + tail`, so every `tool_result` keeps its `tool_use`). Everything before the cut is summarised by `claude-haiku-5-5`, in a request with no tools; a summary that doesn't finish (`max_tokens`) is not used. Tool inputs and results are clipped to 2,000 characters in the text the summariser reads, and very long histories are summarised in chunks, each folding in the summary so far. Thinking blocks are removed from the kept tail, since they were signed with the full history in front of them. If summarisation fails, the older messages are dropped from the model's context (they stay in the log) and a notice says so.
 
 ---
 
@@ -186,7 +215,8 @@ Memory entries are plain markdown files in `.syl/memory/`:
 ```
 .syl/
 ├── config.toml          # per-project settings
-├── session.json         # saved conversation (--resume)
+├── sessions/            # one append-only JSONL log per session
+├── spill/               # large tool output, per session
 ├── syl.log              # append-only event log
 ├── memory/
 │   ├── project-stack.md
@@ -268,8 +298,8 @@ Shows the active model and request timeout. While a tool is running, it switches
 **Thinking blocks and the prefix check.** Opus 5.5 and other models with preserved thinking sign each thinking block against everything before it, and reject (or drop) blocks if `system`, `tools` or an earlier message changed. Syl keeps conversations append-only:
 
 - Assistant turns are stored and sent back exactly as streamed, thinking blocks and signatures included.
-- The system prompt (persona, workspace snapshot, memories) is built when a conversation starts and then frozen in `SharedState::system_prompt`. It is rebuilt only while history has no assistant turn yet (new session, or after `/clear`). Memories written mid-session reach the model through the tool result, and appear in the system prompt from the next conversation.
-- Where history *is* rewritten (compaction, or `--resume` under a fresh system prompt) every old thinking block is removed with `compaction::strip_thinking`, so nothing stale is sent back.
+- The system prompt (persona, workspace snapshot, memories) is built when a conversation starts and then frozen in `SharedState::system_prompt`. It is rebuilt only while history has no assistant turn yet (new session, or after `/clear`), and logged; a resumed session reuses the logged prompt. Memories written mid-session reach the model through the tool result, and appear in the system prompt from the next conversation.
+- Where history *is* cut (compaction keeps a tail after a summary) or replayed by a new process (`--resume`), the affected thinking blocks are removed with `compaction::strip_thinking`, so nothing stale is sent back. Removing thinking blocks is allowed by the check; editing what came before them is not.
 
 When extended thinking is enabled (`--thinking <budget>`), a windspren animation plays in the bottom status bar while Claude's thinking block streams in — an animated `≋` character drifts across a trail of `·` dots at 80 ms per frame. The animation stops the moment the first text delta arrives.
 
@@ -302,7 +332,7 @@ crates/syl-core/src/
 ├── config.rs              # AppConfig, CLI parser, CLAUDE_MODELS fallback
 ├── shared.rs              # SharedState (history, tokens, model, system prompt)
 ├── pricing.rs             # cost estimation from token usage
-├── session.rs             # load/save session.json
+├── session.rs             # append-only session log, derived history, listing
 ├── system_prompt.rs       # system prompt assembly
 ├── workspace.rs           # workspace context (ls + git status)
 ├── logging.rs             # file logger to .syl/syl.log
