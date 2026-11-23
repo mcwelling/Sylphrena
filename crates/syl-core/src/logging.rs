@@ -13,7 +13,7 @@ pub fn init_logging(syl_dir: &Path) -> anyhow::Result<tracing_appender::non_bloc
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("syl_rs=info"));
+        .unwrap_or_else(|_| EnvFilter::new("syl=info,syl_rs=info,syl_core=info,syl_container=info"));
 
     tracing_subscriber::registry()
         .with(filter)

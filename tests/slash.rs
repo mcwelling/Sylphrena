@@ -1,9 +1,16 @@
 use std::fs;
 use tempfile::TempDir;
 
-use syl_rs::config::AppConfig;
+use std::sync::LazyLock;
+
+use syl_core::api::types::{Message, MessageContent};
+use syl_core::config::AppConfig;
+use syl_core::container::Container;
 use syl_rs::slash::{handle_slash, SlashAction, SlashContext};
-use syl_rs::api::types::{Message, MessageContent};
+
+/// Never started: these tests don't run workflows.
+static CONTAINER: LazyLock<Container> =
+    LazyLock::new(|| Container::for_project(std::path::Path::new("/nonexistent/syl-slash-test")));
 
 // ============================================================
 // Helpers
@@ -50,6 +57,7 @@ fn build_ctx<'a>(
         output_tokens,
         message_count,
         config,
+        container: &CONTAINER,
     }
 }
 

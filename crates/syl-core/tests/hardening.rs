@@ -4,12 +4,12 @@
 use std::path::Path;
 
 use serde_json::json;
-use syl_rs::api::compaction::{choose_keep_boundary, KeepBoundary, COMPACT_KEEP};
-use syl_rs::api::types::{ContentBlock, Message, MessageContent};
-use syl_rs::config::container_name_for;
-use syl_rs::tools::memory::{memory_read, memory_write};
-use syl_rs::tools::workflow::{load_workflow, workflow_delete, workflow_write};
-use syl_rs::util::{is_safe_key, shell_quote, truncate_output, MAX_TOOL_OUTPUT};
+use syl_core::api::compaction::{choose_keep_boundary, KeepBoundary, COMPACT_KEEP};
+use syl_core::api::types::{ContentBlock, Message, MessageContent};
+use syl_core::container::name_for as container_name_for;
+use syl_core::tools::memory::{memory_read, memory_write};
+use syl_core::tools::workflow::{load_workflow, workflow_delete, workflow_write};
+use syl_core::util::{is_safe_key, shell_quote, truncate_output, MAX_TOOL_OUTPUT};
 
 // ---------------------------------------------------------------------------
 // Key validation / path traversal
@@ -174,8 +174,8 @@ fn boundary_inside_long_tool_chain_starts_at_assistant() {
 
 #[test]
 fn unanswered_tool_use_is_not_stored() {
-    use syl_rs::api::compaction::drop_unanswered_tool_uses;
-    use syl_rs::api::types::StopReason;
+    use syl_core::api::compaction::drop_unanswered_tool_uses;
+    use syl_core::api::types::StopReason;
 
     let text = ContentBlock::Text { text: "let me check".into(), cache_control: None };
     let tu = ContentBlock::ToolUse { id: "t1".into(), name: "run_bash".into(), input: json!({}) };
@@ -236,8 +236,8 @@ const OK_STREAM: &str = concat!(
     "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
 );
 
-fn mock_config(server: &wiremock::MockServer) -> syl_rs::config::AppConfig {
-    let mut config = syl_rs::config::AppConfig::default();
+fn mock_config(server: &wiremock::MockServer) -> syl_core::config::AppConfig {
+    let mut config = syl_core::config::AppConfig::default();
     config.api_url = format!("{}/v1/messages", server.uri());
     config.api_key = "test-key".to_string();
     config
@@ -245,9 +245,9 @@ fn mock_config(server: &wiremock::MockServer) -> syl_rs::config::AppConfig {
 
 #[tokio::test]
 async fn overloaded_error_mid_stream_is_retried_not_returned_as_partial_turn() {
-    use syl_rs::api::client::{call_with_retry_shared, SystemBlock};
+    use syl_core::api::client::{call_with_retry_shared, SystemBlock};
     let server = mock_server_with(vec![OVERLOADED_MID_STREAM, OK_STREAM]).await;
-    let state = syl_rs::shared::SharedState::new();
+    let state = syl_core::shared::SharedState::new();
     let turn = call_with_retry_shared(
         &reqwest::Client::new(),
         &mock_config(&server),
@@ -265,7 +265,7 @@ async fn overloaded_error_mid_stream_is_retried_not_returned_as_partial_turn() {
 
 #[tokio::test]
 async fn other_error_mid_stream_is_surfaced() {
-    use syl_rs::api::client::{stream_turn, SystemBlock};
+    use syl_core::api::client::{stream_turn, SystemBlock};
     const API_ERROR: &str = concat!(
         "event: error\n",
         "data: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"boom\"}}\n\n",
@@ -287,7 +287,7 @@ async fn other_error_mid_stream_is_surfaced() {
 
 #[tokio::test]
 async fn cancel_during_retry_backoff_returns_promptly() {
-    use syl_rs::api::client::{call_with_retry_shared, SystemBlock};
+    use syl_core::api::client::{call_with_retry_shared, SystemBlock};
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
     let server = MockServer::start().await;
@@ -300,7 +300,7 @@ async fn cancel_during_retry_backoff_returns_promptly() {
         c.cancel();
     });
     let started = std::time::Instant::now();
-    let state = syl_rs::shared::SharedState::new();
+    let state = syl_core::shared::SharedState::new();
     let err = call_with_retry_shared(
         &reqwest::Client::new(),
         &mock_config(&server),
@@ -327,6 +327,6 @@ fn html_tool_output_is_stripped_without_panicking() {
     let page = "<!DOCTYPE html><html><head><style>body { color: red }</style>\
                 <script type=\"text/javascript\">var x = '<b>';</script></head>\
                 <body><h1>Title</h1><p>Hello   world</p><SCRIPT>evil()</SCRIPT></body></html>";
-    let out = syl_rs::util::process_tool_output(page);
+    let out = syl_core::util::process_tool_output(page);
     assert_eq!(out, "Title Hello world");
 }

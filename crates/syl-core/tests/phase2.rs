@@ -1,8 +1,8 @@
 /// Phase 2 tests: AppConfig, SseParser, wiremock API client.
 use tempfile::TempDir;
 
-use syl_rs::api::client::SseParser;
-use syl_rs::config::{
+use syl_core::api::client::SseParser;
+use syl_core::config::{
     build_config, parse_cli_args, AppConfig, DEFAULT_RATE_LIMIT,
 };
 
@@ -164,8 +164,8 @@ fn full_sse_response(text: &str) -> Vec<u8> {
 
 #[test]
 fn test_sse_full_round_trip() {
-    use syl_rs::api::sse::StreamHandler;
-    use syl_rs::api::types::StopReason;
+    use syl_core::api::sse::StreamHandler;
+    use syl_core::api::types::StopReason;
 
     let mut parser = SseParser::new();
     let mut handler = StreamHandler::new();
@@ -184,8 +184,8 @@ fn test_sse_full_round_trip() {
 
 #[test]
 fn test_sse_tool_use_round_trip() {
-    use syl_rs::api::sse::StreamHandler;
-    use syl_rs::api::types::{ContentBlock, StopReason};
+    use syl_core::api::sse::StreamHandler;
+    use syl_core::api::types::{ContentBlock, StopReason};
 
     let sse = concat!(
         "event: message_start\n",
@@ -234,9 +234,9 @@ async fn test_stream_turn_with_mock_server() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    use syl_rs::api::client::{stream_turn, SystemBlock};
-    use syl_rs::api::types::{Message, StopReason};
-    use syl_rs::config::AppConfig;
+    use syl_core::api::client::{stream_turn, SystemBlock};
+    use syl_core::api::types::{Message, StopReason};
+    use syl_core::config::AppConfig;
 
     let server = MockServer::start().await;
 
@@ -284,9 +284,9 @@ async fn test_stream_turn_retries_on_429() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    use syl_rs::api::client::SystemBlock;
-    use syl_rs::api::types::{Message, StopReason};
-    use syl_rs::config::AppConfig;
+    use syl_core::api::client::SystemBlock;
+    use syl_core::api::types::{Message, StopReason};
+    use syl_core::config::AppConfig;
 
     let server = MockServer::start().await;
 
@@ -327,8 +327,8 @@ async fn test_stream_turn_retries_on_429() {
     let cancel = CancellationToken::new();
 
     // call_with_retry_shared should succeed on second attempt
-    let state = syl_rs::shared::SharedState::new();
-    let result = syl_rs::api::client::call_with_retry_shared(
+    let state = syl_core::shared::SharedState::new();
+    let result = syl_core::api::client::call_with_retry_shared(
         &client, &config, &state, &messages, &system, cancel, |_| {}, |_| {},
     )
     .await
@@ -344,9 +344,9 @@ async fn test_stream_turn_propagates_non_retryable_error() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    use syl_rs::api::client::{call_with_retry_shared, SystemBlock};
-    use syl_rs::api::types::Message;
-    use syl_rs::config::AppConfig;
+    use syl_core::api::client::{call_with_retry_shared, SystemBlock};
+    use syl_core::api::types::Message;
+    use syl_core::config::AppConfig;
 
     let server = MockServer::start().await;
 
@@ -365,7 +365,7 @@ async fn test_stream_turn_propagates_non_retryable_error() {
     let system = vec![SystemBlock::text("sys")];
     let cancel = CancellationToken::new();
 
-    let state = syl_rs::shared::SharedState::new();
+    let state = syl_core::shared::SharedState::new();
     let result =
         call_with_retry_shared(&client, &config, &state, &messages, &system, cancel, |_| {}, |_| {})
             .await;
@@ -381,9 +381,9 @@ async fn test_stream_turn_cancel() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    use syl_rs::api::client::{stream_turn, SystemBlock};
-    use syl_rs::api::types::Message;
-    use syl_rs::config::AppConfig;
+    use syl_core::api::client::{stream_turn, SystemBlock};
+    use syl_core::api::types::Message;
+    use syl_core::config::AppConfig;
 
     let server = MockServer::start().await;
 

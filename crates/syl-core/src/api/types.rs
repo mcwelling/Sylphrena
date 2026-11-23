@@ -98,7 +98,7 @@ impl From<&str> for StopReason {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Usage {
     pub input_tokens:       u64,
     pub output_tokens:      u64,

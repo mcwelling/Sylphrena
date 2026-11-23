@@ -1,5 +1,5 @@
 /// Tests for config.rs (Phase 4 mandatory gate).
-use syl_rs::config::{build_config, parse_cli_args, CliArgs, DEFAULT_MODEL, DEFAULT_RATE_LIMIT};
+use syl_core::config::{build_config, parse_cli_args, CliArgs, DEFAULT_MODEL, DEFAULT_RATE_LIMIT};
 use tempfile::TempDir;
 
 // ---------------------------------------------------------------------------

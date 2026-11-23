@@ -1,6 +1,7 @@
 /// `read_file` tool — reads a paged range of lines from a file inside the container.
 /// Mirrors `read-file-paged` in syl.bb.
-use crate::config::{container_name, AppConfig};
+use syl_container::Container;
+
 use crate::util::{shell_quote, truncate_output};
 
 /// Run the `read_file` tool. Returns `(output, is_error)`.
@@ -12,7 +13,7 @@ use crate::util::{shell_quote, truncate_output};
 /// 4. Uses `awk` to print lines in range with 5-char right-aligned line numbers
 ///
 /// Default window: 100 lines (start_line..start_line+99).
-pub fn read_file(input: &serde_json::Value, config: &AppConfig) -> (String, bool) {
+pub fn read_file(input: &serde_json::Value, container: &Container) -> (String, bool) {
     let path = match input["path"].as_str() {
         Some(p) if !p.is_empty() => p,
         _ => return ("[Tool error: read_file requires a non-empty 'path' field]".to_string(), true),
@@ -40,26 +41,9 @@ pub fn read_file(input: &serde_json::Value, config: &AppConfig) -> (String, bool
         end   = end,
     );
 
-    let _ = config.timeout_ms; // timeout enforced at container level via bash timeout if needed
-    match std::process::Command::new("podman")
-        .args(["exec", container_name(), "/bin/bash", "-c", &cmd])
-        .output()
-    {
-        Ok(out) => {
-            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-            let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-            if out.status.success() {
-                (truncate_output(&stdout), false)
-            } else {
-                let code = out.status.code().unwrap_or(-1);
-                let parts: Vec<&str> = [stdout.trim(), stderr.trim()]
-                    .iter()
-                    .filter(|s| !s.is_empty())
-                    .copied()
-                    .collect();
-                (format!("Error (Exit {}): {}", code, parts.join("\n")), true)
-            }
-        }
+    match container.exec_sync(&cmd) {
+        Ok(out) if out.success() => (truncate_output(&out.stdout), false),
+        Ok(out) => (out.error_text(), true),
         Err(e) => (format!("[Tool error: failed to spawn podman exec: {}]", e), true),
     }
 }

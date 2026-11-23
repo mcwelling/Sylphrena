@@ -1,7 +1,36 @@
-[package]
-name = "syl-rs"
+[workspace]
+members = ["crates/syl-core", "crates/syl-container"]
+resolver = "2"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
+
+[workspace.dependencies]
+syl-core = { path = "crates/syl-core" }
+syl-container = { path = "crates/syl-container" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+regex = "1"
+sha2 = "0.10"
+hex = "0.4"
+toml = "0.8"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+futures-util = "0.3"
+tempfile = "3"
+wiremock = "0.6"
+
+# The TUI client: the `syl` binary.
+[package]
+name = "syl-rs"
+version.workspace = true
+edition.workspace = true
 
 [lib]
 name = "syl_rs"
@@ -12,30 +41,17 @@ name = "syl"
 path = "src/main.rs"
 
 [dependencies]
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-regex = "1"
-chrono = { version = "0.4", features = ["std", "clock"], default-features = false }
-sha2 = "0.10"
-hex = "0.4"
-toml = "0.8"
-anyhow = "1"
-thiserror = "1"
-
-# Logging
-tracing            = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-appender   = "0.2"
-
-# Async runtime + HTTP
-tokio = { version = "1", features = ["full"] }
-tokio-util = { version = "0.7", features = ["compat"] }
-reqwest = { version = "0.12", features = ["json", "stream"] }
+syl-core.workspace = true
+syl-container.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+reqwest.workspace = true
 crossterm = "0.28"
 rustyline = "14"
-futures-util = "0.3"
 
 [dev-dependencies]
-tempfile = "3"
-wiremock = "0.6"
-tokio = { version = "1", features = ["full"] }
+tempfile.workspace = true
+tokio.workspace = true

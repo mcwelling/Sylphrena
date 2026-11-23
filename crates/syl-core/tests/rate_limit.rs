@@ -1,5 +1,5 @@
 /// Tests for api/rate_limit.rs (Phase 4 mandatory gate).
-use syl_rs::api::rate_limit::{
+use syl_core::api::rate_limit::{
     now_ms, prune_old_calls, record_rate_call, window_tokens, RateCall, RATE_WINDOW_MS,
 };
 
