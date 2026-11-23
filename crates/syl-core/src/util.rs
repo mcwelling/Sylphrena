@@ -77,11 +77,7 @@ pub fn process_tool_output(raw: &str) -> String {
     truncate_output(raw)
 }
 
-/// Wrap a string in single quotes for safe interpolation into a `sh -c` /
-/// `bash -c` command line. Embedded single quotes become `'\''`.
-pub fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', r"'\''"))
-}
+pub use syl_container::shell_quote;
 
 /// Validate a memory / workflow key before it becomes a file name on the HOST.
 /// Allows ASCII letters, digits, `-`, `_` and `.`; rejects empty keys, leading

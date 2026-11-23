@@ -1,13 +1,4 @@
-pub mod api;
-pub mod config;
-pub mod pricing;
-pub mod container;
-pub mod logging;
-pub mod session;
-pub mod shared;
+//! The Syl terminal client. The agent itself lives in `syl-core`; this crate
+//! renders its events and turns keystrokes into commands.
 pub mod slash;
-pub mod system_prompt;
-pub mod tools;
 pub mod tui;
-pub mod util;
-pub mod workspace;

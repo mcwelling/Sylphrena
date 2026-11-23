@@ -1,10 +1,11 @@
-use crate::api::types::Message;
-use crate::config::AppConfig;
-use crate::container::exec_command_raw;
-use crate::session::save_session;
-use crate::tools::memory::{list_memories, memory_read};
-use crate::tools::workflow::{list_workflows, load_workflow};
 use std::path::Path;
+
+use syl_container::Container;
+use syl_core::api::types::Message;
+use syl_core::config::AppConfig;
+use syl_core::session::save_session;
+use syl_core::tools::memory::{list_memories, memory_read};
+use syl_core::tools::workflow::{list_workflows, load_workflow, Workflow};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SlashAction {
@@ -31,6 +32,7 @@ pub struct SlashContext<'a> {
     pub output_tokens: u64,
     pub message_count: usize,
     pub config: &'a AppConfig,
+    pub container: &'a Container,
 }
 
 /// Handle a slash command. Returns None if the input is not a slash command.
@@ -160,7 +162,7 @@ Slash commands:
         } else {
             match load_workflow(ctx.workflow_dir, wf_name) {
                 None => format!("Workflow '{}' not found.", wf_name),
-                Some(wf) => run_workflow(&wf, ctx.config).await,
+                Some(wf) => run_workflow(&wf, ctx.container),
             }
         };
         return Some(SlashResult {
@@ -190,7 +192,7 @@ Slash commands:
 // Workflow execution (M5)
 // ---------------------------------------------------------------------------
 
-async fn run_workflow(wf: &crate::tools::workflow::Workflow, config: &AppConfig) -> String {
+fn run_workflow(wf: &Workflow, container: &Container) -> String {
     let total = wf.steps.len();
     let mut lines = vec![format!("[Workflow: {}] {} steps", wf.name, total)];
 
@@ -199,9 +201,7 @@ async fn run_workflow(wf: &crate::tools::workflow::Workflow, config: &AppConfig)
         lines.push(format!("[{step_num}/{total}] {}", step.label));
         lines.push(format!("$ {}", step.command));
 
-        let cmd = step.command.clone();
-        let cfg = config.clone();
-        let result = tokio::task::block_in_place(|| exec_command_raw(&cmd, &cfg));
+        let result = tokio::task::block_in_place(|| container.exec_raw(&step.command));
 
         match result {
             Ok(output) => {

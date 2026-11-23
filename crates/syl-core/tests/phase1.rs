@@ -4,18 +4,18 @@
 /// persistence, workflow CRUD, system prompt, stream handler, cache
 /// breakpoints, fmt_num, workspace context. CLI/config, slash commands, rate
 /// limiting have their own test files.
-use syl_rs::api::cache::attach_cache_breakpoints;
-use syl_rs::api::compaction::build_compacted_messages;
-use syl_rs::api::sse::StreamHandler;
-use syl_rs::api::types::{ContentBlock, Message, MessageContent, StopReason};
-use syl_rs::session::{load_session, save_session};
-use syl_rs::system_prompt::build_system_blocks;
-use syl_rs::tools::memory::{load_all_memories, memory_read, memory_write};
-use syl_rs::tools::workflow::{
+use syl_core::api::cache::attach_cache_breakpoints;
+use syl_core::api::compaction::build_compacted_messages;
+use syl_core::api::sse::StreamHandler;
+use syl_core::api::types::{ContentBlock, Message, MessageContent, StopReason};
+use syl_core::session::{load_session, save_session};
+use syl_core::system_prompt::build_system_blocks;
+use syl_core::tools::memory::{load_all_memories, memory_read, memory_write};
+use syl_core::tools::workflow::{
     list_workflows, load_workflow, parse_workflow, workflow_delete, workflow_write,
 };
-use syl_rs::util::{fmt_num, truncate_output, MAX_TOOL_OUTPUT};
-use syl_rs::workspace::gather_workspace_context;
+use syl_core::util::{fmt_num, truncate_output, MAX_TOOL_OUTPUT};
+use syl_core::workspace::gather_workspace_context;
 
 // ============================================================
 // 1. truncate_output

@@ -1,14 +1,15 @@
 /// `dispatch_agent` tool — fetches a URL and processes it via a Haiku sub-agent.
 ///
 /// See the "Output Handling" section of `docs/architecture.md`.
-use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::api::client::{call_with_retry_shared, CancelledError, SystemBlock};
+use syl_container::Container;
+
+use crate::api::client::{CancelledError, SystemBlock};
 use crate::api::types::{Message, StopReason};
 use crate::config::AppConfig;
-use crate::shared::SharedState;
+use crate::model::{ModelAdapter, ModelRequest};
 use crate::util::{is_html, strip_html};
 
 // ---------------------------------------------------------------------------
@@ -36,10 +37,10 @@ format exactly.";
 /// Run the `dispatch_agent` tool. Returns `(output_json, is_error)`.
 pub async fn dispatch_agent(
     input:  &serde_json::Value,
-    config: &AppConfig,
-    state:  &Arc<SharedState>,
-    client: &reqwest::Client,
-    cancel: CancellationToken,
+    config:    &AppConfig,
+    model:     &dyn ModelAdapter,
+    container: &Container,
+    cancel:    CancellationToken,
 ) -> (String, bool) {
     // --- Input validation ---
     let task = match input["task"].as_str() {
@@ -66,7 +67,7 @@ pub async fn dispatch_agent(
         .unwrap_or(800);
 
     // --- Fetch ---
-    let raw = match fetch_source(source, config, cancel.clone()).await {
+    let raw = match fetch_source(source, config, container, cancel.clone()).await {
         Ok(r)  => r,
         Err(e) => return err_json("Content retrieval failed", &e, source),
     };
@@ -85,8 +86,9 @@ pub async fn dispatch_agent(
     let user_msg   = build_haiku_user_message(&content, task, focus, fmt);
     let messages   = vec![Message::user_text(user_msg)];
 
-    let result = call_with_retry_shared(
-        client, &haiku_cfg, state, &messages, &system, cancel.clone(), |_| {}, |_| {},
+    let result = model.complete(
+        ModelRequest { config: &haiku_cfg, messages: &messages, system: &system },
+        cancel.clone(), &|_| {}, &|_| {},
     ).await;
 
     let turn = match result {
@@ -124,9 +126,10 @@ pub async fn dispatch_agent(
             let retry_msg  = build_haiku_retry_message(&content, task, focus);
             let retry_msgs = vec![Message::user_text(retry_msg)];
 
-            let retry_result = call_with_retry_shared(
-                client, &haiku_cfg, state, &retry_msgs, &system, cancel.clone(), |_| {}, |_| {},
-            ).await;
+            let retry_result = model.complete(
+        ModelRequest { config: &haiku_cfg, messages: &retry_msgs, system: &system },
+        cancel.clone(), &|_| {}, &|_| {},
+    ).await;
 
             let retry_text = match retry_result {
                 Ok(t) => t.content.iter().find_map(|b| {
@@ -158,9 +161,10 @@ pub async fn dispatch_agent(
 // ---------------------------------------------------------------------------
 
 async fn fetch_source(
-    source: &str,
-    config: &AppConfig,
-    cancel: CancellationToken,
+    source:    &str,
+    config:    &AppConfig,
+    container: &Container,
+    cancel:    CancellationToken,
 ) -> Result<String, String> {
     let is_pdf = source.to_lowercase().ends_with(".pdf");
     let cmd = if is_pdf {
@@ -174,11 +178,10 @@ async fn fetch_source(
         format!("curl -sL -A 'Mozilla/5.0' --max-time 30 {}", crate::util::shell_quote(source))
     };
 
-    let running = std::sync::Arc::new(std::sync::Mutex::new(None));
     let (output, is_err) = crate::tools::bash::run_bash(
         &serde_json::json!({ "command": cmd }),
         config,
-        running,
+        container,
         cancel,
     ).await;
 

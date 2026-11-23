@@ -1,7 +1,9 @@
 pub mod animation;
 pub mod bars;
 pub mod image_proto;
+pub mod image_render;
 pub mod input;
 pub mod picker;
 pub mod spinner;
+pub mod state;
 pub mod terminal;

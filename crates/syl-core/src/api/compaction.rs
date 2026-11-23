@@ -1,11 +1,10 @@
-use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::api::client::{call_with_retry_shared, SystemBlock};
+use crate::api::client::SystemBlock;
 use crate::api::types::{ContentBlock, Message, MessageContent, StopReason};
 use crate::config::AppConfig;
-use crate::shared::SharedState;
+use crate::model::{ModelAdapter, ModelRequest};
 
 // ---------------------------------------------------------------------------
 // Constants (match syl.bb lines 134-135)
@@ -146,9 +145,8 @@ fn messages_to_text(msgs: &[Message]) -> String {
 /// Summarise a slice of old messages. Returns None on failure (caller falls
 /// back to keeping the messages as-is).
 pub async fn summarize_messages(
-    http:   &reqwest::Client,
+    model:  &dyn ModelAdapter,
     config: &AppConfig,
-    state:  &Arc<SharedState>,
     msgs:   &[Message],
     cancel: CancellationToken,
 ) -> Option<String> {
@@ -169,7 +167,8 @@ pub async fn summarize_messages(
         "You are a conversation summarizer. Produce a concise summary in plain prose."
     )];
 
-    match call_with_retry_shared(http, &compact_cfg, state, &summary_msgs, &system, cancel, |_| {}, |_| {}).await {
+    let req = ModelRequest { config: &compact_cfg, messages: &summary_msgs, system: &system };
+    match model.complete(req, cancel, &|_| {}, &|_| {}).await {
         Ok(turn) => {
             let text: String = turn.content.iter().filter_map(|b| match b {
                 ContentBlock::Text { text, .. } => Some(text.as_str()),
@@ -223,9 +222,8 @@ pub fn choose_keep_boundary(messages: &[Message]) -> Option<KeepBoundary> {
 /// role-alternating history. Safe to call mid-turn, inside a tool chain.
 pub async fn compact_history(
     messages: Vec<Message>,
-    http:     &reqwest::Client,
+    model:    &dyn ModelAdapter,
     config:   &AppConfig,
-    state:    &Arc<SharedState>,
     cancel:   CancellationToken,
 ) -> Vec<Message> {
     if messages.len() <= MAX_HISTORY {
@@ -247,7 +245,7 @@ pub async fn compact_history(
         "compacting history"
     );
 
-    let summary = summarize_messages(http, config, state, &old, cancel).await;
+    let summary = summarize_messages(model, config, &old, cancel).await;
     if summary.is_none() {
         tracing::warn!("compaction summary failed — keeping recent messages only");
     }

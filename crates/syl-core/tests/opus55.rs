@@ -1,10 +1,10 @@
 //! Tests for the Claude Opus 5.5 default: model catalog, thinking request
 //! shape on adaptive models, and thinking-block stripping on history rewrites.
 use serde_json::json;
-use syl_rs::api::client::thinking_param;
-use syl_rs::api::compaction::strip_thinking;
-use syl_rs::api::types::{ContentBlock, Message, MessageContent};
-use syl_rs::config::{supports_manual_thinking, AppConfig, CLAUDE_MODELS, DEFAULT_MODEL};
+use syl_core::api::client::thinking_param;
+use syl_core::api::compaction::strip_thinking;
+use syl_core::api::types::{ContentBlock, Message, MessageContent};
+use syl_core::config::{supports_manual_thinking, AppConfig, CLAUDE_MODELS, DEFAULT_MODEL};
 
 #[test]
 fn default_model_is_opus_5_5_and_in_catalog() {
@@ -86,7 +86,7 @@ fn strip_thinking_removes_only_thinking_and_keeps_roles() {
 
 #[test]
 fn max_tokens_adds_budget_only_for_manual_thinking() {
-    use syl_rs::api::client::{request_max_tokens, MIN_THINKING_BUDGET};
+    use syl_core::api::client::{request_max_tokens, MIN_THINKING_BUDGET};
     let base = AppConfig::default().max_tokens as u64;
     assert_eq!(request_max_tokens(&cfg("claude-opus-5-5", None)), base);
     // Adaptive models ignore the budget, so it must not inflate max_tokens.
