@@ -5,7 +5,7 @@
 /// terminal and are tested manually or in integration tests.
 use syl_rs::tui::{
     animation::make_wind_frames,
-    bars::{ansi_visible_len, make_bottom_bar, make_top_bar, pad_to, BarData, DARK, LIGHT},
+    bars::{ansi_visible_len, make_bar, pad_to, BarData, DARK, LIGHT},
     image_proto::{parse_protocol_env, wrap_for_tmux, ImageProtocol},
 };
 
@@ -93,11 +93,8 @@ fn wind_frames_last_forward_wave_at_end() {
 fn default_bar_data() -> BarData {
     BarData {
         model: "claude-opus-4-6".into(),
-        timeout_ms: 60_000,
         input_tokens: 12_345,
         output_tokens: 1_234,
-        cache_read_tokens: 8_000,
-        cache_write_tokens: 500,
         tokens_per_min: 30_000.0,
         tpm_limit: 60_000.0,
         cost_usd: 0.1234,
@@ -105,86 +102,42 @@ fn default_bar_data() -> BarData {
         mem_mb: 256,
         message_count: 7,
         width: 100,
-        spinner_label: None,
     }
 }
 
 #[test]
-fn top_bar_not_empty() {
-    let bar = make_top_bar(&default_bar_data(), &DARK);
-    assert!(!bar.is_empty());
+fn bar_shows_model_tokens_cost_and_meters() {
+    let bar = make_bar(&default_bar_data(), &DARK);
+    for want in ["claude-opus-4-6", "12K", "1K", "0.1234", "50%", "256M", "7 msgs", "/help"] {
+        assert!(bar.contains(want), "bar missing {want}: {bar}");
+    }
 }
 
 #[test]
-fn top_bar_contains_token_counts() {
-    let bar = make_top_bar(&default_bar_data(), &DARK);
-    // 12_345 input → "12K"
-    assert!(bar.contains("12K"), "top bar missing input tokens: {}", bar);
-    // 1_234 output → "1K"
-    assert!(bar.contains("1K"), "top bar missing output tokens: {}", bar);
+fn bar_fills_the_width() {
+    let data = BarData { width: 160, ..default_bar_data() };
+    assert_eq!(ansi_visible_len(&make_bar(&data, &DARK)), 160);
 }
 
 #[test]
-fn top_bar_contains_cost() {
-    let bar = make_top_bar(&default_bar_data(), &DARK);
-    assert!(bar.contains("0.1234"), "top bar missing cost: {}", bar);
+fn a_narrow_bar_drops_the_least_useful_segments_first() {
+    let data = BarData { width: 70, ..default_bar_data() };
+    let bar = make_bar(&data, &DARK);
+    assert!(ansi_visible_len(&bar) <= 70, "{bar}");
+    assert!(bar.contains("claude-opus-4-6") && bar.contains("0.1234"), "model and cost stay: {bar}");
+    assert!(!bar.contains("msgs"), "messages go first: {bar}");
 }
 
 #[test]
-fn top_bar_padded_to_width() {
-    let data = BarData { width: 120, ..default_bar_data() };
-    let bar = make_top_bar(&data, &DARK);
-    let visible = ansi_visible_len(&bar);
-    assert!(
-        visible >= 120,
-        "top bar visible len {} < width 120",
-        visible
-    );
-}
-
-#[test]
-fn top_bar_tpm_zero_limit() {
-    // With tpm_limit=0, bar should not panic and should still render
+fn bar_without_a_tpm_limit_has_no_meter() {
     let data = BarData { tpm_limit: 0.0, ..default_bar_data() };
-    let bar = make_top_bar(&data, &DARK);
-    assert!(!bar.is_empty());
-}
-
-#[test]
-fn bottom_bar_shows_model() {
-    let bar = make_bottom_bar(&default_bar_data(), &DARK);
-    assert!(bar.contains("claude-opus-4-6"), "bottom bar missing model: {}", bar);
-}
-
-#[test]
-fn bottom_bar_shows_timeout() {
-    let bar = make_bottom_bar(&default_bar_data(), &DARK);
-    assert!(bar.contains("60"), "bottom bar missing timeout: {}", bar);
-}
-
-#[test]
-fn bottom_bar_spinner_overrides_model() {
-    let data = BarData {
-        spinner_label: Some("⠋ run_bash (3 s)".into()),
-        ..default_bar_data()
-    };
-    let bar = make_bottom_bar(&data, &DARK);
-    assert!(
-        bar.contains("run_bash"),
-        "spinner label missing: {}",
-        bar
-    );
-    // Model name should NOT appear when spinner is active
-    assert!(
-        !bar.contains("claude-opus-4-6"),
-        "model should not appear with spinner: {}",
-        bar
-    );
+    let bar = make_bar(&data, &DARK);
+    assert!(!bar.contains('█') && !bar.contains('░'), "{bar}");
 }
 
 #[test]
 fn light_palette_renders() {
-    let bar = make_top_bar(&default_bar_data(), &LIGHT);
+    let bar = make_bar(&default_bar_data(), &LIGHT);
     assert!(!bar.is_empty());
 }
 

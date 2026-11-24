@@ -18,7 +18,7 @@ use syl_core::shared::SharedState;
 use syl_rs::slash::{handle_slash, SlashAction, SlashContext};
 use syl_rs::tui::{
     animation,
-    bars::{make_bottom_bar, make_top_bar, BarData, DARK, LIGHT},
+    bars::{make_bar, BarData, DARK, LIGHT},
     image_render,
     input::InputEditor,
     spinner,
@@ -244,8 +244,8 @@ fn print_banner(tui: &TuiState, cols: u16, rows: u16) {
         String::new(),
     ];
 
-    // Scroll region height = rows - 4; show only as many image lines as fit
-    let scroll_height = rows.saturating_sub(4) as usize;
+    // Scroll region height = rows - 3; show only as many image lines as fit
+    let scroll_height = rows.saturating_sub(3) as usize;
     let image_available = scroll_height.saturating_sub(text_block.len());
     let all_image: Vec<&str> = BANNER.lines().collect();
     let image_lines = &all_image[..image_available.min(all_image.len())];
@@ -263,16 +263,10 @@ fn print_banner(tui: &TuiState, cols: u16, rows: u16) {
 fn draw_bars(tui: &TuiState, state: &SharedState, config: &AppConfig, model: &str, cols: u16, rows: u16) {
     let palette = if config.light { &LIGHT } else { &DARK };
 
-    let (input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd) = {
+    let (input_tokens, output_tokens, cost_usd) = {
         let tok = state.session_tokens.lock().unwrap();
         let cost = syl_core::pricing::compute_cost_usd(&tok, model);
-        (
-            tok.input_tokens,
-            tok.output_tokens,
-            tok.cache_read_tokens,
-            tok.cache_write_tokens,
-            cost,
-        )
+        (tok.input_tokens, tok.output_tokens, cost)
     };
 
     let (cpu_pct, mem_mb) = match tui.container_stats.lock().unwrap().as_ref() {
@@ -288,11 +282,8 @@ fn draw_bars(tui: &TuiState, state: &SharedState, config: &AppConfig, model: &st
 
     let data = BarData {
         model: model.to_string(),
-        timeout_ms: config.timeout_ms,
         input_tokens,
         output_tokens,
-        cache_read_tokens,
-        cache_write_tokens,
         tokens_per_min,
         tpm_limit: config.rate_limit as f64,
         cost_usd,
@@ -300,14 +291,11 @@ fn draw_bars(tui: &TuiState, state: &SharedState, config: &AppConfig, model: &st
         mem_mb,
         message_count: state.messages.lock().unwrap().len(),
         width: cols,
-        spinner_label: None,
     };
 
-    let top = make_top_bar(&data, palette);
-    let bottom = make_bottom_bar(&data, palette);
-
+    let bar = make_bar(&data, palette);
     let mut out = tui.stdout.lock().unwrap();
-    let _ = terminal::draw_status_bars(&mut *out, &top, &bottom, rows);
+    let _ = terminal::draw_status_bar(&mut *out, &bar, rows);
 }
 
 // ---------------------------------------------------------------------------
@@ -398,13 +386,26 @@ impl Repl<'_> {
         *self.tui.spinner.lock().unwrap() = Some(sp);
     }
 
-    /// `/tools`: the last turn's tool calls in full.
+    /// `/tools`: the last turn's tool calls in full, read from the session
+    /// log (so it works after `--resume` too), or from this run's memory
+    /// when there is no log.
     fn print_last_tools(&self) {
-        if self.last_tools.is_empty() {
+        let logged: Option<Vec<(String, serde_json::Value, String, bool)>> = self
+            .session
+            .as_ref()
+            .and_then(|s| syl_core::session::load_entries(self.sessions_dir, &s.id).ok())
+            .map(|entries| {
+                syl_core::session::last_turn_tool_calls(&entries)
+                    .into_iter()
+                    .map(|c| (c.name, c.input, c.output.unwrap_or_else(|| "(no result logged)".into()), c.is_error))
+                    .collect()
+            });
+        let calls = logged.unwrap_or_else(|| self.last_tools.clone());
+        if calls.is_empty() {
             self.print("No tool calls in the last turn.\r\n");
             return;
         }
-        for (name, input, output, is_error) in &self.last_tools {
+        for (name, input, output, is_error) in &calls {
             let mark = if *is_error { "\x1b[31m✗\x1b[0m" } else { "\x1b[32m✓\x1b[0m" };
             self.print(&format!("{mark} \x1b[1m{}\x1b[0m\r\n", tool_brief(name, input)));
             self.print(&format!("{}\r\n", tool_display(name, input, output)));
@@ -452,9 +453,10 @@ impl Repl<'_> {
             }
             editor.add_history_entry(&line);
 
-            // What you typed stays in the conversation (rustyline's own echo
-            // is on the input row, which the next prompt overwrites).
-            self.print(&format!("\r\n\x1b[1;36m›\x1b[0m \x1b[1m{}\x1b[0m\r\n", sanitize(&line)));
+            // What you typed stays in the conversation, on the right like a
+            // sent message (rustyline's own echo is on the input row, which
+            // the next prompt overwrites).
+            self.print(&format!("\r\n{}", chat_bubble(&sanitize(&line), self.cols, self.config.light)));
 
             if line == "/tools" {
                 self.print_last_tools();
@@ -593,6 +595,12 @@ impl Repl<'_> {
                     }
                     let (nc, nr) = *resize_rx.borrow_and_update();
                     self.apply_resize(nc, nr, true);
+                    // The resize stopped the spinner, which drew at the old
+                    // row: start it again where the ticker row is now.
+                    if !active.is_empty() {
+                        self.tui.stop_anim();
+                        self.show_running(&active);
+                    }
                     steer.draw(&self.tui.stdout, nr, nc);
                     if streaming {
                         // Text is already flowing: no thinking animation, and
@@ -631,7 +639,11 @@ impl Repl<'_> {
                     }
                     let _ = terminal::write_streaming(&self.tui.stdout, &text);
                 }
-                AgentEvent::Usage { .. } => self.tui.stop_anim(),
+                AgentEvent::Usage { .. } => {
+                    self.tui.stop_anim();
+                    // Keep the meters current through a long turn.
+                    self.redraw_bars();
+                }
                 AgentEvent::ToolCallStarted { id, name, input } => {
                     self.tui.stop_anim();
                     active.push((id.clone(), name, input.clone()));
@@ -657,7 +669,7 @@ impl Repl<'_> {
                             tool_brief(&name, &input),
                             one_line(&sanitize(&tool_outcome(&name, &output, is_error)), 60)
                         );
-                        terminal::draw_status_line(&self.tui.stdout, self.rows, &clip_visible(&line, self.cols));
+                        terminal::draw_ticker(&self.tui.stdout, self.rows, &clip_visible(&line, self.cols));
                     } else {
                         self.show_running(&active);
                     }
@@ -775,6 +787,50 @@ impl Repl<'_> {
     }
 }
 
+/// The user's message as a right-aligned block with a tinted background,
+/// the way a messaging app shows what you sent. Wrapped by words to about
+/// two thirds of the width; widths are in terminal columns, so wide
+/// characters line up.
+fn chat_bubble(text: &str, cols: u16, light: bool) -> String {
+    use unicode_width::UnicodeWidthStr;
+    let cols = cols as usize;
+    let max = (cols * 2 / 3).clamp(10, cols.saturating_sub(4).max(10));
+    let mut lines: Vec<String> = Vec::new();
+    for word in text.split_whitespace() {
+        let mut word = word.to_string();
+        // Hard-break a word wider than the bubble.
+        while word.width() > max {
+            let mut cut = String::new();
+            for c in word.chars() {
+                if (cut.clone() + &c.to_string()).width() > max {
+                    break;
+                }
+                cut.push(c);
+            }
+            word = word[cut.len()..].to_string();
+            lines.push(cut);
+        }
+        match lines.last_mut() {
+            Some(last) if !last.is_empty() && last.width() + 1 + word.width() <= max => {
+                last.push(' ');
+                last.push_str(&word);
+            }
+            _ => lines.push(word),
+        }
+    }
+    let inner = lines.iter().map(|l| l.width()).max().unwrap_or(0);
+    let (bg, fg) = if light { ("\x1b[48;5;254m", "\x1b[30m") } else { ("\x1b[48;5;238m", "\x1b[97m") };
+    // One column of margin on the right; one of padding inside each side.
+    let indent = cols.saturating_sub(inner + 2 + 1);
+    lines
+        .iter()
+        .map(|l| {
+            let pad = inner - l.width();
+            format!("{}{bg}{fg} {l}{} \x1b[0m\r\n", " ".repeat(indent), " ".repeat(pad))
+        })
+        .collect()
+}
+
 /// A short description of a tool call for the ticker: the tool and the
 /// one argument that says what it is doing.
 fn tool_brief(name: &str, input: &serde_json::Value) -> String {
@@ -821,9 +877,10 @@ fn tool_outcome(name: &str, output: &str, is_error: bool) -> String {
     }
 }
 
-/// Clip a line with colour codes to `cols` visible characters (the codes
-/// themselves take no room).
+/// Clip a line with colour codes to `cols` terminal columns (the codes
+/// themselves take no room; wide characters take two).
 fn clip_visible(text: &str, cols: u16) -> String {
+    use unicode_width::UnicodeWidthChar;
     let max = cols.saturating_sub(1) as usize;
     let mut out = String::new();
     let mut visible = 0;
@@ -839,11 +896,12 @@ fn clip_visible(text: &str, cols: u16) -> String {
             }
             continue;
         }
-        if visible >= max {
+        let w = c.width().unwrap_or(0);
+        if visible + w > max {
             break;
         }
         out.push(c);
-        visible += 1;
+        visible += w;
     }
     out.push_str("\x1b[0m");
     out

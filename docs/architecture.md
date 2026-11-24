@@ -19,7 +19,7 @@ This document covers the implementation details behind Syl's main subsystems.
 - [File Tools](#file-tools)
 - [Steering and Images](#steering-and-images)
 - [Output Handling](#output-handling)
-- [Status Bars & Token Tracking](#status-bars--token-tracking)
+- [Status Bar](#status-bar)
 - [Thinking Animation](#thinking-animation)
 - [Source Layout](#source-layout)
 
@@ -287,39 +287,38 @@ For remote content, Claude can call `dispatch_agent`, which fetches a URL and ha
 
 ---
 
-## Status Bars
+## Status Bar
 
 Everything fixed sits at the bottom of the terminal, under the conversation:
 
 ```
-rows 1 … rows-4   the conversation (DECSTBM scroll region)
-row  rows-3       stats bar
-row  rows-2       status bar: model and shortcuts, or the tool ticker
-row  rows-1       input prompt (the thinking animation during a turn)
+rows 1 … rows-3   the conversation (DECSTBM scroll region)
+row  rows-2       the status bar
+row  rows-1       input prompt; during a turn, the thinking animation or the tool ticker
 row  rows         the steering line during a turn
 ```
 
-The scroll region starts at row 1 on purpose. Terminals keep lines that scroll off the top of the screen in their scrollback, but discard lines that scroll out of a region starting lower down, so with a bar on row 1 the conversation could not be scrolled back through. Your own messages are printed into the conversation (`› …`) as you send them.
+The scroll region starts at row 1 on purpose. Terminals keep lines that scroll off the top of the screen in their scrollback, but discard lines that scroll out of a region starting lower down, so with a bar on row 1 the conversation could not be scrolled back through.
 
-**Stats bar:**
+Your messages are printed into the conversation as you send them, right-aligned on a tinted background like a sent text message, wrapped to two thirds of the width (widths in terminal columns, via `unicode-width`). Syl's replies stay on the left.
+
+**The bar** (`make_bar` in `src/tui/bars.rs`), redrawn at each prompt and after every model response:
 ```
-Syl ── ↑ 1024  ↓ 512  · $0.0124 ── TPM ████░░ 42% ── 80% cpu 123M ── 6 msgs ─────
+ Syl · claude-opus-5-5 ── ↑12K ↓1K ── $0.1234 ── ███░░░ 50% ── cpu 12% 256M ── 7 msgs ───── /help ─
 ```
 
 | Field | Description |
 |---|---|
-| `↑ N` / `↓ N` | Cumulative session input / output tokens |
-| `· $N` | Estimated session cost (USD) |
-| `TPM ███░ N%` | Real-time TPM vs. rate-limit budget |
-| `cpu% / MB` | Container CPU and memory (polled every 5 s) |
-| `N msgs` | Messages in the active conversation history |
+| model | The model for the next turn |
+| `↑ N` / `↓ N` | Session input / output tokens |
+| `$N` | Estimated session cost (USD) |
+| `███░ N%` | Tokens per minute against the rate-limit budget (hidden with no limit) |
+| `cpu N% NM` | Container CPU and memory (polled every 5 s) |
+| `N msgs` | Messages in the conversation history |
 
-**Status bar:**
-```
-─ claude-opus-5-5 · 120s ────────────────────── /help  /sessions  /exit ─
-```
+On a narrow terminal the bar drops segments, least useful first (messages, container, TPM, tokens); the model and cost always stay. Cache tokens and the timeout are in `/status`.
 
-Shows the active model and request timeout. During a turn it is the tool ticker: one line that each tool call overwrites. While calls run it shows a spinner with the call (`run_bash › cargo test`, and `+N more` for parallel calls); when they finish, `✓` or `✗` with a few words of outcome (`+3 -1` for an edit, a result count for a search). Tool calls don't print into the conversation; `/tools` shows the last turn's calls in full, with output and diffs. `show_image` still draws its image in the conversation.
+**The tool ticker** uses the input row during a turn, which the thinking animation also uses; the two never run at once (the animation is for waiting on the model, the ticker for tools). Each tool call overwrites it: while calls run, a spinner with the call (`run_bash › cargo test`, and `+N more` for parallel calls); when they finish, `✓` or `✗` with a few words (`+3 -1` for an edit, a result count for a search). The next prompt clears it. Tool calls don't print into the conversation; `/tools` shows the last turn's calls in full, with output and diffs, read from the session log so it works after `--resume`. `show_image` still draws its image in the conversation.
 
 ---
 
@@ -347,7 +346,7 @@ src/                       # syl-rs: the terminal client (binary `syl`)
 └── tui/
     ├── state.rs           # TuiState (stdout, spinner, animation, stats)
     ├── terminal.rs        # raw mode, scroll region, DECSC/DECRC, SIGWINCH
-    ├── bars.rs            # top/bottom status bar rendering (pure)
+    ├── bars.rs            # status bar rendering (pure)
     ├── picker.rs          # interactive arrow-key model picker
     ├── animation.rs       # windspren thinking animation
     ├── spinner.rs         # tool execution spinner

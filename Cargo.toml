@@ -53,6 +53,7 @@ tokio-util.workspace = true
 reqwest.workspace = true
 crossterm = "0.28"
 rustyline = "14"
+unicode-width = "0.2"
 
 [dev-dependencies]
 tempfile.workspace = true

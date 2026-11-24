@@ -324,3 +324,25 @@ fn images_dropped_replaces_older_images_and_strips_thinking() {
     log.append(EntryKind::ImagesDropped { all: true }).unwrap();
     assert_eq!(syl_core::session::image_load(log.messages()), (0, 0));
 }
+
+#[test]
+fn last_turn_tool_calls_come_from_the_log() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut log = SessionLog::create(None, tmp.path());
+    log.append(msg(Message::user_text("first"))).unwrap();
+    log.append(msg(tool_use("old"))).unwrap();
+    log.append(result("old")).unwrap();
+    log.append(msg(Message::user_text("second"))).unwrap();
+    log.append(msg(Message::assistant_blocks(vec![
+        ContentBlock::ToolUse { id: "a".into(), name: "ls".into(), input: json!({}) },
+        ContentBlock::ToolUse { id: "b".into(), name: "grep".into(), input: json!({"pattern": "x"}) },
+    ])))
+    .unwrap();
+    log.append(EntryKind::ToolResult { tool_use_id: "b".into(), content: "boom".into(), is_error: true }).unwrap();
+    log.append(result("a")).unwrap();
+    let calls = syl_core::session::last_turn_tool_calls(log.entries());
+    let names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["ls", "grep"]);
+    assert_eq!(calls[0].output.as_deref(), Some("out a"));
+    assert!(calls[1].is_error);
+}

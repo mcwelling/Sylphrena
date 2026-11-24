@@ -1,10 +1,10 @@
 /// Terminal control: scroll region setup, status bar drawing, cursor helpers, SIGWINCH.
 ///
 /// Layout (1-indexed rows, `rows` = total terminal height):
-///   Rows 1..rows-4 — scroll region (the conversation)
-///   Row rows-3     — stats bar
-///   Row rows-2     — status bar (tool ticker, spinner, or model and shortcuts)
-///   Row rows-1     — input prompt (rustyline; the thinking animation in a turn)
+///   Rows 1..rows-3 — scroll region (the conversation)
+///   Row rows-2     — the status bar (model, tokens, cost, meters)
+///   Row rows-1     — input prompt; during a turn, the thinking animation
+///                    or the tool ticker (they never run at the same time)
 ///   Row rows       — spare (the steering line during a turn)
 ///
 /// The scroll region starts at row 1 on purpose: terminals keep lines that
@@ -25,62 +25,40 @@ use crossterm::{
 
 /// The last row of the scroll region (0-indexed).
 pub fn last_chat_row(rows: u16) -> u16 {
-    rows.saturating_sub(5)
-}
-
-/// The stats bar row (0-indexed).
-pub fn stats_row(rows: u16) -> u16 {
     rows.saturating_sub(4)
 }
 
-/// The status bar row, 1-indexed for escape sequences.
-pub fn status_row_1(rows: u16) -> u16 {
-    rows.saturating_sub(2)
+/// The status bar row (0-indexed).
+pub fn bar_row(rows: u16) -> u16 {
+    rows.saturating_sub(3)
+}
+
+/// The row the tool ticker and spinner use during a turn: the input row,
+/// 1-indexed for escape sequences.
+pub fn ticker_row_1(rows: u16) -> u16 {
+    rows.saturating_sub(1)
 }
 
 /// Establish the scroll region for Syl's fixed-row layout.
 ///
-/// Sets the DECSTBM scroll region to rows 1..=rows-4 (1-indexed) and moves
+/// Sets the DECSTBM scroll region to rows 1..=rows-3 (1-indexed) and moves
 /// the cursor to the input row so the first readline call lands correctly.
 pub fn setup_scroll_region(stdout: &mut impl Write, rows: u16) -> io::Result<()> {
-    // DECSTBM: set scroll region top=1, bottom=rows-4 (1-indexed)
-    let bot = rows.saturating_sub(4).max(1);
+    // DECSTBM: set scroll region top=1, bottom=rows-3 (1-indexed)
+    let bot = rows.saturating_sub(3).max(1);
     write!(stdout, "\x1b[1;{}r", bot)?;
     // Move cursor to input row: rows-1 (1-indexed) = rows-2 (0-indexed)
     execute!(stdout, cursor::MoveTo(0, rows.saturating_sub(2)))?;
     stdout.flush()
 }
 
-/// Draw top and bottom status bars without moving the user-visible cursor.
+/// Draw the status bar without moving the user-visible cursor.
 ///
 /// Uses DECSC (\x1b7) / DECRC (\x1b8) to save and restore the cursor position
 /// so bar repaints are invisible to output flowing through the scroll region.
-pub fn draw_status_bars(
-    stdout: &mut impl Write,
-    top: &str,
-    bottom: &str,
-    rows: u16,
-) -> io::Result<()> {
-    // Save cursor (DECSC)
+pub fn draw_status_bar(stdout: &mut impl Write, bar: &str, rows: u16) -> io::Result<()> {
     write!(stdout, "\x1b7")?;
-
-    // Stats bar — row rows-3 (1-indexed)
-    queue!(
-        stdout,
-        cursor::MoveTo(0, stats_row(rows)),
-        Clear(ClearType::CurrentLine),
-        Print(top),
-    )?;
-
-    // Bottom bar — row rows-2 (1-indexed) = row rows-3 (0-indexed)
-    queue!(
-        stdout,
-        cursor::MoveTo(0, rows.saturating_sub(3)),
-        Clear(ClearType::CurrentLine),
-        Print(bottom),
-    )?;
-
-    // Restore cursor (DECRC)
+    queue!(stdout, cursor::MoveTo(0, bar_row(rows)), Clear(ClearType::CurrentLine), Print(bar))?;
     write!(stdout, "\x1b8")?;
     stdout.flush()
 }
@@ -174,12 +152,12 @@ pub fn end_streaming(
     out.flush()
 }
 
-/// Show `text` on the status bar row, replacing what was there (the tool
-/// ticker). The next bar redraw or spinner overwrites it.
-pub fn draw_status_line(stdout: &Arc<Mutex<std::io::Stdout>>, rows: u16, text: &str) {
+/// Show `text` on the ticker row, replacing what was there. The spinner,
+/// the thinking animation or the next prompt overwrites it.
+pub fn draw_ticker(stdout: &Arc<Mutex<std::io::Stdout>>, rows: u16, text: &str) {
     if let Ok(mut out) = stdout.lock() {
         // Autowrap off, so a long line is clipped rather than wrapped.
-        let _ = write!(out, "\x1b7\x1b[?7l\x1b[{};1H\x1b[2K{text}\x1b[?7h\x1b8", status_row_1(rows));
+        let _ = write!(out, "\x1b7\x1b[?7l\x1b[{};1H\x1b[2K{text}\x1b[?7h\x1b8", ticker_row_1(rows));
         let _ = out.flush();
     }
 }

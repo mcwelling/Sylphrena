@@ -32,7 +32,12 @@ impl InputEditor {
     /// of a turn, say).
     pub fn readline(&mut self, prompt: &str, rows: u16, initial: &str) -> RlResult<String> {
         // Anchor cursor at input row: rows-1 (1-indexed) = rows-2 (0-indexed)
-        let _ = execute!(io::stdout(), cursor::MoveTo(0, rows.saturating_sub(2)));
+        // Clear it too: the tool ticker may have left its last line here.
+        let _ = execute!(
+            io::stdout(),
+            cursor::MoveTo(0, rows.saturating_sub(2)),
+            crossterm::terminal::Clear(crossterm::terminal::ClearType::CurrentLine)
+        );
         if initial.is_empty() {
             self.rl.readline(prompt)
         } else {

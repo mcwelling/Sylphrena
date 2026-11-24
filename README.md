@@ -116,7 +116,7 @@ Claude has these built-in tools, all running inside the container:
 
 Read-only calls (`read_file`, `grep`, `glob`, `ls`, `memory_read`) made together run in parallel.
 
-In the terminal, tool calls show on a single status line that each call overwrites (`✓ edit_file › src/main.rs  +3 -1`), so they don't crowd the conversation. `/tools` shows the last turn's calls in full, with output and diffs.
+In the terminal, your messages sit on the right and Syl's replies on the left, and the conversation scrolls back in your terminal's own scrollback. Tool calls show on a single line under the status bar that each call overwrites (`✓ edit_file › src/main.rs  +3 -1`), so they don't crowd the conversation. `/tools` shows the last turn's calls in full, with output and diffs.
 
 **Project instructions:** `AGENTS.md` (or `CLAUDE.md` where there is no `AGENTS.md`) in the project and every directory above it is loaded into the system prompt when a conversation starts; the project's own file comes last.
 

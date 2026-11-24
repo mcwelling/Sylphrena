@@ -765,6 +765,50 @@ pub fn user_prompts(entries: &[Entry]) -> Vec<Prompt> {
         .collect()
 }
 
+/// A tool call and its result, as the log recorded them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolCallRecord {
+    pub name: String,
+    pub input: serde_json::Value,
+    /// None if the call has no result in the log (yet).
+    pub output: Option<String>,
+    pub is_error: bool,
+}
+
+/// The tool calls of the last turn in a chain (everything after the last
+/// typed prompt), in the order they were made.
+pub fn last_turn_tool_calls(entries: &[Entry]) -> Vec<ToolCallRecord> {
+    let start = user_prompts(entries)
+        .last()
+        .and_then(|p| entries.iter().position(|e| e.id == p.entry))
+        .map_or(0, |i| i + 1);
+    let mut calls: Vec<(String, ToolCallRecord)> = Vec::new();
+    for e in &entries[start..] {
+        match &e.kind {
+            EntryKind::Message { message } if message.role == "assistant" => {
+                if let MessageContent::Blocks(blocks) = &message.content {
+                    for b in blocks {
+                        if let ContentBlock::ToolUse { id, name, input } = b {
+                            calls.push((
+                                id.clone(),
+                                ToolCallRecord { name: name.clone(), input: input.clone(), output: None, is_error: false },
+                            ));
+                        }
+                    }
+                }
+            }
+            EntryKind::ToolResult { tool_use_id, content, is_error } => {
+                if let Some((_, c)) = calls.iter_mut().find(|(id, _)| id == tool_use_id) {
+                    c.output = Some(content.clone());
+                    c.is_error = *is_error;
+                }
+            }
+            _ => {}
+        }
+    }
+    calls.into_iter().map(|(_, c)| c).collect()
+}
+
 /// `text` on one line of at most `max` characters, with control
 /// characters (terminal escapes included) replaced by spaces.
 pub fn one_line(text: &str, max: usize) -> String {

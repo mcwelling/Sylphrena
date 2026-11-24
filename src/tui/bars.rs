@@ -1,7 +1,7 @@
-/// Status bar rendering: top (token telemetry) and bottom (model/spinner).
-///
-/// All functions are pure — no I/O.  The caller owns stdout and calls
-/// `draw_status_bars` from `tui::terminal` to paint the returned strings.
+//! Status bar rendering: one bar with the model, tokens, cost and meters.
+//!
+//! All functions are pure — no I/O.  The caller owns stdout and calls
+//! `draw_status_bar` from `tui::terminal` to paint the returned string.
 
 /// ANSI colour escape strings for one theme.
 pub struct Palette {
@@ -46,20 +46,14 @@ pub const LIGHT: Palette = Palette {
     ug:  "\x1b[32m",
 };
 
-/// All data needed to render both bars.
+/// All data needed to render the bar.
 pub struct BarData {
-    /// Model identifier shown in the bottom bar.
+    /// Model identifier.
     pub model: String,
-    /// Request timeout in milliseconds.
-    pub timeout_ms: u64,
     /// Cumulative input tokens for this session.
     pub input_tokens: u64,
     /// Cumulative output tokens for this session.
     pub output_tokens: u64,
-    /// Cumulative cache-read tokens.
-    pub cache_read_tokens: u64,
-    /// Cumulative cache-write tokens.
-    pub cache_write_tokens: u64,
     /// Tokens-per-minute consumption in the current rate window.
     pub tokens_per_min: f64,
     /// Configured TPM budget (0 = unlimited).
@@ -72,21 +66,16 @@ pub struct BarData {
     pub mem_mb: u64,
     /// Number of messages in the current conversation history.
     pub message_count: usize,
-    /// Terminal column count — used to right-pad bars to fill the row.
+    /// Terminal column count — used to right-pad the bar to fill the row.
     pub width: u16,
-    /// When `Some`, the bottom bar shows the spinner label rather than model info.
-    pub spinner_label: Option<String>,
 }
 
 impl Default for BarData {
     fn default() -> Self {
         BarData {
             model: String::from("claude-opus-4-6"),
-            timeout_ms: 60_000,
             input_tokens: 0,
             output_tokens: 0,
-            cache_read_tokens: 0,
-            cache_write_tokens: 0,
             tokens_per_min: 0.0,
             tpm_limit: 0.0,
             cost_usd: 0.0,
@@ -94,7 +83,6 @@ impl Default for BarData {
             mem_mb: 0,
             message_count: 0,
             width: 80,
-            spinner_label: None,
         }
     }
 }
@@ -144,107 +132,61 @@ pub fn ansi_visible_len(s: &str) -> usize {
 /// Build the top status bar: branding + token counts + TPM bar + cost + container stats + message count.
 ///
 /// Layout: `Syl ─ ↑ N  ↓ N  · $N.NNNN ─── TPMbar pct% ─── cpu% mem ─── N msgs ──────`
-pub fn make_top_bar(data: &BarData, p: &Palette) -> String {
-    let w = data.width as usize;
-
-    // Branding
-    let brand = format!("{lb}Syl{r}", lb = p.lb, r = p.r);
-
-    // Token counts — ↑ in  ↓ out  · cache_read/cache_write
-    let tokens = format!(
-        "{cy}↑{r}{wh}{inp}{r}  {cy}↓{r}{wh}{out}{r}  {dim}·{r} {dim}{cr}/{cw}{r}",
-        cy  = p.cy,
-        r   = p.r,
-        wh  = p.wh,
-        dim = p.dim,
-        inp = fmt_k(data.input_tokens),
-        out = fmt_k(data.output_tokens),
-        cr  = fmt_k(data.cache_read_tokens),
-        cw  = fmt_k(data.cache_write_tokens),
-    );
-
-    // Cost
-    let cost = format!("{ye}${:.4}{r}", data.cost_usd, ye = p.ye, r = p.r);
-
-    // TPM bar (6 blocks) + percentage
-    let tpm_ratio = if data.tpm_limit > 0.0 {
-        (data.tokens_per_min / data.tpm_limit).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    let tpm_color = if tpm_ratio > 0.8 { p.ur } else if tpm_ratio > 0.5 { p.uy } else { p.ug };
-    let tpm_seg = if data.tpm_limit > 0.0 {
-        let filled = (tpm_ratio * 6.0).round() as usize;
-        let bar: String = "█".repeat(filled) + &"░".repeat(6 - filled);
-        format!("{c}{bar}{r} {c}{pct:.0}%{r}", c = tpm_color, r = p.r, bar = bar, pct = tpm_ratio * 100.0)
-    } else {
-        format!("{dim}──────{r}", dim = p.dim, r = p.r)
-    };
-
-    // CPU — colour-coded: green < 60%, yellow < 85%, red ≥ 85%
-    let cpu_color = if data.cpu_pct >= 85.0 { p.ur } else if data.cpu_pct >= 60.0 { p.uy } else { p.ug };
-    let cpu_seg = format!("{c}{cpu:.0}%{r} {dim}{mem}M{r}", c = cpu_color, r = p.r, dim = p.dim,
-                          cpu = data.cpu_pct, mem = data.mem_mb);
-
-    // Message count
-    let msgs_seg = format!("{dim}{n} msgs{r}", n = data.message_count, dim = p.dim, r = p.r);
-
-    // Assemble fixed segments separated by dim dash separators
-    let sep = format!(" {dim}──{r} ", dim = p.dim, r = p.r);
-    let core = format!(" {brand} {sep}{tokens}{sep}{cost}{sep}{tpm_seg}{sep}{cpu_seg}{sep}{msgs_seg} ",
-                       brand = brand, sep = sep, tokens = tokens, cost = cost,
-                       tpm_seg = tpm_seg, cpu_seg = cpu_seg, msgs_seg = msgs_seg);
-
-    // Fill remaining width with dim dashes
-    let visible = ansi_visible_len(&core);
-    if visible < w {
-        let fill = format!("{dim}{}{r}", "─".repeat(w - visible), dim = p.dim, r = p.r);
-        format!("{}{}", core, fill)
-    } else {
-        core
-    }
-}
-
-/// Build the bottom status bar: model + timeout + right-aligned shortcuts.
+/// The one status bar: brand and model, then the meters, then `/help`.
 ///
-/// Layout: `─ model · Ns timeout ──────────────── /help  /sessions  /exit ─`
-pub fn make_bottom_bar(data: &BarData, p: &Palette) -> String {
+/// ```text
+///  Syl · claude-opus-5-5 ── ↑12K ↓1K ── $0.1234 ── ███░░░ 50% ── cpu 12% 256M ── 7 msgs ───── /help
+/// ```
+///
+/// When the terminal is too narrow, segments are dropped, least useful
+/// first: messages, container, TPM, tokens. The model and cost always stay.
+pub fn make_bar(data: &BarData, p: &Palette) -> String {
     let w = data.width as usize;
+    let (r, dim) = (p.r, p.dim);
 
-    let content = match &data.spinner_label {
-        Some(label) => {
-            // Spinner mode: just show the label, padded
-            let s = format!(" {lb}{label}{r} ", lb = p.lb, r = p.r, label = label);
-            return pad_to(&s, w);
+    let head = format!(" {lb}Syl{r} {dim}·{r} {lb}{}{r}", data.model, lb = p.lb);
+    let tokens = format!(
+        "{cy}↑{r}{wh}{}{r} {cy}↓{r}{wh}{}{r}",
+        fmt_k(data.input_tokens),
+        fmt_k(data.output_tokens),
+        cy = p.cy,
+        wh = p.wh,
+    );
+    let cost = format!("{ye}${:.4}{r}", data.cost_usd, ye = p.ye);
+    let tpm = (data.tpm_limit > 0.0).then(|| {
+        let ratio = (data.tokens_per_min / data.tpm_limit).clamp(0.0, 1.0);
+        let c = if ratio > 0.8 { p.ur } else if ratio > 0.5 { p.uy } else { p.ug };
+        let filled = (ratio * 6.0).round() as usize;
+        format!("{c}{}{}{r} {c}{:.0}%{r}", "█".repeat(filled), "░".repeat(6 - filled), ratio * 100.0)
+    });
+    let cpu_c = if data.cpu_pct >= 85.0 { p.ur } else if data.cpu_pct >= 60.0 { p.uy } else { p.ug };
+    let cpu = format!("{dim}cpu{r} {cpu_c}{:.0}%{r} {dim}{}M{r}", data.cpu_pct, data.mem_mb);
+    let msgs = format!("{dim}{} msgs{r}", data.message_count);
+    let help = format!("{dim}/help ─{r}");
+
+    // Optional segments, most important first; drop from the end to fit.
+    let mut optional: Vec<String> = vec![tokens];
+    optional.extend(tpm);
+    optional.push(cpu);
+    optional.push(msgs);
+
+    let sep = format!(" {dim}──{r} ");
+    loop {
+        let mut parts = vec![head.clone()];
+        parts.push(cost.clone());
+        parts.extend(optional.iter().cloned());
+        // Cost reads best right after the tokens it pays for.
+        if parts.len() > 2 {
+            parts.swap(1, 2);
         }
-        None => {
-            let timeout_s = data.timeout_ms / 1000;
-            format!(
-                "{dim}─{r} {lb}{model}{r} {dim}· {timeout}s{r}",
-                dim     = p.dim,
-                r       = p.r,
-                lb      = p.lb,
-                model   = data.model,
-                timeout = timeout_s,
-            )
+        let core = parts.join(&sep);
+        let used = ansi_visible_len(&core) + 1 + ansi_visible_len(&help);
+        if used < w || optional.is_empty() {
+            let fill = w.saturating_sub(used + 1);
+            return format!("{core} {dim}{}{r} {help}", "─".repeat(fill));
         }
-    };
-
-    // Right-aligned shortcuts
-    let shortcuts = format!("{dim}/help  /sessions  /exit ─{r}", dim = p.dim, r = p.r);
-    let shortcuts_vis = ansi_visible_len(&shortcuts);
-
-    let left_vis  = ansi_visible_len(&content);
-    // +1 for leading space, +1 for space before shortcuts
-    let total_fixed = 1 + left_vis + 1 + shortcuts_vis;
-
-    let fill = if total_fixed < w {
-        format!("{dim}{}{r}", "─".repeat(w - total_fixed), dim = p.dim, r = p.r)
-    } else {
-        String::new()
-    };
-
-    format!(" {content} {fill}{shortcuts}", content = content, fill = fill, shortcuts = shortcuts)
+        optional.pop();
+    }
 }
 
 #[cfg(test)]
