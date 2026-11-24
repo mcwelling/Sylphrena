@@ -90,8 +90,27 @@ pub enum EntryKind {
     /// too many images make every request fail. Thinking blocks are removed
     /// too, since editing earlier messages invalidates them.
     ImagesDropped { all: bool },
-    /// Reserved for the permission engine (Phase 3).
-    Approval { tool_use_id: String, approved: bool },
+    /// A permission decision for a tool call that a rule (or plan mode)
+    /// didn't simply allow.
+    Approval {
+        tool_use_id: String,
+        /// `allow` or `deny`.
+        decision: String,
+        /// `rule`, `user`, `user_always` or `reviewer`.
+        by: String,
+        /// What was decided on (the command, path or URL).
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        subject: String,
+    },
+    /// The workspace was snapshotted (shadow git) before this turn changed
+    /// files.
+    Checkpoint { commit: String, label: String },
+    /// The workspace was put back to `commit`; `safety` is the snapshot taken
+    /// just before, so the restore can be undone.
+    Restored { commit: String, safety: String },
+    /// Something the model should know that isn't a prompt: the mode
+    /// changed, or files were restored. Added to the next user message.
+    Note { text: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -251,7 +270,30 @@ impl History {
                 }
                 self.messages = strip_thinking(std::mem::take(&mut self.messages));
             }
-            EntryKind::Approval { .. } => {}
+            EntryKind::Note { text } => {
+                let block = ContentBlock::Text { text: text.clone(), cache_control: None };
+                match self.messages.last_mut() {
+                    Some(m) if m.role == "user" => {
+                        if let MessageContent::Text(t) = &m.content {
+                            m.content = MessageContent::Blocks(vec![ContentBlock::Text {
+                                text: t.clone(),
+                                cache_control: None,
+                            }]);
+                        }
+                        if let MessageContent::Blocks(blocks) = &mut m.content {
+                            blocks.push(block);
+                        }
+                    }
+                    _ => {
+                        self.messages.push(Message {
+                            role: "user".to_string(),
+                            content: MessageContent::Blocks(vec![block]),
+                        });
+                        self.starts.push(e.id.clone());
+                    }
+                }
+            }
+            EntryKind::Approval { .. } | EntryKind::Checkpoint { .. } | EntryKind::Restored { .. } => {}
         }
     }
 
@@ -761,6 +803,86 @@ pub fn user_prompts(entries: &[Entry]) -> Vec<Prompt> {
                 }
             };
             Some(Prompt { entry: e.id.clone(), parent: e.parent_id.clone(), text })
+        })
+        .collect()
+}
+
+/// What one turn did, from the log: `/receipts`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Receipt {
+    pub prompt: String,
+    pub ts: u64,
+    /// The checkpoint taken before the turn changed files.
+    pub checkpoint: Option<String>,
+    /// Paths given to edit_file / write_file (run_bash may change others;
+    /// diff the checkpoints for everything).
+    pub files: Vec<String>,
+    pub commands: Vec<String>,
+    pub urls: Vec<String>,
+    /// "allow git push (user)", "deny rm -rf x (rule)".
+    pub approvals: Vec<String>,
+    /// Tool calls that failed or were refused.
+    pub errors: usize,
+}
+
+/// One receipt per typed prompt, oldest first.
+pub fn receipts(entries: &[Entry]) -> Vec<Receipt> {
+    let prompts: std::collections::HashSet<String> = user_prompts(entries).into_iter().map(|p| p.entry).collect();
+    let mut out: Vec<Receipt> = Vec::new();
+    for e in entries {
+        if prompts.contains(&e.id) {
+            let text = user_prompts(std::slice::from_ref(e)).pop().map(|p| p.text).unwrap_or_default();
+            out.push(Receipt { prompt: text, ts: e.ts, ..Default::default() });
+            continue;
+        }
+        let Some(r) = out.last_mut() else { continue };
+        match &e.kind {
+            EntryKind::Message { message } if message.role == "assistant" => {
+                if let MessageContent::Blocks(blocks) = &message.content {
+                    for b in blocks {
+                        if let ContentBlock::ToolUse { name, input, .. } = b {
+                            let arg = |k: &str| input[k].as_str().unwrap_or("").to_string();
+                            match name.as_str() {
+                                "edit_file" | "write_file" => {
+                                    let p = arg("path");
+                                    if !r.files.contains(&p) {
+                                        r.files.push(p);
+                                    }
+                                }
+                                "run_bash" => r.commands.push(arg("command")),
+                                "dispatch_agent" => r.urls.push(arg("source")),
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+            EntryKind::ToolResult { is_error: true, .. } => r.errors += 1,
+            EntryKind::Approval { decision, by, subject, .. } => {
+                r.approvals.push(format!("{decision} {} ({by})", one_line(subject, 80)));
+            }
+            EntryKind::Checkpoint { commit, .. } if r.checkpoint.is_none() => r.checkpoint = Some(commit.clone()),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The checkpoints in a chain, oldest first: the commit, its label, and
+/// when it was taken. Includes the snapshots taken just before restores
+/// and plan-mode put-backs.
+pub fn checkpoints(entries: &[Entry]) -> Vec<(String, String, u64)> {
+    entries
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EntryKind::Checkpoint { commit, label } => Some((commit.clone(), label.clone(), e.ts)),
+            // The state just before a restore, so a restore can be undone.
+            EntryKind::Restored { commit, safety } => Some((
+                safety.clone(),
+                format!("before going back to {}", crate::checkpoint::short(commit)),
+                e.ts,
+            )),
+            _ => None,
         })
         .collect()
 }

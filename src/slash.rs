@@ -60,6 +60,10 @@ Slash commands:
   /model [name]     Interactive model picker, or switch directly by name
   /status           Session stats
   /tools            The last turn's tool calls in full (output, diffs)
+  /undo             Put files back as they were before the last turn that changed them (Ctrl+Z)
+  /checkpoints      List checkpoints; /restore <n> goes back to one
+  /receipts [n]     What the last n turns edited, ran, fetched and were allowed
+  /plan, /build     Plan mode (no file changes) or build mode (Shift+Tab toggles)
   /sessions         List saved sessions
   /resume <n|id>    Switch to a saved session (number from /sessions, id or name)
   /history          Prompts in this session, numbered for /fork

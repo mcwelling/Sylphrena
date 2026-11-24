@@ -9,7 +9,9 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use syl_container::Container;
-use syl_core::agent::{self, Agent, AgentCommand, AgentEvent, SessionPaths, SessionStart, TurnEnd};
+use syl_core::agent::{self, Agent, AgentCommand, AgentEvent, Mode, SessionPaths, SessionStart, TurnEnd};
+use syl_core::checkpoint::Checkpoints;
+use syl_core::control::PermissionAnswer;
 use syl_core::api::types::StopReason;
 use syl_core::config::{build_config, parse_cli_args, AppConfig};
 use syl_core::model::AnthropicAdapter;
@@ -20,7 +22,7 @@ use syl_rs::tui::{
     animation,
     bars::{make_bar, BarData, DARK, LIGHT},
     image_render,
-    input::InputEditor,
+    input::{Hotkey, InputEditor},
     spinner,
     state::TuiState,
     steer::{carry_over, KeyReader, SteerKey, SteerLine},
@@ -55,6 +57,11 @@ async fn main() -> anyhow::Result<()> {
 
     // 4. Build config
     let config = build_config(&cli, &syl_dir);
+    if let Some(e) = &config.config_error {
+        // Shown before anything else: with config.toml unreadable, its
+        // permission rules aren't in force.
+        eprintln!("[Syl] Could not read the config file, so its settings (permission rules included) are not in effect:\n  {e}");
+    }
 
     // 5. Build reqwest client
     let http = reqwest::Client::builder()
@@ -81,7 +88,12 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // 7. Container lifecycle
-    let container = Arc::new(Container::for_project(&project_dir));
+    let defaults = syl_container::ContainerOptions::default();
+    let container = Arc::new(Container::for_project(&project_dir).with_options(syl_container::ContainerOptions {
+        network: config.container.network.clone(),
+        memory: config.container.memory.clone().unwrap_or(defaults.memory),
+        cpus: config.container.cpus.clone(),
+    }));
     if cli.fresh {
         container.remove(false);
     }
@@ -96,7 +108,7 @@ async fn main() -> anyhow::Result<()> {
         let mut out = tui.stdout.lock().unwrap();
         terminal::setup_scroll_region(&mut *out, rows)?;
     }
-    draw_bars(&tui, &state, &config, &config.model, cols, rows);
+    draw_bars(&tui, &state, &config, &config.model, Mode::Build, cols, rows);
 
     // 10b. Startup banner
     if !config.no_banner {
@@ -175,6 +187,7 @@ async fn main() -> anyhow::Result<()> {
         session: None,
         carry: String::new(),
         last_tools: Vec::new(),
+        mode: Mode::Build,
     };
     let result = match repl.await_session_reply(&mut handle.events).await {
         true => repl.run(&mut handle.events, resize_rx).await,
@@ -260,7 +273,8 @@ fn print_banner(tui: &TuiState, cols: u16, rows: u16) {
 // Status bars
 // ---------------------------------------------------------------------------
 
-fn draw_bars(tui: &TuiState, state: &SharedState, config: &AppConfig, model: &str, cols: u16, rows: u16) {
+#[allow(clippy::too_many_arguments)]
+fn draw_bars(tui: &TuiState, state: &SharedState, config: &AppConfig, model: &str, mode: Mode, cols: u16, rows: u16) {
     let palette = if config.light { &LIGHT } else { &DARK };
 
     let (input_tokens, output_tokens, cost_usd) = {
@@ -291,6 +305,7 @@ fn draw_bars(tui: &TuiState, state: &SharedState, config: &AppConfig, model: &st
         mem_mb,
         message_count: state.messages.lock().unwrap().len(),
         width: cols,
+        plan_mode: mode == Mode::Plan,
     };
 
     let bar = make_bar(&data, palette);
@@ -322,6 +337,8 @@ struct Repl<'a> {
     carry: String,
     /// The last turn's tool calls (name, input, output, is_error), for /tools.
     last_tools: Vec<(String, serde_json::Value, String, bool)>,
+    /// Plan or build, as last sent to the agent.
+    mode: Mode,
 }
 
 impl Repl<'_> {
@@ -330,7 +347,7 @@ impl Repl<'_> {
     }
 
     fn redraw_bars(&self) {
-        draw_bars(&self.tui, &self.state, self.config, &self.model, self.cols, self.rows);
+        draw_bars(&self.tui, &self.state, self.config, &self.model, self.mode, self.cols, self.rows);
     }
 
     /// Show the agent's answer to a session command: wait for the
@@ -353,8 +370,179 @@ impl Repl<'_> {
                         return true;
                     }
                 }
-                Some(AgentEvent::Notice { message }) => self.print(&format!("{message}\r\n")),
+                Some(AgentEvent::Notice { message }) => self.print(&format!("{}\r\n", sanitize(&message))),
                 Some(_) => {}
+            }
+        }
+    }
+
+    /// Switch plan/build and wait for the agent to confirm.
+    async fn set_mode(&mut self, mode: Mode, events: &mut mpsc::UnboundedReceiver<AgentEvent>) -> bool {
+        let wanted = mode;
+        let _ = self.commands.send(AgentCommand::SetMode(mode));
+        loop {
+            match events.recv().await {
+                None => return false,
+                // A ModeChanged for an earlier switch (made during a turn and
+                // applied when it ended) can come first: note it, keep waiting.
+                Some(AgentEvent::ModeChanged { mode }) if mode != wanted => self.mode = mode,
+                Some(AgentEvent::ModeChanged { mode }) => {
+                    self.mode = mode;
+                    let text = match mode {
+                        Mode::Plan => "\x1b[33m[plan mode: Syl can read and run commands, but not change files · Shift+Tab or /build to switch back]\x1b[0m",
+                        Mode::Build => "\x1b[2m[build mode: file changes allowed]\x1b[0m",
+                    };
+                    self.print(&format!("{text}\r\n"));
+                    self.redraw_bars();
+                    return true;
+                }
+                Some(AgentEvent::Notice { message }) => self.print(&format!("{}\r\n", sanitize(&message))),
+                Some(_) => {}
+            }
+        }
+    }
+
+    /// This session's checkpoints, newest first.
+    fn checkpoints(&self) -> Vec<(String, String, u64)> {
+        let mut list = self
+            .session
+            .as_ref()
+            .and_then(|s| syl_core::session::load_entries(self.sessions_dir, &s.id).ok())
+            .map(|e| syl_core::session::checkpoints(&e))
+            .unwrap_or_default();
+        list.reverse();
+        list
+    }
+
+    fn print_checkpoints(&self) {
+        let list = self.checkpoints();
+        if list.is_empty() {
+            self.print("No checkpoints yet: one is taken before each turn that changes files.\r\n");
+            return;
+        }
+        for (i, (commit, label, ts)) in list.iter().enumerate().take(30) {
+            self.print(&format!(
+                "{:>3}  {}  \x1b[2m{}\x1b[0m  {}\r\n",
+                i + 1,
+                syl_core::session::format_utc(*ts),
+                syl_core::checkpoint::short(commit),
+                sanitize(&one_line(label, 70))
+            ));
+        }
+        self.print("\x1b[2m/restore <n> puts the files back as they were at that checkpoint.\x1b[0m\r\n");
+    }
+
+    /// `/undo` (n = None: the newest checkpoint) and `/restore n`: show what
+    /// would change, confirm, then ask the agent to restore.
+    async fn undo(
+        &mut self,
+        n: Option<usize>,
+        editor: &mut InputEditor,
+        events: &mut mpsc::UnboundedReceiver<AgentEvent>,
+    ) -> bool {
+        let list = self.checkpoints();
+        let Some((commit, label, _)) = list.get(n.unwrap_or(1) - 1).cloned() else {
+            self.print(match n {
+                None => "Nothing to undo: no turn has changed files yet.\r\n",
+                Some(_) => "No such checkpoint (see /checkpoints).\r\n",
+            });
+            return true;
+        };
+        let project = self.syl_dir.parent().unwrap_or(self.syl_dir).to_path_buf();
+        let preview = tokio::task::block_in_place(|| Checkpoints::for_project(&project).preview(&commit));
+        let changes = match preview {
+            Ok(c) => c,
+            Err(e) => {
+                self.print(&format!("[Error: {e}]\r\n"));
+                return true;
+            }
+        };
+        if changes.is_empty() {
+            self.print(&format!(
+                "Nothing has changed since the checkpoint {}{}.\r\n",
+                sanitize(&one_line(&label, 60)),
+                if n.is_none() { " (to go further back: /checkpoints, then /restore <n>)" } else { "" }
+            ));
+            return true;
+        }
+        self.print(&format!(
+            "Restore {} files to how they were {}:\r\n",
+            changes.len(),
+            sanitize(&one_line(&label, 70))
+        ));
+        for c in changes.iter().take(20) {
+            let (mark, what) = match c.status {
+                'A' => ("\x1b[32m+\x1b[0m", "comes back"),
+                'D' => ("\x1b[31m-\x1b[0m", "is removed"),
+                _ => ("\x1b[33m~\x1b[0m", "goes back"),
+            };
+            self.print(&format!("  {mark} {}  \x1b[2m{what}\x1b[0m\r\n", sanitize(&c.path)));
+        }
+        if changes.len() > 20 {
+            self.print(&format!("  \x1b[2m… and {} more\x1b[0m\r\n", changes.len() - 20));
+        }
+        let answer = editor.readline("Restore? [y/N] ", self.rows, "").unwrap_or_default();
+        let _ = editor.take_hotkey();
+        if !answer.trim().eq_ignore_ascii_case("y") {
+            self.print("\x1b[2m[not restored]\x1b[0m\r\n");
+            return true;
+        }
+        let _ = self.commands.send(AgentCommand::Restore { commit });
+        loop {
+            match events.recv().await {
+                None => return false,
+                Some(AgentEvent::Restored { files, .. }) => {
+                    self.print(&format!(
+                        "\x1b[32m[restored {files} files · the restore can itself be undone with /undo]\x1b[0m\r\n"
+                    ));
+                    return true;
+                }
+                Some(AgentEvent::Error { message }) => {
+                    self.print(&format!("[Error: {message}]\r\n"));
+                    return true;
+                }
+                Some(AgentEvent::Notice { message }) => self.print(&format!("{}\r\n", sanitize(&message))),
+                Some(_) => {}
+            }
+        }
+    }
+
+    /// `/receipts`: what the last `n` turns did.
+    fn print_receipts(&self, n: usize) {
+        let receipts = self
+            .session
+            .as_ref()
+            .and_then(|s| syl_core::session::load_entries(self.sessions_dir, &s.id).ok())
+            .map(|e| syl_core::session::receipts(&e))
+            .unwrap_or_default();
+        if receipts.is_empty() {
+            self.print("No turns yet.\r\n");
+            return;
+        }
+        let start = receipts.len().saturating_sub(n);
+        for (i, r) in receipts.iter().enumerate().skip(start) {
+            self.print(&format!(
+                "\x1b[1m#{} \x1b[0m{}  \x1b[2m{}\x1b[0m\r\n",
+                i + 1,
+                sanitize(&one_line(&r.prompt, 70)),
+                syl_core::session::format_utc(r.ts)
+            ));
+            let line = |label: &str, items: &[String]| {
+                if !items.is_empty() {
+                    let shown: Vec<String> = items.iter().take(8).map(|i| sanitize(&one_line(i, 80))).collect();
+                    let more = if items.len() > 8 { format!(" … +{}", items.len() - 8) } else { String::new() };
+                    self.print(&format!("    \x1b[2m{label:<9}\x1b[0m {}{more}\r\n", shown.join(" · ")));
+                }
+            };
+            line("edited", &r.files);
+            line("ran", &r.commands);
+            line("fetched", &r.urls);
+            line("approvals", &r.approvals);
+            if r.errors > 0 {
+                self.print(&format!("    \x1b[2m{:<9}\x1b[0m {}\r\n", "failed", r.errors));
+            }
+            if let Some(c) = &r.checkpoint {
+                self.print(&format!("    \x1b[2m{:<9} {}\x1b[0m\r\n", "checkpoint", syl_core::checkpoint::short(c)));
             }
         }
     }
@@ -428,6 +616,15 @@ impl Repl<'_> {
         let memory_dir = self.syl_dir.join("memory");
         let log_path = self.syl_dir.join("syl.log");
 
+        if let Some(e) = &self.config.config_error {
+            self.print(&format!(
+                "\x1b[31m[Syl] .syl/config.toml can't be read, so Syl will ask before every tool call until it's fixed:\x1b[0m\r\n  {}\r\n",
+                sanitize(e)
+            ));
+        }
+        for w in &self.config.config_warnings {
+            self.print(&format!("\x1b[33m[Syl] {}\x1b[0m\r\n", sanitize(w)));
+        }
         self.print("Type a message, or /help for commands.\r\n");
 
         loop {
@@ -447,6 +644,24 @@ impl Repl<'_> {
                 Err(rustyline::error::ReadlineError::Interrupted) => continue,
                 Err(e) => return Err(e.into()),
             };
+            match editor.take_hotkey() {
+                Some(Hotkey::ToggleMode) => {
+                    self.carry = line;
+                    let next = if self.mode == Mode::Plan { Mode::Build } else { Mode::Plan };
+                    if !self.set_mode(next, events).await {
+                        anyhow::bail!("the agent stopped unexpectedly");
+                    }
+                    continue;
+                }
+                Some(Hotkey::Undo) => {
+                    self.carry = line;
+                    if !self.undo(None, &mut editor, events).await {
+                        anyhow::bail!("the agent stopped unexpectedly");
+                    }
+                    continue;
+                }
+                None => {}
+            }
             let line = line.trim().to_string();
             if line.is_empty() {
                 continue;
@@ -461,6 +676,40 @@ impl Repl<'_> {
             if line == "/tools" {
                 self.print_last_tools();
                 continue;
+            }
+            let ok = match line.as_str() {
+                "/plan" => Some(self.set_mode(Mode::Plan, events).await),
+                "/build" => Some(self.set_mode(Mode::Build, events).await),
+                "/mode" => {
+                    let next = if self.mode == Mode::Plan { Mode::Build } else { Mode::Plan };
+                    Some(self.set_mode(next, events).await)
+                }
+                "/undo" => Some(self.undo(None, &mut editor, events).await),
+                "/checkpoints" => {
+                    self.print_checkpoints();
+                    Some(true)
+                }
+                l if l.starts_with("/restore") => {
+                    let n = l.trim_start_matches("/restore").trim().parse::<usize>().ok();
+                    match n {
+                        Some(n) if n > 0 => Some(self.undo(Some(n), &mut editor, events).await),
+                        _ => {
+                            self.print("Usage: /restore <n>  (n from /checkpoints; 1 is the newest)\r\n");
+                            Some(true)
+                        }
+                    }
+                }
+                l if l == "/receipts" || l.starts_with("/receipts ") => {
+                    let n = l.trim_start_matches("/receipts").trim().parse::<usize>().unwrap_or(5);
+                    self.print_receipts(n);
+                    Some(true)
+                }
+                _ => None,
+            };
+            match ok {
+                Some(true) => continue,
+                Some(false) => anyhow::bail!("the agent stopped unexpectedly"),
+                None => {}
             }
 
             if line.starts_with('/') {
@@ -559,6 +808,9 @@ impl Repl<'_> {
         let mut unanswered = 0usize;
         let mut turns_expected = 0usize;
         let mut in_turn = true;
+        // A tool call waiting for y / a / n, and when it was asked: keys in
+        // the first moment are typeahead, not answers.
+        let mut asking: Option<(String, std::time::Instant)> = None;
         steer.draw(&self.tui.stdout, self.rows, self.cols);
 
         let ended = loop {
@@ -568,6 +820,29 @@ impl Repl<'_> {
                     None => break false,
                 },
                 Some(key) = reader.keys.recv() => {
+                    // While a permission question is open, keys answer it.
+                    if let (Some((id, asked_at)), crossterm::event::Event::Key(k)) = (&asking, &key) {
+                        use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+                        if k.kind == KeyEventKind::Press && !k.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+                            if asked_at.elapsed() < std::time::Duration::from_millis(300) {
+                                continue;
+                            }
+                            let answer = match k.code {
+                                KeyCode::Char('y' | 'Y') => Some((PermissionAnswer::Once, "allowed once")),
+                                KeyCode::Char('a' | 'A') => Some((PermissionAnswer::Always, "allowed, and from now on in this project")),
+                                KeyCode::Char('n' | 'N') | KeyCode::Esc => Some((PermissionAnswer::Reject, "declined")),
+                                _ => None,
+                            };
+                            if let Some((answer, said)) = answer {
+                                let _ = self.commands.send(AgentCommand::ApprovePermission { id: id.clone(), answer });
+                                let _ = asked_at;
+                                self.print(&format!("\x1b[2m  → {said}\x1b[0m\r\n"));
+                                asking = None;
+                                steer.draw(&self.tui.stdout, self.rows, self.cols);
+                            }
+                            continue;
+                        }
+                    }
                     match steer.handle_event(key) {
                         SteerKey::Edited => steer.draw(&self.tui.stdout, self.rows, self.cols),
                         SteerKey::Send(text) => {
@@ -582,7 +857,16 @@ impl Repl<'_> {
                         }
                         SteerKey::Cancel => {
                             let _ = self.commands.send(AgentCommand::Cancel);
+                            asking = None;
                             steer.draw(&self.tui.stdout, self.rows, self.cols);
+                        }
+                        SteerKey::ToggleMode => {
+                            // The agent applies it when this turn ends; the bar
+                            // shows it now.
+                            self.mode = if self.mode == Mode::Plan { Mode::Build } else { Mode::Plan };
+                            let _ = self.commands.send(AgentCommand::SetMode(self.mode));
+                            self.print(&format!("\x1b[2m[{} mode from the next turn]\x1b[0m\r\n", self.mode.name()));
+                            self.redraw_bars();
                         }
                         SteerKey::Ignored => {}
                     }
@@ -675,9 +959,35 @@ impl Repl<'_> {
                     }
                     self.last_tools.push((name, input, output, is_error));
                 }
-                AgentEvent::PermissionRequested { id, .. } => {
-                    // Nothing asks yet (the default policy allows everything).
-                    let _ = self.commands.send(AgentCommand::ApprovePermission { id, approved: true });
+                AgentEvent::PermissionRequested { id, name, input, subject, note } => {
+                    self.tui.stop_anim();
+                    self.tui.stop_spinner();
+                    // The whole call, never cut: approving shows exactly what runs.
+                    let full = match name.as_str() {
+                        "run_bash" => input["command"].as_str().unwrap_or("").to_string(),
+                        _ => serde_json::to_string(&input).unwrap_or_default(),
+                    };
+                    self.print(&format!("\x1b[33m?\x1b[0m Syl wants to use \x1b[1m{name}\x1b[0m:\r\n"));
+                    for line in sanitize(&full).lines() {
+                        self.print(&format!("    {line}\r\n"));
+                    }
+                    if !subject.is_empty() && subject.trim() != full.trim() {
+                        self.print(&format!("  \x1b[2masking because of: {}\x1b[0m\r\n", sanitize(&subject)));
+                    }
+                    if let Some(note) = note {
+                        self.print(&format!("  \x1b[2m{}\x1b[0m\r\n", sanitize(&one_line(&note, 200))));
+                    }
+                    self.print("  \x1b[1my\x1b[0m allow once · \x1b[1ma\x1b[0m always (this project) · \x1b[1mn\x1b[0m no\r\n");
+                    terminal::draw_ticker(&self.tui.stdout, self.rows, " \x1b[33m? waiting for you: y / a / n\x1b[0m");
+                    asking = Some((id, std::time::Instant::now()));
+                }
+                AgentEvent::PermissionDecided { .. } | AgentEvent::Checkpointed { .. } => {}
+                AgentEvent::ModeChanged { mode } => {
+                    self.mode = mode;
+                    self.redraw_bars();
+                }
+                AgentEvent::Restored { files, .. } => {
+                    self.print(&format!("\x1b[2m[restored {files} files]\x1b[0m\r\n"));
                 }
                 AgentEvent::Compacted { before, after } => {
                     tracing::info!(before, after, "history compacted");
@@ -700,7 +1010,7 @@ impl Repl<'_> {
                     unanswered = unanswered.saturating_sub(1);
                     self.print(&format!("\x1b[2m[delivered: {}]\x1b[0m\r\n", one_line(&text, 70)))
                 }
-                AgentEvent::Notice { message } => self.print(&format!("{message}\r\n")),
+                AgentEvent::Notice { message } => self.print(&format!("{}\r\n", sanitize(&message))),
                 AgentEvent::Error { message } => self.print(&format!("[Error: {message}]\r\n")),
                 AgentEvent::TurnEnded { reason } => {
                     match reason {

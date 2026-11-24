@@ -18,6 +18,7 @@ This document covers the implementation details behind Syl's main subsystems.
 - [Workflows](#workflows)
 - [File Tools](#file-tools)
 - [Steering and Images](#steering-and-images)
+- [Control and Safety](#control-and-safety)
 - [Output Handling](#output-handling)
 - [Status Bar](#status-bar)
 - [Thinking Animation](#thinking-animation)
@@ -271,6 +272,24 @@ The API takes about 100 images and 32 MB per request, and images stay in history
 
 ---
 
+## Control and Safety
+
+Nothing prompts by default: the container limits the damage, and checkpoints and receipts are the safety net. Rules, plan mode and the reviewer are opt-in.
+
+**Checkpoints** (`checkpoint.rs`). Before the first `run_bash`, `edit_file` or `write_file` call in a turn, the workspace is committed to a shadow repository, `.syl/shadow.git`, whose work tree is the project. The user's own `.git` is never touched. The snapshot honours `.gitignore` and also skips `.git/`, `.syl/`, `node_modules/`, `target/`, `.venv/` and `__pycache__/`. Git runs on the host (`.syl` is read-only in the container) with every inherited `GIT_*` variable cleared, no global or system config, and no hooks. The shadow repository's own config and excludes are rewritten before every use, so a `.syl/shadow.git` shipped with a project can't define an fsmonitor or filter that git would run. A directory that is a git repository of its own is reported once: a snapshot holds only its commit, not its files. A `checkpoint` log entry and a `Checkpointed` event record the commit. `AgentCommand::Restore { commit }` snapshots the current state first, so a restore can itself be undone, then makes the work tree match the checkpoint: tracked files are rewritten, files added since are removed, and ignored files are left alone. That includes ignored files a turn exposed by editing `.gitignore`: those are put back from the safety snapshot. The safety snapshot is listed in `/checkpoints`, so a restore can be undone. It logs `restored` and a `note`, which reaches the model with the next prompt, so Syl knows its edits are gone. In the TUI, `/undo` (or Ctrl+Z at the prompt) shows what would change and asks before restoring the newest checkpoint; `/checkpoints` and `/restore <n>` go further back.
+
+**Receipts.** `/receipts [n]` is built from the log (`session::receipts`): for each turn, the files given to `edit_file`/`write_file`, the commands run, the URLs fetched, the approvals, the failed calls, and the checkpoint.
+
+**Permission rules** (`permissions.rs`). `[[permission]]` tables in `.syl/config.toml` are `{tool, pattern, action}` with `allow`, `ask` or `deny`. Then come plan mode's rules, and the last match wins; with no match a call is allowed. `.syl/approvals.toml` holds the "always" answers. They only turn an `ask` into an allow, so a `deny` added later still wins. A file that doesn't parse is reported and never overwritten. If `config.toml` can't be read, every tool call asks until it is fixed, rather than running with no rules. Unknown keys inside `[[permission]]`, `[reviewer]` or `[container]` are errors; unknown top-level keys are warnings (`[[permissions]]` is flagged). A rule matches a tool (`*` for any) and a glob over the call's subject: the command for `run_bash`, the path for file tools (normalised: workspace-relative, no `./` or `..`), the pattern and the path for searches, the URL for `dispatch_agent`. A `run_bash` command is split into its parts on `&&`, `||`, `;`, `|`, `&` and newlines, plus `$( )` and backticks, Groups, subshells and process substitution are split too. Each part is checked in several forms: as written; with assignments, reserved words (`then`, `do`, `!`) and wrappers (`env`, `sudo`, `timeout`, `nohup`, `xargs`, ...) dropped; with the program's path dropped; with git's global options dropped (`git -C repo push` is `git push`); and inside `sh -c '...'` and `eval`. The strictest answer applies. It's still a simple splitter, not a shell: rules are a convenience, and the container is the boundary. An `ask` emits `PermissionRequested { subject, note }`, where `subject` lists every part that needs asking (all approved together; the TUI shows the whole command) and the turn waits for `ApprovePermission { answer: Once | Always | Reject }`. `Always` saves an allow rule for exactly each of those parts in `.syl/approvals.toml`. In the TUI, keys pressed in the first 300 ms after the question appears are ignored, as typeahead. Every decision that isn't a plain allow is logged as an `approval` entry with who made it (`rule`, `user`, `user_always`, `reviewer`).
+
+**Reviewer** (`control.rs`). With `[reviewer]` configured, an `ask` call first goes to that model (default `claude-haiku-4-5`) with the user's latest request. The request has no tools and asks for ALLOW or BLOCK. The reply's first word must be exactly ALLOW, and a reply naming both verdicts counts as neither. ALLOW runs the call. BLOCK, an error, a timeout (`timeout_secs`, default 20), an unreadable answer, or a call too long to show in full all fall back to asking the user, with the reviewer's reason shown: it fails closed.
+
+**Modes.** `AgentCommand::SetMode(Plan | Build)` applies from the next turn and is told to the model as a `note`. Plan mode adds rules that deny `edit_file`, `write_file`, `workflow_write`, `workflow_delete`, and the git commands that change the user's repository: commit, push, pull, fetch, reset, checkout, switch, restore, stash, rebase, merge, clean, config, tag and branch deletion, among others. Snapshots don't cover `.git`. Each `run_bash` call then runs between two snapshots. Anything it changed in the workspace is put back and reported to the model as an error, and the state before the put-back is kept as a checkpoint. Ignored paths it removed can't be put back, so they are reported. If no snapshot can be taken (no git on the host, or checkpoints off), `run_bash` is refused in plan mode. Plan-mode turns don't take a turn checkpoint, so `/undo` finds the last build turn. What plan mode can't stop: a background process that outlives the command, and changes outside the workspace. The TUI shows the mode in the bar; Shift+Tab toggles it, as do `/plan` and `/build`.
+
+**Container limits.** `[container]` in config.toml sets `memory` (default `2g`), `cpus` and `network` (`"none"` for no network; `dispatch_agent`, package installs and git over the network then fail). The options are recorded as a label on the container, and a container started with other options is recreated.
+
+---
+
 ## Output Handling
 
 Tool output is processed before it reaches the model (`process_tool_output` in `crates/syl-core/src/util.rs`):
@@ -367,6 +386,9 @@ crates/syl-core/src/
 ├── session.rs             # append-only session log, derived history, listing
 ├── system_prompt.rs       # system prompt assembly, AGENTS.md / CLAUDE.md loading
 ├── attachments.rs         # images named in prompts
+├── checkpoint.rs          # shadow-git snapshots and restore
+├── permissions.rs         # allow/ask/deny rules, command splitter, modes
+├── control.rs             # permission answers, the reviewer
 ├── workspace.rs           # workspace context (ls + git status)
 ├── logging.rs             # file logger to .syl/syl.log
 ├── util.rs                # output processing, HTML stripping, key checks

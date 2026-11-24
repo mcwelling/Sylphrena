@@ -112,7 +112,41 @@ pub struct Container {
     podman: PathBuf,
     /// Where the project is mounted inside the container.
     workdir: String,
+    options: ContainerOptions,
 }
+
+/// Resource limits and network for the container (`[container]` in
+/// config.toml). A container started with other options is recreated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerOptions {
+    /// `--network`: `Some("none")` for no network at all.
+    pub network: Option<String>,
+    /// `--memory`.
+    pub memory: String,
+    /// `--cpus`, when limited.
+    pub cpus: Option<String>,
+}
+
+impl Default for ContainerOptions {
+    fn default() -> Self {
+        ContainerOptions { network: None, memory: "2g".to_string(), cpus: None }
+    }
+}
+
+impl ContainerOptions {
+    /// Recorded as a label on the container, to tell when it must be
+    /// recreated.
+    fn label(&self) -> String {
+        format!(
+            "memory={};cpus={};network={}",
+            self.memory,
+            self.cpus.as_deref().unwrap_or(""),
+            self.network.as_deref().unwrap_or("")
+        )
+    }
+}
+
+const OPTIONS_LABEL: &str = "syl.options";
 
 /// What `exec_argv` returns: stdout as bytes (file contents need not be
 /// UTF-8), stderr as text.
@@ -143,7 +177,40 @@ impl Container {
             project_dir: dir,
             podman: PathBuf::from("podman"),
             workdir: WORKDIR.to_string(),
+            options: ContainerOptions::default(),
         }
+    }
+
+    /// Start the container with these limits and network.
+    pub fn with_options(mut self, options: ContainerOptions) -> Self {
+        self.options = options;
+        self
+    }
+
+    pub fn options(&self) -> &ContainerOptions {
+        &self.options
+    }
+
+    /// Whether the running container was started with other options. One
+    /// from before options were recorded counts as having the defaults.
+    fn options_changed(&self) -> bool {
+        let Ok(out) = self
+            .podman()
+            .args(["inspect", "--format", &format!("{{{{index .Config.Labels \"{OPTIONS_LABEL}\"}}}}"), &self.name])
+            .output()
+        else {
+            return false;
+        };
+        if !out.status.success() {
+            return false;
+        }
+        let label = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let label = if label.is_empty() || label == "<no value>" {
+            ContainerOptions::default().label()
+        } else {
+            label
+        };
+        label != self.options.label()
     }
 
     /// Treat `dir` as the in-container project path. Tests pair this with a
@@ -279,7 +346,11 @@ impl Container {
         let saved_id = if fresh { None } else { self.read_marker() };
         let live_id = if saved_id.is_some() { self.inspect_id().ok() } else { None };
 
-        if saved_id.is_some() && saved_id == live_id {
+        let options_changed = saved_id.is_some() && saved_id == live_id && self.options_changed();
+        if options_changed {
+            progress("[Syl] Container options changed — recreating the container...");
+        }
+        if saved_id.is_some() && saved_id == live_id && !options_changed {
             progress("Resuming container...");
             let _ = self.run_podman(&["start", &self.name]);
             self.configure_git_and_ssh();
@@ -345,6 +416,13 @@ impl Container {
         let home = std::env::var("HOME").unwrap_or_default();
         let ssh_dir = format!("{home}/.ssh");
         let has_bake = self.baked_image_exists();
+        if !has_bake && self.options.network.as_deref() == Some("none") {
+            anyhow::bail!(
+                "the first start installs Syl's tools from the network, but config.toml sets \
+                 [container] network = \"none\". Start once without it, then turn it back on \
+                 (the tools are kept in the {BAKED_IMAGE} image)."
+            );
+        }
         let base = if has_bake { BAKED_IMAGE } else { BASE_IMAGE };
         let project = self.project_dir.to_string_lossy().to_string();
 
@@ -365,9 +443,14 @@ impl Container {
             std::env::var("TERM_PROGRAM").unwrap_or_default()
         );
 
+        let memory = format!("--memory={}", self.options.memory);
+        let label = format!("{OPTIONS_LABEL}={}", self.options.label());
+        let cpus = self.options.cpus.as_ref().map(|c| format!("--cpus={c}"));
+        let network = self.options.network.as_ref().map(|n| format!("--network={n}"));
         let mut args: Vec<&str> = vec![
             "run", "-d", "--name", &self.name,
-            "--memory=2g",
+            "--label", &label,
+            &memory,
             "-e", "TERM=xterm-256color",
             "-e", &term_program,
             "-v", &ws_vol,
@@ -376,6 +459,8 @@ impl Container {
         if Path::new(&ssh_dir).exists() {
             args.extend(["-v", &ssh_vol]);
         }
+        args.extend(cpus.as_deref());
+        args.extend(network.as_deref());
         args.extend(["--workdir", "/workspace", "-it", base, "/bin/bash"]);
         self.run_podman(&args)?;
 

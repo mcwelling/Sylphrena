@@ -68,6 +68,8 @@ pub struct BarData {
     pub message_count: usize,
     /// Terminal column count — used to right-pad the bar to fill the row.
     pub width: u16,
+    /// Plan mode (no file changes) rather than build.
+    pub plan_mode: bool,
 }
 
 impl Default for BarData {
@@ -83,6 +85,7 @@ impl Default for BarData {
             mem_mb: 0,
             message_count: 0,
             width: 80,
+            plan_mode: false,
         }
     }
 }
@@ -144,7 +147,12 @@ pub fn make_bar(data: &BarData, p: &Palette) -> String {
     let w = data.width as usize;
     let (r, dim) = (p.r, p.dim);
 
-    let head = format!(" {lb}Syl{r} {dim}·{r} {lb}{}{r}", data.model, lb = p.lb);
+    let mode = if data.plan_mode {
+        format!("{ye}{b}PLAN{r}", ye = p.ye, b = p.b)
+    } else {
+        format!("{dim}build{r}")
+    };
+    let head = format!(" {lb}Syl{r} {mode} {dim}·{r} {lb}{}{r}", data.model, lb = p.lb);
     let tokens = format!(
         "{cy}↑{r}{wh}{}{r} {cy}↓{r}{wh}{}{r}",
         fmt_k(data.input_tokens),

@@ -21,6 +21,8 @@ pub enum SteerKey {
     /// Send this text as steering.
     Send(String),
     Cancel,
+    /// Shift+Tab: switch plan/build mode (from the next turn).
+    ToggleMode,
     Ignored,
 }
 
@@ -59,6 +61,7 @@ impl SteerLine {
                 self.buf.clear();
                 SteerKey::Cancel
             }
+            KeyCode::BackTab => SteerKey::ToggleMode,
             KeyCode::Char('u') if ctrl => {
                 self.buf.clear();
                 SteerKey::Edited

@@ -135,3 +135,18 @@ fn missing_config_file_gives_defaults() {
     let cfg = build_config(&cli, tmp.path());
     assert_eq!(cfg.model, DEFAULT_MODEL);
 }
+
+#[test]
+fn a_misspelt_or_malformed_permission_setting_is_reported_and_fails_closed() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("config.toml"), "[[permissions]]\ntool = \"run_bash\"\naction = \"ask\"\n").unwrap();
+    let cfg = build_config(&CliArgs::default(), tmp.path());
+    assert!(cfg.config_warnings.iter().any(|w| w.contains("[[permission]]")), "{:?}", cfg.config_warnings);
+
+    std::fs::write(tmp.path().join("config.toml"), "[[permission]]\ntool = \"run_bash\"\npatern = \"git push*\"\naction = \"ask\"\n").unwrap();
+    let cfg = build_config(&CliArgs::default(), tmp.path());
+    assert!(cfg.config_error.as_deref().unwrap_or("").contains("patern"), "{:?}", cfg.config_error);
+    // Unknown rules mean: ask before everything.
+    assert_eq!(cfg.permissions.len(), 1);
+    assert_eq!(cfg.permissions[0].action, syl_core::permissions::Action::Ask);
+}
