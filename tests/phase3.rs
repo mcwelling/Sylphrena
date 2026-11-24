@@ -102,6 +102,7 @@ fn default_bar_data() -> BarData {
         mem_mb: 256,
         message_count: 7,
         width: 100,
+        plan_mode: false,
     }
 }
 
@@ -133,6 +134,14 @@ fn bar_without_a_tpm_limit_has_no_meter() {
     let data = BarData { tpm_limit: 0.0, ..default_bar_data() };
     let bar = make_bar(&data, &DARK);
     assert!(!bar.contains('█') && !bar.contains('░'), "{bar}");
+}
+
+#[test]
+fn bar_shows_the_mode() {
+    let build = make_bar(&default_bar_data(), &DARK);
+    assert!(build.contains("build") && !build.contains("PLAN"), "{build}");
+    let plan = make_bar(&BarData { plan_mode: true, ..default_bar_data() }, &DARK);
+    assert!(plan.contains("PLAN"), "{plan}");
 }
 
 #[test]

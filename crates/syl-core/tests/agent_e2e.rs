@@ -6,7 +6,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use syl_core::agent::{self, Agent, AgentCommand, AgentEvent, AgentHandle, SessionPaths, SessionStart, TurnEnd};
+use syl_core::agent::{self, Agent, AgentCommand, AgentEvent, AgentHandle, Mode, SessionPaths, SessionStart, TurnEnd};
+use syl_core::control::PermissionAnswer;
+use syl_core::permissions::{Action, Rule};
 use syl_core::api::types::MessageContent;
 use syl_core::session::{self, Entry, EntryKind, History, SessionInfo};
 use syl_core::api::types::{ContentBlock, Message, StopReason, Usage};
@@ -225,6 +227,10 @@ async fn full_tool_using_turn_runs_headless() {
         },
         AgentEvent::TurnEnded { reason: TurnEnd::Completed(StopReason::EndTurn) },
     ];
+    // A run_bash call is checkpointed first; the commit varies.
+    let (checkpoints, events): (Vec<AgentEvent>, Vec<AgentEvent>) =
+        events.into_iter().partition(|e| matches!(e, AgentEvent::Checkpointed { .. }));
+    assert_eq!(checkpoints.len(), 1);
     assert_eq!(events, expected);
 
     // The second request answered the tool call.
@@ -244,7 +250,7 @@ async fn full_tool_using_turn_runs_headless() {
     let kinds: Vec<&str> = log.iter().map(kind_name).collect();
     assert_eq!(
         kinds,
-        ["session", "message", "model_change", "system_prompt", "message", "tool_result", "message"]
+        ["session", "message", "model_change", "system_prompt", "message", "checkpoint", "tool_result", "message"]
     );
     // The last request was exactly what the log says the model saw.
     assert_eq!(serde_json::to_value(&messages[..3]).unwrap(), bodies[1]["messages"]);
@@ -263,6 +269,9 @@ fn kind_name(e: &Entry) -> &'static str {
         EntryKind::Approval { .. } => "approval",
         EntryKind::Steer { .. } => "steer",
         EntryKind::ImagesDropped { .. } => "images_dropped",
+        EntryKind::Checkpoint { .. } => "checkpoint",
+        EntryKind::Restored { .. } => "restored",
+        EntryKind::Note { .. } => "note",
     }
 }
 
@@ -927,4 +936,204 @@ async fn dispatch_agent_gets_the_full_page_cut_on_a_character_boundary() {
     assert!(prompt.contains("日本語の行です 0000") && prompt.contains("日本語の行です 1100"), "the page is not cut to 100 lines");
     assert!(!prompt.contains("read_file") && !prompt.contains("    1: "), "no run_bash preview formatting");
     assert!(prompt.contains("of 54000 bytes shown"), "the cut is reported");
+}
+
+// ---------------------------------------------------------------------------
+// Control and safety (Phase 3)
+// ---------------------------------------------------------------------------
+
+fn ask_rule(pattern: &str) -> Rule {
+    Rule { tool: "run_bash".into(), pattern: pattern.into(), action: Action::Ask }
+}
+
+/// Wait for a PermissionRequested, collecting what came before.
+async fn until_asked(h: &mut Harness) -> (String, String) {
+    loop {
+        match next_event(h).await {
+            AgentEvent::PermissionRequested { id, subject, .. } => return (id, subject),
+            AgentEvent::TurnEnded { .. } => panic!("the turn ended without asking"),
+            _ => {}
+        }
+    }
+}
+
+fn result_of(events: &[AgentEvent], id: &str) -> (String, bool) {
+    events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::ToolCallFinished { id: i, output, is_error, .. } if i == id => Some((output.clone(), *is_error)),
+            _ => None,
+        })
+        .expect("the call finished")
+}
+
+#[tokio::test]
+async fn an_ask_rule_waits_for_the_user_and_runs_once_approved() {
+    let server = model_server(vec![ok(tool_use_stream("t1", "true && echo pushed")), ok(text_stream("done"))]).await;
+    let config = AppConfig { permissions: vec![ask_rule("echo *")], ..test_config(&server) };
+    let mut h = start_with(config, tempfile::tempdir().unwrap(), SessionStart::New).await;
+    h.send(AgentCommand::Prompt("go".into()));
+    let (id, subject) = until_asked(&mut h).await;
+    assert_eq!(subject, "echo pushed", "only the part that needs asking is shown");
+    h.send(AgentCommand::ApprovePermission { id: id.clone(), answer: PermissionAnswer::Once });
+    let events = until_turn_ended(&mut h).await;
+    assert!(result_of(&events, &id).0.contains("pushed"));
+    assert!(h.log(&h.session.id).iter().any(|e| matches!(&e.kind,
+        EntryKind::Approval { decision, by, .. } if decision == "allow" && by == "user")));
+}
+
+#[tokio::test]
+async fn a_rejected_call_tells_the_model_and_a_deny_rule_never_asks() {
+    let server = model_server(vec![
+        ok(tool_calls_stream(&[
+            ("a", "run_bash", json!({"command": "echo one"})),
+            ("b", "run_bash", json!({"command": "rm -rf build"})),
+        ])),
+        ok(text_stream("ok")),
+    ])
+    .await;
+    let config = AppConfig {
+        permissions: vec![ask_rule("echo *"), Rule { tool: "*".into(), pattern: "rm -rf *".into(), action: Action::Deny }],
+        ..test_config(&server)
+    };
+    let mut h = start_with(config, tempfile::tempdir().unwrap(), SessionStart::New).await;
+    h.send(AgentCommand::Prompt("go".into()));
+    let (id, _) = until_asked(&mut h).await;
+    h.send(AgentCommand::ApprovePermission { id, answer: PermissionAnswer::Reject });
+    let events = until_turn_ended(&mut h).await;
+    let (a, a_err) = result_of(&events, "a");
+    assert!(a_err && a.contains("declined"), "{a}");
+    let (b, b_err) = result_of(&events, "b");
+    assert!(b_err && b.contains("denied") && b.contains("rm -rf build"), "{b}");
+    let asks = events.iter().filter(|e| matches!(e, AgentEvent::PermissionRequested { .. })).count();
+    assert_eq!(asks, 0, "only the first call asked (before these events)");
+}
+
+#[tokio::test]
+async fn always_saves_a_rule_so_the_same_command_isnt_asked_again() {
+    let server = model_server(vec![
+        ok(tool_use_stream("t1", "echo again")),
+        ok(tool_use_stream("t2", "echo again")),
+        ok(text_stream("done")),
+    ])
+    .await;
+    let config = AppConfig { permissions: vec![ask_rule("echo *")], ..test_config(&server) };
+    let mut h = start_with(config, tempfile::tempdir().unwrap(), SessionStart::New).await;
+    h.send(AgentCommand::Prompt("go".into()));
+    let (id, _) = until_asked(&mut h).await;
+    h.send(AgentCommand::ApprovePermission { id, answer: PermissionAnswer::Always });
+    let events = until_turn_ended(&mut h).await;
+    assert!(!events.iter().any(|e| matches!(e, AgentEvent::PermissionRequested { .. })), "not asked twice");
+    assert!(!result_of(&events, "t2").1);
+    let saved = std::fs::read_to_string(h.project().join(".syl/approvals.toml")).unwrap();
+    assert!(saved.contains("echo again") && saved.contains("allow"), "{saved}");
+}
+
+#[tokio::test]
+async fn the_reviewer_can_approve_and_fails_closed() {
+    use syl_core::config::ReviewerConfig;
+    // First call: the reviewer allows. Second: the reviewer's request fails,
+    // so the user is asked.
+    let server = model_server(vec![
+        ok(tool_use_stream("t1", "echo one")),
+        ok(text_stream("ALLOW: a harmless echo")),
+        ok(tool_use_stream("t2", "echo two")),
+        ResponseTemplate::new(400).set_body_string("reviewer broke"),
+        ok(text_stream("done")),
+    ])
+    .await;
+    let config = AppConfig {
+        permissions: vec![ask_rule("echo *")],
+        reviewer: Some(ReviewerConfig { model: "claude-haiku-4-5".into(), timeout_secs: 5 }),
+        ..test_config(&server)
+    };
+    let mut h = start_with(config, tempfile::tempdir().unwrap(), SessionStart::New).await;
+    h.send(AgentCommand::Prompt("go".into()));
+    let (id, _) = until_asked(&mut h).await;
+    assert_eq!(id, "t2", "the reviewer approved t1 without asking");
+    h.send(AgentCommand::ApprovePermission { id, answer: PermissionAnswer::Once });
+    until_turn_ended(&mut h).await;
+    let bodies = request_bodies(&server).await;
+    assert_eq!(bodies[1]["model"], "claude-haiku-4-5");
+    assert!(bodies[1].get("tools").is_none());
+    assert!(bodies[1]["messages"][0]["content"].as_str().unwrap().contains("echo one"));
+    let log = h.log(&h.session.id);
+    assert!(log.iter().any(|e| matches!(&e.kind, EntryKind::Approval { by, .. } if by == "reviewer")));
+}
+
+#[tokio::test]
+async fn plan_mode_refuses_edits_and_puts_back_what_run_bash_changes() {
+    let server = model_server(vec![
+        ok(tool_calls_stream(&[
+            ("e", "write_file", json!({"path": "plan.md", "content": "x"})),
+            ("b", "run_bash", json!({"command": "echo made > made.txt; rm keep.txt; echo looked"})),
+        ])),
+        ok(text_stream("here is my plan")),
+    ])
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("project")).unwrap();
+    std::fs::write(tmp.path().join("project/keep.txt"), "keep me\n").unwrap();
+    let mut h = start_with(test_config(&server), tmp, SessionStart::New).await;
+    h.send(AgentCommand::SetMode(Mode::Plan));
+    assert_eq!(next_event(&mut h).await, AgentEvent::ModeChanged { mode: Mode::Plan });
+    h.send(AgentCommand::Prompt("plan it".into()));
+    let events = until_turn_ended(&mut h).await;
+
+    let (e, e_err) = result_of(&events, "e");
+    assert!(e_err && e.contains("Plan mode"), "{e}");
+    let (b, b_err) = result_of(&events, "b");
+    assert!(b_err && b.contains("looked") && b.contains("put back"), "{b}");
+    assert!(!h.project().join("plan.md").exists());
+    assert!(!h.project().join("made.txt").exists());
+    assert_eq!(std::fs::read_to_string(h.project().join("keep.txt")).unwrap(), "keep me\n");
+    // The model was told it is in plan mode.
+    let first = request_bodies(&server).await[0]["messages"][0]["content"].to_string();
+    assert!(first.contains("plan mode"), "{first}");
+}
+
+#[tokio::test]
+async fn a_turn_is_checkpointed_and_can_be_restored() {
+    let server = model_server(vec![
+        ok(tool_use_stream("t1", "rm -rf src")),
+        ok(text_stream("deleted it")),
+        ok(text_stream("noted")),
+    ])
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("project/src")).unwrap();
+    std::fs::write(tmp.path().join("project/src/main.rs"), "fn main() {}\n").unwrap();
+    let mut h = start_with(test_config(&server), tmp, SessionStart::New).await;
+    h.send(AgentCommand::Prompt("clean up".into()));
+    let events = until_turn_ended(&mut h).await;
+    let commit = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::Checkpointed { commit } => Some(commit.clone()),
+            _ => None,
+        })
+        .expect("a checkpoint before rm");
+    assert!(!h.project().join("src").exists());
+
+    h.send(AgentCommand::Restore { commit: commit.clone() });
+    loop {
+        match next_event(&mut h).await {
+            AgentEvent::Restored { commit: c, files } => {
+                assert_eq!((c.as_str(), files), (commit.as_str(), 1));
+                break;
+            }
+            AgentEvent::Error { message } => panic!("{message}"),
+            _ => {}
+        }
+    }
+    assert_eq!(std::fs::read_to_string(h.project().join("src/main.rs")).unwrap(), "fn main() {}\n");
+
+    // The model hears about it with the next prompt, and receipts show the turn.
+    h.send(AgentCommand::Prompt("what happened?".into()));
+    until_turn_ended(&mut h).await;
+    let sent = request_bodies(&server).await[2]["messages"].to_string();
+    assert!(sent.contains("restored the workspace"), "{sent}");
+    let receipts = session::receipts(&h.log(&h.session.id));
+    assert_eq!(receipts[0].commands, ["rm -rf src"]);
+    assert_eq!(receipts[0].checkpoint.as_deref(), Some(commit.as_str()));
 }

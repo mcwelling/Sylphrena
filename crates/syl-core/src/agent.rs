@@ -19,6 +19,10 @@ use tokio_util::sync::CancellationToken;
 use crate::api::client::{syl_tools, BlockDeltaEvent, CancelledError, SystemBlock};
 use crate::api::compaction;
 use crate::api::types::{ContentBlock, ImageSource, Message, MessageContent, StopReason, Usage};
+use crate::checkpoint::Checkpoints;
+use crate::control::{Pending, PermissionAnswer, Review};
+pub use crate::permissions::Mode;
+use crate::permissions::{Action, Policy};
 use crate::config::AppConfig;
 use crate::model::{ModelAdapter, ModelRequest};
 use crate::session::{EntryKind, PromptBlock, SessionInfo, SessionLog};
@@ -39,9 +43,21 @@ pub enum AgentEvent {
     ThinkingDelta { text: String },
     ToolCallStarted { id: String, name: String, input: serde_json::Value },
     ToolCallFinished { id: String, name: String, output: String, is_error: bool },
-    /// Reserved for the permission engine (Phase 3). The default policy
-    /// allows everything, so nothing emits it yet.
-    PermissionRequested { id: String, name: String, input: serde_json::Value },
+    /// A rule says to ask before this tool call (and the reviewer, if any,
+    /// didn't approve it). The turn waits for `ApprovePermission`.
+    /// `subject` is what the rule matched (for `run_bash`, the one command
+    /// of several that needs asking); `note` is the reviewer's reason for
+    /// blocking, if it did.
+    PermissionRequested { id: String, name: String, input: serde_json::Value, subject: String, note: Option<String> },
+    /// A call that wasn't simply allowed was decided: by a rule, the
+    /// reviewer or the user.
+    PermissionDecided { id: String, allowed: bool, by: String },
+    /// The mode changed (it applies from the next turn).
+    ModeChanged { mode: Mode },
+    /// The workspace was snapshotted before this turn changed files.
+    Checkpointed { commit: String },
+    /// The workspace was restored to `commit`; `files` changed back.
+    Restored { commit: String, files: usize },
     /// Token use of one model request, and the session total after it.
     Usage { request: Usage, session: Usage },
     /// History was compacted from `before` to `after` messages.
@@ -91,8 +107,15 @@ pub enum AgentCommand {
     Steer(String),
     /// Stop the turn in progress. Ignored when idle.
     Cancel,
-    /// Answer a `PermissionRequested` event. Ignored until Phase 3.
-    ApprovePermission { id: String, approved: bool },
+    /// Answer a `PermissionRequested` event.
+    ApprovePermission { id: String, answer: PermissionAnswer },
+    /// Plan (no file changes) or build. Applies from the next turn; the
+    /// model is told.
+    SetMode(Mode),
+    /// Put the workspace back to a checkpoint (a commit from a `Checkpoint`
+    /// entry or `Checkpointed` event). The current state is snapshotted
+    /// first, so this can be undone too. Waits for a turn in progress.
+    Restore { commit: String },
     /// Use this model from the next turn on.
     SetModel(String),
     /// Start a new, empty session. Like the session commands below, it
@@ -123,6 +146,11 @@ pub struct SessionPaths {
     pub sessions_dir: Option<PathBuf>,
     /// Where large tool output is saved, one subdirectory per session.
     pub spill: Option<SpillDir>,
+    /// Snapshot the workspace before turns that change files (shadow git
+    /// in `.syl/shadow.git`).
+    pub checkpoints: bool,
+    /// Rules saved by "always" answers.
+    pub approvals: Option<PathBuf>,
 }
 
 impl SessionPaths {
@@ -139,6 +167,8 @@ impl SessionPaths {
                 host: syl_dir.join("spill"),
                 container: "/workspace/.syl/spill".to_string(),
             }),
+            checkpoints: true,
+            approvals: Some(syl_dir.join("approvals.toml")),
             project_dir,
         }
     }
@@ -208,6 +238,10 @@ struct ContextState {
     compacted_len: Option<usize>,
     /// A failed log write was already reported.
     log_error_reported: bool,
+    /// A failed checkpoint was already reported.
+    checkpoint_error_reported: bool,
+    /// Nested git repositories were already reported.
+    nested_repos_reported: bool,
 }
 
 fn open_session(dir: Option<&std::path::Path>, id: &str) -> anyhow::Result<SessionLog> {
@@ -234,6 +268,8 @@ async fn run(agent: Agent, mut commands: mpsc::UnboundedReceiver<AgentCommand>, 
     emit(AgentEvent::SessionChanged { info: session.info() });
 
     let mut deferred: VecDeque<AgentCommand> = VecDeque::new();
+    let mut mode = Mode::Build;
+    let pending: Pending = Default::default();
     loop {
         let cmd = match deferred.pop_front() {
             Some(c) => c,
@@ -245,6 +281,18 @@ async fn run(agent: Agent, mut commands: mpsc::UnboundedReceiver<AgentCommand>, 
         let prompt = match cmd {
             AgentCommand::Shutdown => break,
             AgentCommand::Cancel | AgentCommand::ApprovePermission { .. } => continue,
+            AgentCommand::SetMode(m) => {
+                if m != mode {
+                    mode = m;
+                    record(&agent, &mut session, &mut ctx, &events, EntryKind::Note { text: mode_note(m).to_string() });
+                }
+                emit(AgentEvent::ModeChanged { mode });
+                continue;
+            }
+            AgentCommand::Restore { commit } => {
+                restore(&agent, &mut session, &mut ctx, &events, &commit).await;
+                continue;
+            }
             AgentCommand::SetModel(m) => {
                 *agent.state.current_model.lock().unwrap() = m;
                 continue;
@@ -304,7 +352,7 @@ async fn run(agent: Agent, mut commands: mpsc::UnboundedReceiver<AgentCommand>, 
         let cancel = CancellationToken::new();
         let mut shutting_down = false;
         let reason = {
-            let turn = run_turn(&agent, &mut session, &mut ctx, &events, &steer, cancel.clone());
+            let turn = run_turn(&agent, &mut session, &mut ctx, &events, &steer, &pending, mode, cancel.clone());
             tokio::pin!(turn);
             loop {
                 tokio::select! {
@@ -320,7 +368,11 @@ async fn run(agent: Agent, mut commands: mpsc::UnboundedReceiver<AgentCommand>, 
                         Some(AgentCommand::SetModel(m)) if deferred.is_empty() => {
                             *agent.state.current_model.lock().unwrap() = m
                         }
-                        Some(AgentCommand::ApprovePermission { .. }) => {}
+                        Some(AgentCommand::ApprovePermission { id, answer }) => {
+                            if let Some(tx) = pending.lock().unwrap().remove(&id) {
+                                let _ = tx.send(answer);
+                            }
+                        }
                         Some(AgentCommand::Steer(text)) => steer.lock().unwrap().push(text),
                         // Prompts and session commands wait for the turn.
                         Some(other) => deferred.push_back(other),
@@ -336,7 +388,13 @@ async fn run(agent: Agent, mut commands: mpsc::UnboundedReceiver<AgentCommand>, 
             if matches!(reason, TurnEnd::Completed(_)) && !shutting_down {
                 // The turn ended before it could hear it: it's the next prompt.
                 emit(AgentEvent::SteerQueued { text: text.clone(), count });
-                deferred.push_front(AgentCommand::Prompt(text));
+                // Ahead of queued prompts, but after mode changes sent before
+                // them: a switch to plan mode during the turn applies to it.
+                let at = deferred
+                    .iter()
+                    .position(|c| matches!(c, AgentCommand::Prompt(_) | AgentCommand::PromptWithImages { .. } | AgentCommand::Steer(_)))
+                    .unwrap_or(deferred.len());
+                deferred.insert(at, AgentCommand::Prompt(text));
             } else {
                 emit(AgentEvent::SteerDropped { text, count });
             }
@@ -516,12 +574,15 @@ async fn compact(
 }
 
 /// One user turn: model calls and tool calls until the model stops.
+#[allow(clippy::too_many_arguments)]
 async fn run_turn(
     agent: &Agent,
     session: &mut SessionLog,
     ctx: &mut ContextState,
     events: &Events,
     steer: &std::sync::Mutex<Vec<String>>,
+    pending: &Pending,
+    mode: Mode,
     cancel: CancellationToken,
 ) -> TurnEnd {
     let emit = |e: AgentEvent| {
@@ -544,6 +605,22 @@ async fn run_turn(
         host: s.host.join(session.id()),
         container: format!("{}/{}", s.container.trim_end_matches('/'), session.id()),
     });
+
+    // The permission rules for this turn: config, then saved "always"
+    // answers, then the mode's. "Always" answers during the turn add to it.
+    let mut approvals = match agent.paths.approvals.as_deref().map(crate::permissions::load_approvals) {
+        Some(Ok(a)) => a,
+        Some(Err(e)) => {
+            emit(AgentEvent::Notice {
+                message: format!("[Syl] Saved approvals can't be read, so they don't apply (and none will be saved): {e}"),
+            });
+            Vec::new()
+        }
+        None => Vec::new(),
+    };
+    // In plan mode the turn isn't checkpointed: each run_bash is snapshotted
+    // and put back on its own, and /undo should find the last build turn.
+    let mut checkpointed = mode == Mode::Plan;
 
     let mut overflow_retries = 0;
     let mut images_dropped = false;
@@ -713,14 +790,52 @@ async fn run_turn(
                 }
                 continue;
             }
-            for (id, name, input) in group {
-                emit(AgentEvent::ToolCallStarted { id: id.clone(), name: name.clone(), input: input.clone() });
+            // Permissions first, one call at a time (asking is sequential).
+            let mut results: Vec<Option<(String, bool)>> = vec![None; group.len()];
+            for (k, (id, name, input)) in group.iter().enumerate() {
+                let gate = Gate { agent, config: &config, pending, mode, cancel: &cancel };
+                if let Err(denied) = gate.authorize(session, ctx, events, &mut approvals, id, name, input).await {
+                    results[k] = Some((denied, true));
+                }
             }
-            let outputs = futures_util::future::join_all(
-                group.iter().map(|(id, name, input)| tools::execute(name, id, input, &tool_ctx, cancel.clone())),
-            )
+            // A checkpoint before the first call of the turn that can change files.
+            let will_change = group
+                .iter()
+                .zip(&results)
+                .any(|((_, name, _), r)| r.is_none() && CHANGES_FILES.contains(&name.as_str()));
+            if will_change && !checkpointed && agent.paths.checkpoints && !cancel.is_cancelled() {
+                checkpointed = true;
+                let label = crate::session::user_prompts(session.entries())
+                    .last()
+                    .map(|p| crate::session::one_line(&p.text, 72))
+                    .unwrap_or_default();
+                checkpoint_now(agent, session, ctx, events, &format!("before: {label}")).await;
+            }
+            let refused: Vec<bool> = results.iter().map(Option::is_some).collect();
+            for ((id, name, input), refused) in group.iter().zip(&refused) {
+                if !refused {
+                    emit(AgentEvent::ToolCallStarted { id: id.clone(), name: name.clone(), input: input.clone() });
+                }
+            }
+            let runnable: Vec<usize> = (0..group.len()).filter(|&k| results[k].is_none()).collect();
+            let outputs = futures_util::future::join_all(runnable.iter().map(|&k| {
+                let (id, name, input) = &group[k];
+                execute_call(agent, &tool_ctx, mode, id, name, input, cancel.clone())
+            }))
             .await;
-            for ((id, name, _), (output, is_error)) in group.iter().zip(outputs) {
+            for (k, (output, is_error, put_back)) in runnable.into_iter().zip(outputs) {
+                if let Some((commit, safety)) = put_back {
+                    // The files as they were before the put-back stay reachable.
+                    record(agent, session, ctx, events, EntryKind::Restored { commit, safety });
+                }
+                results[k] = Some((output, is_error));
+            }
+            for (((id, name, input), result), refused) in group.iter().zip(results).zip(refused) {
+                let (output, is_error) = result.expect("every call has a result");
+                if refused {
+                    // It never ran; clients still see a started/finished pair.
+                    emit(AgentEvent::ToolCallStarted { id: id.clone(), name: name.clone(), input: input.clone() });
+                }
                 emit(AgentEvent::ToolCallFinished {
                     id: id.clone(),
                     name: name.clone(),
@@ -747,6 +862,319 @@ async fn run_turn(
 
         if cancel.is_cancelled() {
             return TurnEnd::Cancelled;
+        }
+    }
+}
+
+/// Tools that can change files in the workspace: a turn is checkpointed
+/// before the first of these runs.
+const CHANGES_FILES: &[&str] = &["run_bash", "edit_file", "write_file"];
+
+fn mode_note(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Plan => {
+            "[Syl is now in plan mode: edit_file and write_file are turned off, and anything run_bash \
+             changes in the workspace is put back. Investigate, then propose a plan; the user will \
+             switch to build mode to carry it out.]"
+        }
+        Mode::Build => "[Syl is back in build mode: file changes are allowed again.]",
+    }
+}
+
+/// Snapshot the workspace and log it. A failure is reported once per
+/// session and otherwise ignored: checkpoints are a safety net, not a gate.
+async fn checkpoint_now(
+    agent: &Agent,
+    session: &mut SessionLog,
+    ctx: &mut ContextState,
+    events: &Events,
+    label: &str,
+) -> Option<String> {
+    let cp = Checkpoints::for_project(&agent.paths.project_dir);
+    let msg = label.to_string();
+    let warn_nested = !ctx.nested_repos_reported;
+    match tokio::task::spawn_blocking(move || cp.snapshot(&msg).map(|c| (c, if warn_nested { cp.nested_repos() } else { Vec::new() })))
+        .await
+        .map(|r| r.map(|(c, nested)| {
+            if !nested.is_empty() {
+                let _ = events.send(AgentEvent::Notice {
+                    message: format!(
+                        "[Syl] These directories are git repositories of their own, so checkpoints hold only \
+                         their commit, not their files: {}",
+                        nested.join(", ")
+                    ),
+                });
+            }
+            c
+        })) {
+        Ok(Ok(commit)) => {
+            ctx.nested_repos_reported = true;
+            record(agent, session, ctx, events, EntryKind::Checkpoint { commit: commit.clone(), label: label.to_string() });
+            let _ = events.send(AgentEvent::Checkpointed { commit: commit.clone() });
+            Some(commit)
+        }
+        Ok(Err(e)) => {
+            report_checkpoint_error(ctx, events, &e.to_string());
+            None
+        }
+        Err(e) => {
+            report_checkpoint_error(ctx, events, &e.to_string());
+            None
+        }
+    }
+}
+
+fn report_checkpoint_error(ctx: &mut ContextState, events: &Events, e: &str) {
+    tracing::warn!("checkpoint failed: {e}");
+    if !ctx.checkpoint_error_reported {
+        ctx.checkpoint_error_reported = true;
+        let _ = events.send(AgentEvent::Notice {
+            message: format!("[Syl] Could not snapshot the workspace, so this turn can't be undone: {e}"),
+        });
+    }
+}
+
+/// `AgentCommand::Restore`: put the workspace back and tell the model.
+async fn restore(agent: &Agent, session: &mut SessionLog, ctx: &mut ContextState, events: &Events, commit: &str) {
+    let cp = Checkpoints::for_project(&agent.paths.project_dir);
+    let c = commit.to_string();
+    let done = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let changes = cp.preview(&c)?;
+        let safety = cp.restore(&c, "requested")?;
+        Ok((changes, safety))
+    })
+    .await
+    .map_err(anyhow::Error::from)
+    .and_then(|r| r);
+    match done {
+        Ok((changes, safety)) => {
+            record(agent, session, ctx, events, EntryKind::Restored { commit: commit.to_string(), safety });
+            let list: Vec<&str> = changes.iter().take(20).map(|c| c.path.as_str()).collect();
+            let more = changes.len().saturating_sub(20);
+            let list = if more > 0 { format!("{} and {more} more", list.join(", ")) } else { list.join(", ") };
+            let text = if changes.is_empty() {
+                format!("[The user restored the workspace to checkpoint {}; nothing had changed since.]", crate::checkpoint::short(commit))
+            } else {
+                format!(
+                    "[The user restored the workspace to checkpoint {}: {} files went back ({list}). \
+                     Changes made after that checkpoint, by you or the user, are undone (files that \
+                     .gitignore hides, and the git repository itself, are as they were). Read files \
+                     again before editing them.]",
+                    crate::checkpoint::short(commit),
+                    changes.len()
+                )
+            };
+            record(agent, session, ctx, events, EntryKind::Note { text });
+            let _ = events.send(AgentEvent::Restored { commit: commit.to_string(), files: changes.len() });
+        }
+        Err(e) => {
+            let _ = events.send(AgentEvent::Error { message: format!("could not restore {}: {e}", crate::checkpoint::short(commit)) });
+        }
+    }
+}
+
+/// Run one tool call. In plan mode `run_bash` runs between two snapshots,
+/// and anything it changed in the workspace is put back; it is refused
+/// when no snapshot can be taken, since nothing could be put back. Returns
+/// the output, and for a put-back the checkpoint and the safety snapshot.
+async fn execute_call(
+    agent: &Agent,
+    tool_ctx: &ToolContext<'_>,
+    mode: Mode,
+    id: &str,
+    name: &str,
+    input: &serde_json::Value,
+    cancel: CancellationToken,
+) -> (String, bool, Option<(String, String)>) {
+    if !(mode == Mode::Plan && name == "run_bash") {
+        let (o, e) = tools::execute(name, id, input, tool_ctx, cancel).await;
+        return (o, e, None);
+    }
+    let refuse = |why: String| {
+        (
+            format!("[Plan mode: run_bash is unavailable because the workspace can't be snapshotted ({why}), so changes couldn't be put back.]"),
+            true,
+            None,
+        )
+    };
+    if !agent.paths.checkpoints {
+        return refuse("checkpoints are off".to_string());
+    }
+    let cp = Checkpoints::for_project(&agent.paths.project_dir);
+    let snap = cp.clone();
+    let before = tokio::task::spawn_blocking(move || -> anyhow::Result<(String, Vec<String>)> {
+        Ok((snap.snapshot("plan mode: before run_bash")?, snap.ignored_paths().unwrap_or_default()))
+    })
+    .await;
+    let (before, ignored_before) = match before {
+        Ok(Ok(b)) => b,
+        Ok(Err(e)) => return refuse(e.to_string()),
+        Err(e) => return refuse(e.to_string()),
+    };
+    let (output, is_error) = tools::execute(name, id, input, tool_ctx, cancel).await;
+    let check = before.clone();
+    let put_back = tokio::task::spawn_blocking(move || -> anyhow::Result<(Vec<crate::checkpoint::Change>, Option<String>, Vec<String>)> {
+        let changes = cp.preview(&check)?;
+        let safety = if changes.is_empty() { None } else { Some(cp.restore(&check, "plan mode")?) };
+        let now: std::collections::HashSet<String> = cp.ignored_paths().unwrap_or_default().into_iter().collect();
+        let lost = ignored_before.into_iter().filter(|p| !now.contains(p)).collect();
+        Ok((changes, safety, lost))
+    })
+    .await;
+    match put_back {
+        Ok(Ok((changes, safety, lost))) => {
+            let mut notes = Vec::new();
+            if !changes.is_empty() {
+                let list: Vec<&str> = changes.iter().take(10).map(|c| c.path.as_str()).collect();
+                notes.push(format!(
+                    "[Plan mode: this command changed files in the workspace, so they were put back ({}). In plan \
+                     mode, investigate and propose changes instead of making them.]",
+                    list.join(", ")
+                ));
+            }
+            if !lost.is_empty() {
+                notes.push(format!(
+                    "[Plan mode: these ignored paths were removed and can't be put back: {}.]",
+                    lost.iter().take(10).cloned().collect::<Vec<_>>().join(", ")
+                ));
+            }
+            if notes.is_empty() {
+                (output, is_error, None)
+            } else {
+                (format!("{output}\n\n{}", notes.join("\n")), true, safety.map(|s| (before, s)))
+            }
+        }
+        Ok(Err(e)) => (format!("{output}\n\n[Plan mode: could not check for file changes: {e}]"), true, None),
+        Err(e) => (format!("{output}\n\n[Plan mode: could not check for file changes: {e}]"), true, None),
+    }
+}
+
+/// Decides whether a tool call may run.
+struct Gate<'a> {
+    agent: &'a Agent,
+    config: &'a AppConfig,
+    pending: &'a Pending,
+    mode: Mode,
+    cancel: &'a CancellationToken,
+}
+
+impl Gate<'_> {
+    /// Ok to run it; Err with the tool result to send back instead.
+    #[allow(clippy::too_many_arguments)]
+    async fn authorize(
+        &self,
+        session: &mut SessionLog,
+        ctx: &mut ContextState,
+        events: &Events,
+        approvals: &mut Vec<crate::permissions::Rule>,
+        id: &str,
+        name: &str,
+        input: &serde_json::Value,
+    ) -> Result<(), String> {
+        if self.cancel.is_cancelled() {
+            return Err("[Tool error: cancelled by user]".to_string());
+        }
+        let policy = Policy::new(self.config.permissions.clone()).with_approvals(approvals.clone()).with_mode(self.mode);
+        let decision = policy.decide(name, input);
+        // What the user is asked about: every part that needs it.
+        let asked = decision.asks.join("  ·  ");
+        let log = |session: &mut SessionLog, ctx: &mut ContextState, allowed: bool, by: &str| {
+            record(self.agent, session, ctx, events, EntryKind::Approval {
+                tool_use_id: id.to_string(),
+                decision: if allowed { "allow" } else { "deny" }.to_string(),
+                by: by.to_string(),
+                subject: if decision.action == Action::Ask { asked.clone() } else { decision.subject.clone() },
+            });
+            let _ = events.send(AgentEvent::PermissionDecided { id: id.to_string(), allowed, by: by.to_string() });
+        };
+        match decision.action {
+            Action::Allow => Ok(()),
+            Action::Deny => {
+                log(session, ctx, false, "rule");
+                if self.mode == Mode::Plan && crate::permissions::EDITING_TOOLS.contains(&name) {
+                    Err("[Plan mode: file edits are turned off. Describe the change instead; the user can \
+                         switch to build mode to make it.]"
+                        .to_string())
+                } else {
+                    Err(format!(
+                        "[Permission denied: a rule doesn't allow `{}`. Try another way, or ask the user.]",
+                        crate::session::one_line(&decision.subject, 200)
+                    ))
+                }
+            }
+            Action::Ask => {
+                let mut note = None;
+                if let Some(reviewer) = &self.config.reviewer {
+                    let task = crate::session::user_prompts(session.entries()).last().map(|p| p.text.clone()).unwrap_or_default();
+                    match crate::control::review(
+                        self.agent.model.as_ref(),
+                        self.config,
+                        reviewer,
+                        &task,
+                        name,
+                        input,
+                        self.cancel.clone(),
+                    )
+                    .await
+                    {
+                        Review::Allow(why) => {
+                            log(session, ctx, true, "reviewer");
+                            let _ = events.send(AgentEvent::Notice {
+                                message: format!(
+                                    "[Syl] Reviewer allowed `{}`: {}",
+                                    crate::session::one_line(&asked, 80),
+                                    crate::session::one_line(&why, 200)
+                                ),
+                            });
+                            return Ok(());
+                        }
+                        Review::Block(why) => note = Some(format!("The reviewer would block it: {why}")),
+                        Review::Unsure(why) => note = Some(format!("No review: {why}")),
+                    }
+                }
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                self.pending.lock().unwrap().insert(id.to_string(), tx);
+                let _ = events.send(AgentEvent::PermissionRequested {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    input: input.clone(),
+                    subject: asked.clone(),
+                    note,
+                });
+                let answer = tokio::select! {
+                    a = rx => a.ok(),
+                    _ = self.cancel.cancelled() => None,
+                };
+                self.pending.lock().unwrap().remove(id);
+                match answer {
+                    Some(PermissionAnswer::Once) => {
+                        log(session, ctx, true, "user");
+                        Ok(())
+                    }
+                    Some(PermissionAnswer::Always) => {
+                        log(session, ctx, true, "user_always");
+                        if let Some(path) = &self.agent.paths.approvals {
+                            for subject in &decision.asks {
+                                match crate::permissions::save_approval(path, name, subject) {
+                                    Ok(rule) => approvals.push(rule),
+                                    Err(e) => {
+                                        let _ = events.send(AgentEvent::Notice {
+                                            message: format!("[Syl] Allowed once; couldn't save the rule: {e}"),
+                                        });
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        Ok(())
+                    }
+                    Some(PermissionAnswer::Reject) => {
+                        log(session, ctx, false, "user");
+                        Err("[The user declined this tool call. Don't retry it; ask or take another approach.]".to_string())
+                    }
+                    None => Err("[Tool error: cancelled by user]".to_string()),
+                }
+            }
         }
     }
 }

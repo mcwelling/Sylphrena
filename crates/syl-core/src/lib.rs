@@ -3,10 +3,13 @@
 //! `agent::spawn`, `AgentCommand` and `AgentEvent`.
 pub mod agent;
 pub mod attachments;
+pub mod checkpoint;
 pub mod api;
 pub mod config;
+pub mod control;
 pub mod logging;
 pub mod model;
+pub mod permissions;
 pub mod pricing;
 pub mod session;
 pub mod shared;

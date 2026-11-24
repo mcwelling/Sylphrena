@@ -69,6 +69,22 @@ model      = "claude-sonnet-4-6"
 rate_limit = 40000
 image      = "kitty"
 
+# Ask before some tool calls (optional; the last matching rule wins)
+[[permission]]
+tool = "run_bash"
+pattern = "git push*"
+action = "ask"          # allow | ask | deny
+
+# Let a cheap model approve "ask" calls; if it doesn't, you're asked (optional)
+[reviewer]
+model = "claude-haiku-4-5"
+
+# Container limits (optional)
+[container]
+memory = "4g"
+cpus = "2"
+# network = "none"
+
 # Context compaction (optional)
 context_window      = 1000000  # override the model's window, in tokens
 compact_buffer      = 0.15     # compact when within 15% of the window
@@ -84,6 +100,10 @@ Priority: **CLI flag > environment variable > `.syl/config.toml` > default**
 | `/model [name]` | Interactive picker (↑↓ / jk + Enter), or direct: `/model sonnet` |
 | `/status` | Model, timeout, rate limit, token counts, cost |
 | `/tools` | The last turn's tool calls in full: output and diffs |
+| `/undo` | Put files back as they were before the last turn that changed them (also Ctrl+Z) |
+| `/checkpoints`, `/restore <n>` | List checkpoints, or go back to one |
+| `/receipts [n]` | What the last turns edited, ran, fetched and were allowed |
+| `/plan`, `/build` | Plan mode (Syl can't change files) or build mode; Shift+Tab toggles |
 | `/sessions` | List saved sessions (`*` marks the current one) |
 | `/resume <n\|id\|name>` | Switch to a saved session |
 | `/history` | Prompts in this session, numbered for `/fork` |

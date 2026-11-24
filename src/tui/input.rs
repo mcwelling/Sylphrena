@@ -6,11 +6,40 @@
 /// it; without this anchor, rustyline draws the prompt at the wrong row.
 use std::io;
 
+use std::sync::{Arc, Mutex};
+
 use crossterm::{cursor, execute};
-use rustyline::{Config, DefaultEditor, Result as RlResult};
+use rustyline::{
+    Cmd, ConditionalEventHandler, Config, DefaultEditor, Event, EventContext, EventHandler, KeyCode, KeyEvent,
+    Modifiers, RepeatCount, Result as RlResult,
+};
+
+/// A key at the prompt that does something rather than edit the line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hotkey {
+    /// Shift+Tab: switch between plan and build mode.
+    ToggleMode,
+    /// Ctrl+Z: undo the last turn's file changes.
+    Undo,
+}
+
+/// Records the hotkey and accepts the line, so `readline` returns and the
+/// caller can act on it (the typed text comes back with it, to restore).
+struct HotkeyHandler {
+    key: Hotkey,
+    pressed: Arc<Mutex<Option<Hotkey>>>,
+}
+
+impl ConditionalEventHandler for HotkeyHandler {
+    fn handle(&self, _: &Event, _: RepeatCount, _: bool, _: &EventContext) -> Option<Cmd> {
+        *self.pressed.lock().unwrap() = Some(self.key);
+        Some(Cmd::AcceptLine)
+    }
+}
 
 pub struct InputEditor {
     rl: DefaultEditor,
+    pressed: Arc<Mutex<Option<Hotkey>>>,
 }
 
 impl InputEditor {
@@ -20,8 +49,23 @@ impl InputEditor {
             .history_ignore_space(true)
             .max_history_size(0)? // disable history persistence
             .build();
-        let rl = DefaultEditor::with_config(config)?;
-        Ok(Self { rl })
+        let mut rl = DefaultEditor::with_config(config)?;
+        let pressed = Arc::new(Mutex::new(None));
+        for (key, hotkey) in [
+            (KeyEvent(KeyCode::BackTab, Modifiers::NONE), Hotkey::ToggleMode),
+            (KeyEvent::ctrl('z'), Hotkey::Undo),
+        ] {
+            rl.bind_sequence(
+                key,
+                EventHandler::Conditional(Box::new(HotkeyHandler { key: hotkey, pressed: pressed.clone() })),
+            );
+        }
+        Ok(Self { rl, pressed })
+    }
+
+    /// The hotkey that ended the last `readline`, if one did.
+    pub fn take_hotkey(&self) -> Option<Hotkey> {
+        self.pressed.lock().unwrap().take()
     }
 
     /// Read a line from the user.

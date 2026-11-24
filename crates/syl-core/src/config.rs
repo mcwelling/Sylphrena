@@ -95,6 +95,50 @@ pub struct AppConfig {
     /// Offer Syl's tools in requests. Sub-calls that must answer in text,
     /// like the compaction summarizer, turn this off.
     pub tools: bool,
+    /// `[[permission]]` rules from config.toml, in file order.
+    pub permissions: Vec<crate::permissions::Rule>,
+    /// `[reviewer]`: a cheap model that may approve `ask` calls.
+    pub reviewer: Option<ReviewerConfig>,
+    /// `[container]` options.
+    pub container: ContainerConfig,
+    /// Why config.toml couldn't be read, if it couldn't. The defaults are
+    /// used, and the client should say so: a typo must not quietly turn
+    /// permission rules off.
+    pub config_error: Option<String>,
+    /// Things in config.toml that were ignored, for the client to show.
+    pub config_warnings: Vec<String>,
+}
+
+/// `[reviewer]` in config.toml.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewerConfig {
+    /// Default `claude-haiku-4-5`.
+    #[serde(default = "default_reviewer_model")]
+    pub model: String,
+    /// How long to wait for a verdict before asking the user. Default 20.
+    #[serde(default = "default_reviewer_timeout")]
+    pub timeout_secs: u64,
+}
+
+fn default_reviewer_model() -> String {
+    "claude-haiku-4-5".to_string()
+}
+
+fn default_reviewer_timeout() -> u64 {
+    20
+}
+
+/// `[container]` in config.toml.
+#[derive(Debug, Clone, Default, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContainerConfig {
+    /// `"none"` runs the container without a network.
+    pub network: Option<String>,
+    /// Memory limit, as podman takes it (`"4g"`). Default `"2g"`.
+    pub memory: Option<String>,
+    /// CPU limit (`"2"`, `"1.5"`). Default: no limit.
+    pub cpus: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -117,6 +161,11 @@ impl Default for AppConfig {
             compact_buffer: crate::api::compaction::DEFAULT_COMPACT_BUFFER,
             compact_keep_tokens: crate::api::compaction::DEFAULT_KEEP_TOKENS,
             tools: true,
+            permissions: Vec::new(),
+            reviewer: None,
+            container: ContainerConfig::default(),
+            config_error: None,
+            config_warnings: Vec::new(),
         }
     }
 }
@@ -125,7 +174,10 @@ impl Default for AppConfig {
 // File config
 // ---------------------------------------------------------------------------
 
-/// File-level config (from `.syl/config.toml`).
+/// File-level config (from `.syl/config.toml`). Unknown top-level keys are
+/// tolerated (a newer Syl's settings, say) but reported, so `[[permissions]]`
+/// for `[[permission]]` doesn't quietly mean no rules. Inside the tables
+/// that control safety, unknown keys are errors.
 #[derive(Debug, Default, serde::Deserialize)]
 struct FileConfig {
     model: Option<String>,
@@ -135,14 +187,40 @@ struct FileConfig {
     context_window: Option<u64>,
     compact_buffer: Option<f64>,
     compact_keep_tokens: Option<u64>,
+    #[serde(default)]
+    permission: Vec<crate::permissions::Rule>,
+    reviewer: Option<ReviewerConfig>,
+    #[serde(default)]
+    container: ContainerConfig,
 }
 
-/// Load the TOML config file. Returns `Default` if missing or unparseable.
-fn load_toml_config(path: &Path) -> FileConfig {
+const KNOWN_KEYS: &[&str] = &[
+    "model", "rate_limit", "theme", "image", "context_window", "compact_buffer", "compact_keep_tokens",
+    "permission", "reviewer", "container",
+];
+
+/// Load the TOML config file. Missing → defaults. Unparseable → defaults
+/// and the error, which the caller must surface. Unknown top-level keys
+/// come back as warnings.
+fn load_toml_config(path: &Path) -> (FileConfig, Option<String>, Vec<String>) {
     let Ok(text) = std::fs::read_to_string(path) else {
-        return FileConfig::default();
+        return (FileConfig::default(), None, Vec::new());
     };
-    toml::from_str(&text).unwrap_or_default()
+    let warnings = match toml::from_str::<toml::Table>(&text) {
+        Ok(table) => table
+            .keys()
+            .filter(|k| !KNOWN_KEYS.contains(&k.as_str()))
+            .map(|k| {
+                let hint = if k == "permissions" { " (did you mean [[permission]]?)" } else { "" };
+                format!("{}: unknown setting `{k}` is ignored{hint}", path.display())
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    match toml::from_str(&text) {
+        Ok(c) => (c, None, warnings),
+        Err(e) => (FileConfig::default(), Some(format!("{}: {e}", path.display())), warnings),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -259,8 +337,8 @@ pub fn parse_cli_args(args: &[&str]) -> CliArgs {
 /// Priority: CLI flag > env var > config file > default.
 pub fn build_config(cli: &CliArgs, syl_dir: &Path) -> AppConfig {
     let toml_path = syl_dir.join("config.toml");
-    let file = load_toml_config(&toml_path);
-    let mut cfg = AppConfig::default();
+    let (file, config_error, config_warnings) = load_toml_config(&toml_path);
+    let mut cfg = AppConfig { config_error, config_warnings, ..AppConfig::default() };
 
     // model
     if let Some(v) = cli
@@ -320,6 +398,18 @@ pub fn build_config(cli: &CliArgs, syl_dir: &Path) -> AppConfig {
     if let Some(v) = file.compact_keep_tokens {
         cfg.compact_keep_tokens = v;
     }
+    cfg.permissions = file.permission;
+    if cfg.config_error.is_some() {
+        // The rules that were meant to apply are unknown: ask before every
+        // tool call until the file is fixed, rather than allow everything.
+        cfg.permissions = vec![crate::permissions::Rule {
+            tool: "*".into(),
+            pattern: "*".into(),
+            action: crate::permissions::Action::Ask,
+        }];
+    }
+    cfg.reviewer = file.reviewer;
+    cfg.container = file.container;
 
     // API key from environment
     cfg.api_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
