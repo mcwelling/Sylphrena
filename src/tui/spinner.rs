@@ -1,4 +1,5 @@
-/// Tool-execution spinner: Braille frames on the bottom bar row.
+/// Tool-execution spinner: Braille frames on the ticker row (the input row
+/// during a turn).
 ///
 /// Runs at 100 ms/frame and displays elapsed time.  Uses the same ESC7/ESC8
 /// save-restore pattern as the status bars so it doesn't disturb cursor.
@@ -17,19 +18,19 @@ pub struct SpinnerHandle {
 }
 
 impl SpinnerHandle {
-    /// Stop the spinner and clear the bottom bar row.
+    /// Stop the spinner. The row keeps its last frame until redrawn.
     pub fn stop(self) {
         self.cancel.cancel();
     }
 }
 
-/// Spawn the tool-execution spinner on the bottom bar row.
+/// Spawn the tool-execution spinner on the ticker row.
 ///
 /// `rows` is the current terminal height (crossterm `size().1`).
 /// `label` is the tool name or short description shown next to the spinner.
 ///
-/// The task overwrites the bottom bar row (rows-2 in 1-indexed = rows-3 in
-/// 0-indexed) every 100 ms.  Stop it with [`SpinnerHandle::stop`].
+/// The task overwrites the ticker row every 100 ms.  Stop it with
+/// [`SpinnerHandle::stop`].
 pub fn spawn_spinner(
     stdout: Arc<Mutex<std::io::Stdout>>,
     rows: u16,
@@ -38,8 +39,7 @@ pub fn spawn_spinner(
     let cancel = CancellationToken::new();
     let cancel2 = cancel.clone();
 
-    // Bottom bar: rows-2 (1-indexed) = rows-3 (0-indexed)
-    let bottom_row_1indexed = rows.saturating_sub(2);
+    let row_1indexed = crate::tui::terminal::ticker_row_1(rows);
 
     tokio::spawn(async move {
         let start = Instant::now();
@@ -56,22 +56,27 @@ pub fn spawn_spinner(
             let line = format!(" {} {} ({} s)", spin, label, elapsed);
 
             if let Ok(mut out) = stdout.lock() {
+                // Stopped while waiting for the lock? Then whoever stopped it
+                // is about to draw (or has drawn) this row: don't paint over it.
+                // `stop` signals before the caller takes the lock to draw, so
+                // checking under the lock closes the gap.
+                if cancel2.is_cancelled() {
+                    break;
+                }
+                // Autowrap off: a long label is clipped, never wrapped.
                 let _ = write!(
                     out,
-                    "\x1b7\x1b[{};1H\x1b[2K{}\x1b8",
-                    bottom_row_1indexed, line,
+                    "\x1b7\x1b[?7l\x1b[{};1H\x1b[2K{}\x1b[?7h\x1b8",
+                    row_1indexed, line,
                 );
                 let _ = out.flush();
             }
 
             frame = frame.wrapping_add(1);
         }
-
-        // Clear spinner row on exit
-        if let Ok(mut out) = stdout.lock() {
-            let _ = write!(out, "\x1b7\x1b[{};1H\x1b[2K\x1b8", bottom_row_1indexed);
-            let _ = out.flush();
-        }
+        // The row is left as it is: whoever stopped the spinner draws it
+        // next (the tool ticker, or the bars), and a clear from this task
+        // could land after that and wipe it.
     });
 
     SpinnerHandle { cancel }

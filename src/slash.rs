@@ -59,6 +59,7 @@ pub async fn handle_slash(input: &str, ctx: &SlashContext<'_>) -> Option<SlashRe
 Slash commands:
   /model [name]     Interactive model picker, or switch directly by name
   /status           Session stats
+  /tools            The last turn's tool calls in full (output, diffs)
   /sessions         List saved sessions
   /resume <n|id>    Switch to a saved session (number from /sessions, id or name)
   /history          Prompts in this session, numbered for /fork

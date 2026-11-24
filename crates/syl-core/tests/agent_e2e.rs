@@ -886,3 +886,45 @@ async fn steering_when_idle_is_a_prompt_and_says_so() {
     assert_eq!(next_event(&mut h).await, AgentEvent::TurnStarted);
     until_turn_ended(&mut h).await;
 }
+
+#[tokio::test]
+async fn dispatch_agent_gets_the_full_page_cut_on_a_character_boundary() {
+    // A long plain-text page of 3-byte characters: over 100 lines (which
+    // run_bash would have turned into a numbered preview) and longer than
+    // the 32,000-byte cap, which lands inside a character.
+    let page: String = (0..2_000).map(|i| format!("日本語の行です {i:04}\n")).collect();
+    assert!(!page.is_char_boundary(32_000), "the cap must split a character for this test");
+    let site = MockServer::start().await;
+    Mock::given(method("GET")).respond_with(ResponseTemplate::new(200).set_body_string(page.clone())).mount(&site).await;
+
+    let server = model_server(vec![
+        ok(tool_calls_stream(&[(
+            "d1",
+            "dispatch_agent",
+            json!({"task": "fetch", "source": format!("{}/doc.txt", site.uri()), "focus": "line numbers",
+                   "output_format": "text", "max_length": 300}),
+        )])),
+        ok(text_stream("sub-agent answer")),
+        ok(text_stream("done")),
+    ])
+    .await;
+    let mut h = start(&server).await;
+    h.send(AgentCommand::Prompt("fetch it".into()));
+    let events = until_turn_ended(&mut h).await;
+    let out = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::ToolCallFinished { output, .. } => Some(output.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(out.contains("sub-agent answer"), "{out}");
+
+    let bodies = request_bodies(&server).await;
+    let sub = &bodies[1];
+    assert!(sub.get("tools").is_none(), "the sub-agent is offered no tools");
+    let prompt = sub["messages"][0]["content"].as_str().unwrap();
+    assert!(prompt.contains("日本語の行です 0000") && prompt.contains("日本語の行です 1100"), "the page is not cut to 100 lines");
+    assert!(!prompt.contains("read_file") && !prompt.contains("    1: "), "no run_bash preview formatting");
+    assert!(prompt.contains("of 54000 bytes shown"), "the cut is reported");
+}

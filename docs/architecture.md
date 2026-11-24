@@ -19,7 +19,7 @@ This document covers the implementation details behind Syl's main subsystems.
 - [File Tools](#file-tools)
 - [Steering and Images](#steering-and-images)
 - [Output Handling](#output-handling)
-- [Status Bars & Token Tracking](#status-bars--token-tracking)
+- [Status Bar](#status-bar)
 - [Thinking Animation](#thinking-animation)
 - [Source Layout](#source-layout)
 
@@ -255,7 +255,7 @@ Run with `/workflow <name>`. List all with `/workflow`. Claude can create and de
 
 `read_file`, `edit_file`, `write_file`, `grep`, `glob` and `ls` live in `crates/syl-core/src/tools/fs.rs` and run **inside the container** through `Container::exec_argv` (a program and its arguments, no shell string, with optional stdin). Paths resolve in the container's filesystem, so a symlink planted by code in the container can't make Syl write outside it. File contents travel over stdin and come back as bytes, so size and quoting don't matter.
 
-- `edit_file` reads the file, requires `old_string` to occur exactly once (or `replace_all`), writes the result, and returns a unified diff (`similar`, computed off the async runtime with a deadline). On a CRLF file, `\n` line breaks in `old_string` match `\r\n`. `write_file` creates parent directories and returns a diff against the old contents. The TUI shows both diffs in colour, with control characters made visible.
+- `edit_file` reads the file, requires `old_string` to occur exactly once (or `replace_all`), writes the result, and returns a unified diff (`similar`, computed off the async runtime with a deadline). On a CRLF file, `\n` line breaks in `old_string` match `\r\n`. `write_file` creates parent directories and returns a diff against the old contents. In the TUI the ticker shows each edit's size, and `/tools` shows the diffs in colour, with control characters made visible.
 - Writes go to a temp file beside the target, are checked for length, take the old file's mode, and are renamed over it, so a cancel, timeout or full disk leaves the old file whole. A symlink is written through to its target.
 - Every command in the container runs under `timeout -s KILL`, because killing the host-side `podman exec` doesn't stop the process inside.
 - `grep` uses ripgrep (installed in new images) and falls back to `grep -rnE` in older ones, which skips `.git`, `.syl`, `target`, `node_modules` and similar by name and matches `glob` against base names. `glob` uses bash `globstar`, expands `{a,b}` itself, and lists only paths that exist. Paths in results are relative to `/workspace`.
@@ -281,35 +281,44 @@ Tool output is processed before it reaches the model (`process_tool_output` in `
 
 3. **Hard truncation** — Anything still longer than `MAX_TOOL_OUTPUT` (8 000 bytes) is cut at the nearest UTF-8 character boundary with a `[truncated: N total chars]` trailer.
 
-Separately, the TUI shows `run_bash` output capped at 40 lines with a `... (N more lines)` trailer; this is display-only.
+Separately, `/tools` in the TUI shows `run_bash` output capped at 40 lines with a `... (N more lines)` trailer; this is display-only.
 
 For remote content, Claude can call `dispatch_agent`, which fetches a URL and has a `claude-haiku` sub-agent extract only what the task needs. That is an explicit tool call, not an automatic step applied to `run_bash` output.
 
 ---
 
-## Status Bars
+## Status Bar
 
-Two status bars are pinned to the terminal at all times, updated after every API response.
+Everything fixed sits at the bottom of the terminal, under the conversation:
 
-**Top bar:**
 ```
-Syl ── ↑ 1024  ↓ 512  · $0.0124 ── TPM ████░░ 42% ── 80% cpu 123M ── 6 msgs ─────
+rows 1 … rows-3   the conversation (DECSTBM scroll region)
+row  rows-2       the status bar
+row  rows-1       input prompt; during a turn, the thinking animation or the tool ticker
+row  rows         the steering line during a turn
+```
+
+The scroll region starts at row 1 on purpose. Terminals keep lines that scroll off the top of the screen in their scrollback, but discard lines that scroll out of a region starting lower down, so with a bar on row 1 the conversation could not be scrolled back through.
+
+Your messages are printed into the conversation as you send them, right-aligned on a tinted background like a sent text message, wrapped to two thirds of the width (widths in terminal columns, via `unicode-width`). Syl's replies stay on the left.
+
+**The bar** (`make_bar` in `src/tui/bars.rs`), redrawn at each prompt and after every model response:
+```
+ Syl · claude-opus-5-5 ── ↑12K ↓1K ── $0.1234 ── ███░░░ 50% ── cpu 12% 256M ── 7 msgs ───── /help ─
 ```
 
 | Field | Description |
 |---|---|
-| `↑ N` / `↓ N` | Cumulative session input / output tokens |
-| `· $N` | Estimated session cost (USD) |
-| `TPM ███░ N%` | Real-time TPM vs. rate-limit budget |
-| `cpu% / MB` | Container CPU and memory (polled every 5 s) |
-| `N msgs` | Messages in the active conversation history |
+| model | The model for the next turn |
+| `↑ N` / `↓ N` | Session input / output tokens |
+| `$N` | Estimated session cost (USD) |
+| `███░ N%` | Tokens per minute against the rate-limit budget (hidden with no limit) |
+| `cpu N% NM` | Container CPU and memory (polled every 5 s) |
+| `N msgs` | Messages in the conversation history |
 
-**Bottom bar:**
-```
-─ claude-opus-5-5 · 120s ────────────────────────── /help  /save  /exit ─
-```
+On a narrow terminal the bar drops segments, least useful first (messages, container, TPM, tokens); the model and cost always stay. Cache tokens and the timeout are in `/status`.
 
-Shows the active model and request timeout. While a tool is running, it switches to a spinner showing the active tool name.
+**The tool ticker** uses the input row during a turn, which the thinking animation also uses; the two never run at once (the animation is for waiting on the model, the ticker for tools). Each tool call overwrites it: while calls run, a spinner with the call (`run_bash › cargo test`, and `+N more` for parallel calls); when they finish, `✓` or `✗` with a few words (`+3 -1` for an edit, a result count for a search). The next prompt clears it. Tool calls don't print into the conversation; `/tools` shows the last turn's calls in full, with output and diffs, read from the session log so it works after `--resume`. `show_image` still draws its image in the conversation.
 
 ---
 
@@ -337,7 +346,7 @@ src/                       # syl-rs: the terminal client (binary `syl`)
 └── tui/
     ├── state.rs           # TuiState (stdout, spinner, animation, stats)
     ├── terminal.rs        # raw mode, scroll region, DECSC/DECRC, SIGWINCH
-    ├── bars.rs            # top/bottom status bar rendering (pure)
+    ├── bars.rs            # status bar rendering (pure)
     ├── picker.rs          # interactive arrow-key model picker
     ├── animation.rs       # windspren thinking animation
     ├── spinner.rs         # tool execution spinner

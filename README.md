@@ -83,6 +83,7 @@ Priority: **CLI flag > environment variable > `.syl/config.toml` > default**
 |---|---|
 | `/model [name]` | Interactive picker (↑↓ / jk + Enter), or direct: `/model sonnet` |
 | `/status` | Model, timeout, rate limit, token counts, cost |
+| `/tools` | The last turn's tool calls in full: output and diffs |
 | `/sessions` | List saved sessions (`*` marks the current one) |
 | `/resume <n\|id\|name>` | Switch to a saved session |
 | `/history` | Prompts in this session, numbered for `/fork` |
@@ -101,7 +102,7 @@ Claude has these built-in tools, all running inside the container:
 
 | Tool | Description |
 |---|---|
-| `run_bash` | Execute shell commands (output capped at 40 lines in the TUI; long output is saved to a file the model can page) |
+| `run_bash` | Execute shell commands (long output is saved to a file the model can page) |
 | `read_file` | Read numbered lines of a file, in windows |
 | `edit_file` | Exact string replacement (must be unique unless `replace_all`); shows a diff |
 | `write_file` | Create or replace a file; shows a diff |
@@ -114,6 +115,8 @@ Claude has these built-in tools, all running inside the container:
 | `show_image` | Render an image in the terminal |
 
 Read-only calls (`read_file`, `grep`, `glob`, `ls`, `memory_read`) made together run in parallel.
+
+In the terminal, your messages sit on the right and Syl's replies on the left, and the conversation scrolls back in your terminal's own scrollback. Tool calls show on a single line under the status bar that each call overwrites (`✓ edit_file › src/main.rs  +3 -1`), so they don't crowd the conversation. `/tools` shows the last turn's calls in full, with output and diffs.
 
 **Project instructions:** `AGENTS.md` (or `CLAUDE.md` where there is no `AGENTS.md`) in the project and every directory above it is loaded into the system prompt when a conversation starts; the project's own file comes last.
 
