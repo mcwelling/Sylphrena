@@ -81,7 +81,9 @@ async fn write_text(
     // Write a temp file beside the target, check every byte arrived, then
     // rename it over the target: a cancel, timeout or full disk part way
     // through leaves the old file whole. A symlink is written through to its
-    // target, and an existing file's mode is kept.
+    // target, and an existing file's mode is kept. (The container has GNU
+    // `chmod --reference`; the BSD `stat -f` fallback is for the tests,
+    // which run these scripts on a macOS host.)
     let script = r#"f="$1"; n="$2"
 if [ -L "$f" ]; then f=$(readlink -f -- "$f") || exit 1; fi
 d=$(dirname -- "$f"); mkdir -p -- "$d" || exit 1

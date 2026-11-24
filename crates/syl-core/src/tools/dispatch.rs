@@ -72,10 +72,15 @@ pub async fn dispatch_agent(
         Err(e) => return err_json("Content retrieval failed", &e, source),
     };
 
-    // Strip HTML; truncate to MAX_FETCH_CHARS
+    // Strip HTML; cut to MAX_FETCH_CHARS bytes, backing off to a character
+    // boundary (a fixed byte index can land inside a multi-byte character).
     let content = if is_html(&raw) { strip_html(&raw) } else { raw };
     let content = if content.len() > MAX_FETCH_CHARS {
-        content[..MAX_FETCH_CHARS].to_string()
+        let mut cut = MAX_FETCH_CHARS;
+        while !content.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        format!("{}\n[... cut here: {} of {} bytes shown]", &content[..cut], cut, content.len())
     } else {
         content
     };
@@ -178,18 +183,19 @@ async fn fetch_source(
         format!("curl -sL -A 'Mozilla/5.0' --max-time 30 {}", crate::util::shell_quote(source))
     };
 
-    let (output, is_err) = crate::tools::bash::run_bash(
-        &serde_json::json!({ "command": cmd }),
-        config,
-        container,
-        None,
-        "dispatch",
-        cancel,
-    ).await;
-
-    if is_err {
-        return Err(output);
-    }
+    // Run curl directly rather than through run_bash: run_bash shapes its
+    // output for the main model (100-line previews, a read_file hint), which
+    // would cut the page short and confuse the sub-agent. Truncation happens
+    // in dispatch_agent instead.
+    let timeout = std::time::Duration::from_millis(config.timeout_ms);
+    let output = match container.exec(&cmd, timeout, &cancel).await {
+        Ok(out) if out.success() => out.stdout,
+        Ok(out) => return Err(out.error_text()),
+        Err(syl_container::ExecError::TimedOut(_)) => {
+            return Err(format!("fetch timed out after {}s", config.timeout_ms / 1000))
+        }
+        Err(e) => return Err(e.to_string()),
+    };
     if output.trim().is_empty() {
         return Err("empty response from source".to_string());
     }
@@ -205,6 +211,8 @@ fn haiku_config(base: &AppConfig, max_tokens: u32) -> AppConfig {
         model:           HAIKU_MODEL.to_string(),
         max_tokens,
         thinking_budget: None,
+        // The sub-agent answers from the page; it has no tools to call.
+        tools:           false,
         // Flags that must never be set for a sub-agent call
         resume:   false,
         fresh:    false,
