@@ -174,6 +174,7 @@ async fn main() -> anyhow::Result<()> {
         sessions_dir: &sessions_dir,
         session: None,
         carry: String::new(),
+        last_tools: Vec::new(),
     };
     let result = match repl.await_session_reply(&mut handle.events).await {
         true => repl.run(&mut handle.events, resize_rx).await,
@@ -331,6 +332,8 @@ struct Repl<'a> {
     session: Option<SessionInfo>,
     /// Text typed at the end of a turn, to start the next prompt with.
     carry: String,
+    /// The last turn's tool calls (name, input, output, is_error), for /tools.
+    last_tools: Vec<(String, serde_json::Value, String, bool)>,
 }
 
 impl Repl<'_> {
@@ -384,6 +387,30 @@ impl Repl<'_> {
         self.print(&format!("\x1b[2m[{line}]\x1b[0m\r\n"));
     }
 
+    /// The spinner on the status row, naming the tool calls running now.
+    fn show_running(&self, active: &[(String, String, serde_json::Value)]) {
+        self.tui.stop_spinner();
+        let Some((_, name, input)) = active.last() else { return };
+        let more = if active.len() > 1 { format!("  (+{} more)", active.len() - 1) } else { String::new() };
+        // Room for the spinner frame and the elapsed seconds around it.
+        let label = clip_visible(&format!("{}{more}", tool_brief(name, input)), self.cols.saturating_sub(12));
+        let sp = spinner::spawn_spinner(self.tui.stdout.clone(), self.rows, label);
+        *self.tui.spinner.lock().unwrap() = Some(sp);
+    }
+
+    /// `/tools`: the last turn's tool calls in full.
+    fn print_last_tools(&self) {
+        if self.last_tools.is_empty() {
+            self.print("No tool calls in the last turn.\r\n");
+            return;
+        }
+        for (name, input, output, is_error) in &self.last_tools {
+            let mark = if *is_error { "\x1b[31m✗\x1b[0m" } else { "\x1b[32m✓\x1b[0m" };
+            self.print(&format!("{mark} \x1b[1m{}\x1b[0m\r\n", tool_brief(name, input)));
+            self.print(&format!("{}\r\n", tool_display(name, input, output)));
+        }
+    }
+
     fn apply_resize(&mut self, cols: u16, rows: u16, turn_active: bool) {
         self.cols = cols;
         self.rows = rows;
@@ -424,6 +451,15 @@ impl Repl<'_> {
                 continue;
             }
             editor.add_history_entry(&line);
+
+            // What you typed stays in the conversation (rustyline's own echo
+            // is on the input row, which the next prompt overwrites).
+            self.print(&format!("\r\n\x1b[1;36m›\x1b[0m \x1b[1m{}\x1b[0m\r\n", sanitize(&line)));
+
+            if line == "/tools" {
+                self.print_last_tools();
+                continue;
+            }
 
             if line.starts_with('/') {
                 // The model picker needs the terminal directly, so it runs
@@ -509,6 +545,9 @@ impl Repl<'_> {
     ) -> bool {
         let mut streaming = false;
         let mut inputs: HashMap<String, serde_json::Value> = HashMap::new();
+        // Tool calls running now, in the order they started, for the ticker.
+        let mut active: Vec<(String, String, serde_json::Value)> = Vec::new();
+        self.last_tools.clear();
         let mut resize_open = true;
         let mut reader = KeyReader::start();
         let mut steer = SteerLine::default();
@@ -595,20 +634,34 @@ impl Repl<'_> {
                 AgentEvent::Usage { .. } => self.tui.stop_anim(),
                 AgentEvent::ToolCallStarted { id, name, input } => {
                     self.tui.stop_anim();
-                    self.tui.stop_spinner();
-                    let sp = spinner::spawn_spinner(self.tui.stdout.clone(), self.rows, format!("{name}…"));
-                    *self.tui.spinner.lock().unwrap() = Some(sp);
+                    active.push((id.clone(), name, input.clone()));
+                    self.show_running(&active);
                     inputs.insert(id, input);
                 }
                 AgentEvent::ToolCallFinished { id, name, output, is_error } => {
                     let input = inputs.remove(&id).unwrap_or_default();
+                    active.retain(|(a, _, _)| *a != id);
                     if name == "show_image" && !is_error {
                         let path = input["path"].as_str().unwrap_or("");
                         if !image_render::render_image(path, &self.container, &self.tui, self.rows, self.cols) {
                             self.print(&format!("[show_image: could not render {path}]\r\n"));
                         }
                     }
-                    self.print(&format!("{}\r\n", tool_display(&name, &input, &output)));
+                    // Tool calls go on the one-line ticker, not into the
+                    // conversation; /tools shows them in full.
+                    if active.is_empty() {
+                        self.tui.stop_spinner();
+                        let mark = if is_error { "\x1b[31m✗\x1b[0m" } else { "\x1b[32m✓\x1b[0m" };
+                        let line = format!(
+                            " {mark} {}  \x1b[2m{}\x1b[0m",
+                            tool_brief(&name, &input),
+                            one_line(&sanitize(&tool_outcome(&name, &output, is_error)), 60)
+                        );
+                        terminal::draw_status_line(&self.tui.stdout, self.rows, &clip_visible(&line, self.cols));
+                    } else {
+                        self.show_running(&active);
+                    }
+                    self.last_tools.push((name, input, output, is_error));
                 }
                 AgentEvent::PermissionRequested { id, .. } => {
                     // Nothing asks yet (the default policy allows everything).
@@ -720,6 +773,80 @@ impl Repl<'_> {
             Some(model_id)
         }
     }
+}
+
+/// A short description of a tool call for the ticker: the tool and the
+/// one argument that says what it is doing.
+fn tool_brief(name: &str, input: &serde_json::Value) -> String {
+    let arg = |k: &str| input[k].as_str().unwrap_or("").to_string();
+    let detail = match name {
+        "run_bash" => arg("command"),
+        "read_file" | "edit_file" | "write_file" | "show_image" => arg("path"),
+        "ls" => {
+            let p = arg("path");
+            if p.is_empty() { ".".to_string() } else { p }
+        }
+        "grep" | "glob" => arg("pattern"),
+        "memory_read" | "memory_write" => arg("key"),
+        "workflow_write" | "workflow_delete" => arg("name"),
+        "dispatch_agent" => arg("source"),
+        _ => String::new(),
+    };
+    let detail = one_line(&sanitize(&detail), 80);
+    if detail.is_empty() {
+        name.to_string()
+    } else {
+        format!("{name} \x1b[2m›\x1b[0m {detail}")
+    }
+}
+
+/// What a finished call came to, in a few words.
+fn tool_outcome(name: &str, output: &str, is_error: bool) -> String {
+    if is_error {
+        return output.lines().find(|l| !l.trim().is_empty()).unwrap_or("failed").to_string();
+    }
+    match name {
+        "edit_file" | "write_file" => {
+            let added = output.lines().filter(|l| l.starts_with('+') && !l.starts_with("+++")).count();
+            let removed = output.lines().filter(|l| l.starts_with('-') && !l.starts_with("---")).count();
+            format!("+{added} -{removed}")
+        }
+        "grep" | "glob" if output.starts_with("No ") => "no matches".to_string(),
+        "grep" | "glob" => format!("{} results", output.lines().filter(|l| !l.starts_with("[...")).count()),
+        "read_file" => output.lines().next().unwrap_or("").trim_matches(['[', ']']).to_string(),
+        _ => {
+            let n = output.lines().count();
+            if n > 1 { format!("{n} lines") } else { output.trim().to_string() }
+        }
+    }
+}
+
+/// Clip a line with colour codes to `cols` visible characters (the codes
+/// themselves take no room).
+fn clip_visible(text: &str, cols: u16) -> String {
+    let max = cols.saturating_sub(1) as usize;
+    let mut out = String::new();
+    let mut visible = 0;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            out.push(c);
+            for n in chars.by_ref() {
+                out.push(n);
+                if n.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+        if visible >= max {
+            break;
+        }
+        out.push(c);
+        visible += 1;
+    }
+    out.push_str("\x1b[0m");
+    out
 }
 
 /// `text` with control characters other than newline and tab shown as
@@ -844,4 +971,34 @@ fn handle_resize(new_cols: u16, new_rows: u16, tui: &TuiState, turn_active: bool
         *tui.anim.lock().unwrap() = Some(anim);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn ticker_names_the_call_by_its_key_argument() {
+        assert_eq!(tool_brief("run_bash", &json!({"command": "cargo test\n --all"})), "run_bash \x1b[2m›\x1b[0m cargo test --all");
+        assert_eq!(tool_brief("ls", &json!({})), "ls \x1b[2m›\x1b[0m .");
+        assert_eq!(tool_brief("unknown", &json!({})), "unknown");
+        // Control characters in arguments can't reach the terminal.
+        assert!(!tool_brief("read_file", &json!({"path": "a\x1b]0;x\x07"})).contains('\x07'));
+    }
+
+    #[test]
+    fn ticker_outcomes_are_short() {
+        let diff = "Edited /w/a.rs (1 replacement).\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1,2 @@\n-x\n+y\n+z\n";
+        assert_eq!(tool_outcome("edit_file", diff, false), "+2 -1");
+        assert_eq!(tool_outcome("grep", "No matches.", false), "no matches");
+        assert_eq!(tool_outcome("run_bash", "\n[Tool error: boom]\nmore", true), "[Tool error: boom]");
+    }
+
+    #[test]
+    fn clipping_counts_visible_characters_and_keeps_escapes_whole() {
+        let line = "\x1b[32m✓\x1b[0m abcdefghij";
+        let clipped = clip_visible(line, 6);
+        assert_eq!(clipped, "\x1b[32m✓\x1b[0m abc\x1b[0m");
+    }
 }

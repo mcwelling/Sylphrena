@@ -17,7 +17,7 @@ pub struct SpinnerHandle {
 }
 
 impl SpinnerHandle {
-    /// Stop the spinner and clear the bottom bar row.
+    /// Stop the spinner. The row keeps its last frame until redrawn.
     pub fn stop(self) {
         self.cancel.cancel();
     }
@@ -56,9 +56,10 @@ pub fn spawn_spinner(
             let line = format!(" {} {} ({} s)", spin, label, elapsed);
 
             if let Ok(mut out) = stdout.lock() {
+                // Autowrap off: a long label is clipped, never wrapped.
                 let _ = write!(
                     out,
-                    "\x1b7\x1b[{};1H\x1b[2K{}\x1b8",
+                    "\x1b7\x1b[?7l\x1b[{};1H\x1b[2K{}\x1b[?7h\x1b8",
                     bottom_row_1indexed, line,
                 );
                 let _ = out.flush();
@@ -66,12 +67,9 @@ pub fn spawn_spinner(
 
             frame = frame.wrapping_add(1);
         }
-
-        // Clear spinner row on exit
-        if let Ok(mut out) = stdout.lock() {
-            let _ = write!(out, "\x1b7\x1b[{};1H\x1b[2K\x1b8", bottom_row_1indexed);
-            let _ = out.flush();
-        }
+        // The row is left as it is: whoever stopped the spinner draws it
+        // next (the tool ticker, or the bars), and a clear from this task
+        // could land after that and wipe it.
     });
 
     SpinnerHandle { cancel }

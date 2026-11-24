@@ -1,16 +1,18 @@
 /// Terminal control: scroll region setup, status bar drawing, cursor helpers, SIGWINCH.
 ///
 /// Layout (1-indexed rows, `rows` = total terminal height):
-///   Row 1        — top bar
-///   Rows 2..rows-3 — scroll region (agent output)
-///   Row rows-2   — bottom bar (spinner or stats)
-///   Row rows-1   — input prompt (rustyline)
-///   Row rows     — buffer
+///   Rows 1..rows-4 — scroll region (the conversation)
+///   Row rows-3     — stats bar
+///   Row rows-2     — status bar (tool ticker, spinner, or model and shortcuts)
+///   Row rows-1     — input prompt (rustyline; the thinking animation in a turn)
+///   Row rows       — spare (the steering line during a turn)
 ///
-/// In crossterm MoveTo (0-indexed):
-///   Top bar   → (0, 0)
-///   Bot bar   → (0, rows-3)
-///   Input     → (0, rows-2)
+/// The scroll region starts at row 1 on purpose: terminals keep lines that
+/// scroll off the top of the screen in their scrollback, but drop lines that
+/// scroll off a region starting lower down. So everything fixed lives at
+/// the bottom, and the conversation can be scrolled back through.
+///
+/// In crossterm MoveTo (0-indexed): `LAST_CHAT_ROW` etc. below.
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 
@@ -21,14 +23,29 @@ use crossterm::{
     terminal::{Clear, ClearType},
 };
 
+/// The last row of the scroll region (0-indexed).
+pub fn last_chat_row(rows: u16) -> u16 {
+    rows.saturating_sub(5)
+}
+
+/// The stats bar row (0-indexed).
+pub fn stats_row(rows: u16) -> u16 {
+    rows.saturating_sub(4)
+}
+
+/// The status bar row, 1-indexed for escape sequences.
+pub fn status_row_1(rows: u16) -> u16 {
+    rows.saturating_sub(2)
+}
+
 /// Establish the scroll region for Syl's fixed-row layout.
 ///
-/// Sets the DECSTBM scroll region to rows 2..=rows-3 (1-indexed) and moves
+/// Sets the DECSTBM scroll region to rows 1..=rows-4 (1-indexed) and moves
 /// the cursor to the input row so the first readline call lands correctly.
 pub fn setup_scroll_region(stdout: &mut impl Write, rows: u16) -> io::Result<()> {
-    // DECSTBM: set scroll region top=2, bottom=rows-3 (1-indexed)
-    let bot = rows.saturating_sub(3);
-    write!(stdout, "\x1b[2;{}r", bot)?;
+    // DECSTBM: set scroll region top=1, bottom=rows-4 (1-indexed)
+    let bot = rows.saturating_sub(4).max(1);
+    write!(stdout, "\x1b[1;{}r", bot)?;
     // Move cursor to input row: rows-1 (1-indexed) = rows-2 (0-indexed)
     execute!(stdout, cursor::MoveTo(0, rows.saturating_sub(2)))?;
     stdout.flush()
@@ -47,10 +64,10 @@ pub fn draw_status_bars(
     // Save cursor (DECSC)
     write!(stdout, "\x1b7")?;
 
-    // Top bar — row 1 (1-indexed) = row 0 (0-indexed)
+    // Stats bar — row rows-3 (1-indexed)
     queue!(
         stdout,
-        cursor::MoveTo(0, 0),
+        cursor::MoveTo(0, stats_row(rows)),
         Clear(ClearType::CurrentLine),
         Print(top),
     )?;
@@ -71,12 +88,10 @@ pub fn draw_status_bars(
 /// Move the cursor to the last row of the scroll region and emit `\r\n` to
 /// scroll content upward before appending new output.
 ///
-/// The scroll region spans rows 2..=rows-3 (1-indexed).  The last row is
-/// rows-3 (1-indexed) = rows-4 (0-indexed).  A `\r\n` there scrolls the
-/// region and leaves the cursor at the same logical position.
+/// A `\r\n` on the region's last row scrolls the region and leaves the
+/// cursor at the same logical position.
 pub fn move_to_scroll(stdout: &mut impl Write, rows: u16) -> io::Result<()> {
-    // Last scroll-region row: rows-3 (1-indexed) = rows-4 (0-indexed)
-    execute!(stdout, cursor::MoveTo(0, rows.saturating_sub(4)))?;
+    execute!(stdout, cursor::MoveTo(0, last_chat_row(rows)))?;
     write!(stdout, "\r\n")?;
     stdout.flush()
 }
@@ -103,8 +118,7 @@ pub fn print_to_scroll(
         .map_err(|_| io::Error::new(io::ErrorKind::Other, "stdout lock poisoned"))?;
     // Save cursor (DECSC)
     write!(out, "\x1b7")?;
-    // Move to last row of scroll region: rows-3 (1-indexed) = rows-4 (0-indexed)
-    execute!(out, cursor::MoveTo(0, rows.saturating_sub(4)))?;
+    execute!(out, cursor::MoveTo(0, last_chat_row(rows)))?;
     // Scroll region up one line, then print text
     let normalized = text.replace('\n', "\r\n");
     write!(out, "\r\n{}", normalized)?;
@@ -128,7 +142,7 @@ pub fn begin_streaming(
         .lock()
         .map_err(|_| io::Error::new(io::ErrorKind::Other, "stdout lock poisoned"))?;
     // Move to last row of scroll region, scroll up to create a new blank line
-    execute!(out, cursor::MoveTo(0, rows.saturating_sub(4)))?;
+    execute!(out, cursor::MoveTo(0, last_chat_row(rows)))?;
     write!(out, "\r\n")?;
     out.flush()
 }
@@ -158,6 +172,16 @@ pub fn end_streaming(
     write!(out, "\r\n")?;
     execute!(out, cursor::MoveTo(0, rows.saturating_sub(2)))?;
     out.flush()
+}
+
+/// Show `text` on the status bar row, replacing what was there (the tool
+/// ticker). The next bar redraw or spinner overwrites it.
+pub fn draw_status_line(stdout: &Arc<Mutex<std::io::Stdout>>, rows: u16, text: &str) {
+    if let Ok(mut out) = stdout.lock() {
+        // Autowrap off, so a long line is clipped rather than wrapped.
+        let _ = write!(out, "\x1b7\x1b[?7l\x1b[{};1H\x1b[2K{text}\x1b[?7h\x1b8", status_row_1(rows));
+        let _ = out.flush();
+    }
 }
 
 /// Write raw bytes to stdout.

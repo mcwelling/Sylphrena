@@ -2,7 +2,7 @@
 //!
 //! # Terminal mechanics
 //!
-//! The picker prints into the scroll region (rows 2 .. rows-3 in 1-indexed
+//! The picker prints into the scroll region (rows 1 .. rows-4 in 1-indexed
 //! terminal coordinates).  On the initial call it moves the cursor to the last
 //! row of the scroll region and emits one `\r\n` per picker line; DECSTBM
 //! keeps the cursor at the scroll-region bottom while scrolling old content
@@ -123,7 +123,7 @@ pub fn run_picker(
     // -----------------------------------------------------------------------
     {
         let mut out = stdout.lock().unwrap();
-        execute!(out, cursor::MoveTo(0, rows.saturating_sub(4))).ok();
+        execute!(out, cursor::MoveTo(0, crate::tui::terminal::last_chat_row(rows))).ok();
         render_picker(items, selected, &mut *out);
     }
 
