@@ -150,3 +150,27 @@ fn a_misspelt_or_malformed_permission_setting_is_reported_and_fails_closed() {
     assert_eq!(cfg.permissions.len(), 1);
     assert_eq!(cfg.permissions[0].action, syl_core::permissions::Action::Ask);
 }
+
+#[test]
+fn print_mode_flags() {
+    let a = parse_cli_args(&["-p", "fix the tests", "--output", "json", "--plan"]);
+    assert_eq!(a.print.as_deref(), Some("fix the tests"));
+    assert!(a.output_json && a.plan);
+    assert_eq!(parse_cli_args(&["-p"]).print.as_deref(), Some(""), "no prompt: read stdin");
+    assert_eq!(parse_cli_args(&["--print", "-"]).print.as_deref(), Some(""));
+    assert_eq!(parse_cli_args(&["-p", "--plan"]).print.as_deref(), Some(""));
+    assert!(!parse_cli_args(&["--output", "text"]).output_json);
+}
+
+#[test]
+fn print_prompts_after_flags_and_starting_with_a_dash() {
+    assert_eq!(parse_cli_args(&["-p", "--plan", "explain x"]).print.as_deref(), Some("explain x"));
+    assert_eq!(parse_cli_args(&["-p", "--model", "m", "hi"]).print.as_deref(), Some("hi"));
+    assert_eq!(parse_cli_args(&["-p", "-1 is the answer"]).print.as_deref(), Some("-1 is the answer"));
+    let bad = parse_cli_args(&["--output", "-p", "hi"]);
+    assert!(!bad.errors.is_empty() && bad.print.as_deref() == Some("hi"), "{bad:?}");
+    assert!(parse_cli_args(&["--output", "JSON", "-p", "x"]).output_json);
+    assert!(!parse_cli_args(&["--output", "xml"]).errors.is_empty());
+    assert!(parse_cli_args(&["--model", "x", "acp"]).acp);
+    assert!(!parse_cli_args(&["--bogus"]).errors.is_empty());
+}

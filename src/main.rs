@@ -39,10 +39,24 @@ async fn main() -> anyhow::Result<()> {
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
     let arg_strs: Vec<&str> = raw_args.iter().map(|s| s.as_str()).collect();
     let cli = parse_cli_args(&arg_strs);
+    if !cli.errors.is_empty() {
+        for e in &cli.errors {
+            eprintln!("syl: {e}");
+        }
+        eprintln!("Run syl --help for the options.");
+        std::process::exit(2);
+    }
+    if cli.acp {
+        return syl_rs::headless::run_acp().await;
+    }
 
     if cli.help {
         print_help();
         return Ok(());
+    }
+    if cli.print.is_some() {
+        let code = syl_rs::headless::run_print(&cli).await?;
+        std::process::exit(code);
     }
 
     // 2. Determine directories
@@ -223,7 +237,9 @@ async fn main() -> anyhow::Result<()> {
 fn print_help() {
     println!(
         "syl — AI coding assistant\n\n\
-         Usage: syl [options]\n\n\
+         Usage: syl [options]\n\
+         \x20      syl -p \"prompt\" [--output json] [--plan]   one turn, no UI (prompt from stdin if omitted)\n\
+         \x20      syl acp                                    Agent Client Protocol agent on stdio (for Zed, Bondsmith)\n\n\
          Options:\n  \
          --model <name>      Override model (default: claude-opus-5-5)\n  \
          --rate-limit <n>    TPM budget  (default: 60000)\n  \

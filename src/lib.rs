@@ -2,3 +2,4 @@
 //! renders its events and turns keystrokes into commands.
 pub mod slash;
 pub mod tui;
+pub mod headless;

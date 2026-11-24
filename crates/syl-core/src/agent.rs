@@ -32,8 +32,10 @@ use crate::tools::{self, ToolContext};
 use crate::util::SpillDir;
 use crate::workspace::gather_workspace_context;
 
-/// What happened in the agent, in order.
-#[derive(Debug, Clone, PartialEq)]
+/// What happened in the agent, in order. Serialised (for `--output json`)
+/// as an object tagged with `"type"`: `{"type":"text_delta","text":"…"}`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
     /// A prompt was accepted and its turn began.
     TurnStarted,
@@ -82,7 +84,8 @@ pub enum AgentEvent {
     SteerDropped { text: String, count: usize },
 }
 
-/// How a turn ended.
+/// How a turn ended. Serialised as the stop reason (`"end_turn"`,
+/// `"max_tokens"`, ...), `"cancelled"` or `"failed"`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TurnEnd {
     /// The model stopped for this reason (never `ToolUse`).
@@ -90,6 +93,16 @@ pub enum TurnEnd {
     Cancelled,
     /// An `Error` event with the cause came just before.
     Failed,
+}
+
+impl serde::Serialize for TurnEnd {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            TurnEnd::Completed(r) => s.serialize_str(r.as_str()),
+            TurnEnd::Cancelled => s.serialize_str("cancelled"),
+            TurnEnd::Failed => s.serialize_str("failed"),
+        }
+    }
 }
 
 /// What a client can ask of the agent.
@@ -340,7 +353,10 @@ async fn run(agent: Agent, mut commands: mpsc::UnboundedReceiver<AgentCommand>, 
             AgentCommand::PromptWithImages { text, images } => {
                 let mut blocks: Vec<ContentBlock> =
                     images.into_iter().map(|source| ContentBlock::Image { source }).collect();
-                blocks.push(ContentBlock::Text { text, cache_control: None });
+                // The API rejects empty text blocks: an image alone is fine.
+                if !text.trim().is_empty() {
+                    blocks.push(ContentBlock::Text { text, cache_control: None });
+                }
                 Message { role: "user".to_string(), content: MessageContent::Blocks(blocks) }
             }
         };
@@ -351,6 +367,7 @@ async fn run(agent: Agent, mut commands: mpsc::UnboundedReceiver<AgentCommand>, 
 
         let cancel = CancellationToken::new();
         let mut shutting_down = false;
+        let mut dropped_prompts = 0usize;
         let reason = {
             let turn = run_turn(&agent, &mut session, &mut ctx, &events, &steer, &pending, mode, cancel.clone());
             tokio::pin!(turn);
@@ -362,7 +379,13 @@ async fn run(agent: Agent, mut commands: mpsc::UnboundedReceiver<AgentCommand>, 
                             shutting_down = true;
                             cancel.cancel();
                         }
-                        Some(AgentCommand::Cancel) => cancel.cancel(),
+                        Some(AgentCommand::Cancel) => {
+                            cancel.cancel();
+                            // Prompts queued behind this turn are cancelled too.
+                            let before = deferred.len();
+                            deferred.retain(|c| !matches!(c, AgentCommand::Prompt(_) | AgentCommand::PromptWithImages { .. }));
+                            dropped_prompts += before - deferred.len();
+                        }
                         // Takes effect next turn; this one already chose its
                         // model. Behind queued prompts it waits its turn.
                         Some(AgentCommand::SetModel(m)) if deferred.is_empty() => {
@@ -382,6 +405,11 @@ async fn run(agent: Agent, mut commands: mpsc::UnboundedReceiver<AgentCommand>, 
         };
         let undelivered = std::mem::take(&mut *steer.lock().unwrap());
         emit(AgentEvent::TurnEnded { reason: reason.clone() });
+        // Each prompt the cancel dropped still gets its turn's start and end.
+        for _ in 0..dropped_prompts {
+            emit(AgentEvent::TurnStarted);
+            emit(AgentEvent::TurnEnded { reason: TurnEnd::Cancelled });
+        }
         if !undelivered.is_empty() {
             let count = undelivered.len();
             let text = undelivered.join("\n\n");
@@ -757,8 +785,25 @@ async fn run_turn(
             return TurnEnd::Completed(StopReason::ToolUse);
         }
 
-        if let Err(e) = agent.container.ensure(&on_notice) {
-            emit(AgentEvent::Notice { message: format!("[Syl] Container recovery failed: {e}") });
+        // Recovering a dead container can take minutes of blocking podman
+        // calls: run them off the async runtime.
+        let container = agent.container.clone();
+        let recovered = tokio::task::spawn_blocking(move || {
+            let notes = std::sync::Mutex::new(Vec::new());
+            let r = container.ensure(&|m| notes.lock().unwrap().push(m.to_string()));
+            (r, notes.into_inner().unwrap_or_default())
+        })
+        .await;
+        match recovered {
+            Ok((r, notes)) => {
+                for n in notes {
+                    emit(AgentEvent::Notice { message: n });
+                }
+                if let Err(e) = r {
+                    emit(AgentEvent::Notice { message: format!("[Syl] Container recovery failed: {e}") });
+                }
+            }
+            Err(e) => emit(AgentEvent::Notice { message: format!("[Syl] Container recovery failed: {e}") }),
         }
 
         let tool_ctx = ToolContext {
@@ -864,6 +909,15 @@ async fn run_turn(
             return TurnEnd::Cancelled;
         }
     }
+}
+
+/// One lock per project, shared by the sessions in this process: plan mode's
+/// snapshot-run-put-back holds it exclusively; file-changing calls share it.
+fn project_lock(dir: &std::path::Path) -> Arc<tokio::sync::RwLock<()>> {
+    static LOCKS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<PathBuf, Arc<tokio::sync::RwLock<()>>>>> =
+        std::sync::LazyLock::new(Default::default);
+    let key = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    LOCKS.lock().unwrap().entry(key).or_default().clone()
 }
 
 /// Tools that can change files in the workspace: a turn is checkpointed
@@ -986,10 +1040,17 @@ async fn execute_call(
     input: &serde_json::Value,
     cancel: CancellationToken,
 ) -> (String, bool, Option<(String, String)>) {
+    let lock = project_lock(&agent.paths.project_dir);
     if !(mode == Mode::Plan && name == "run_bash") {
+        // Calls that change files wait while a plan-mode command (in another
+        // session on this project) is between its snapshot and its put-back.
+        let _shared = if CHANGES_FILES.contains(&name) { Some(lock.read().await) } else { None };
         let (o, e) = tools::execute(name, id, input, tool_ctx, cancel).await;
         return (o, e, None);
     }
+    // Exclusive from the snapshot to the put-back, so the put-back can only
+    // undo what this command did.
+    let _exclusive = lock.write().await;
     let refuse = |why: String| {
         (
             format!("[Plan mode: run_bash is unavailable because the workspace can't be snapshotted ({why}), so changes couldn't be put back.]"),
@@ -1131,6 +1192,10 @@ impl Gate<'_> {
                         Review::Block(why) => note = Some(format!("The reviewer would block it: {why}")),
                         Review::Unsure(why) => note = Some(format!("No review: {why}")),
                     }
+                }
+                // A cancel during the review: don't ask about a turn that's over.
+                if self.cancel.is_cancelled() {
+                    return Err("[Tool error: cancelled by user]".to_string());
                 }
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 self.pending.lock().unwrap().insert(id.to_string(), tx);

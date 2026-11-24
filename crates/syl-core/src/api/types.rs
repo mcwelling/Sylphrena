@@ -108,6 +108,25 @@ pub enum StopReason {
     Other(String),
 }
 
+impl StopReason {
+    /// The API's name for it.
+    pub fn as_str(&self) -> &str {
+        match self {
+            StopReason::EndTurn => "end_turn",
+            StopReason::ToolUse => "tool_use",
+            StopReason::MaxTokens => "max_tokens",
+            StopReason::ContextWindowExceeded => "model_context_window_exceeded",
+            StopReason::Other(s) => s,
+        }
+    }
+}
+
+impl Serialize for StopReason {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
 impl From<&str> for StopReason {
     fn from(s: &str) -> Self {
         match s {
@@ -120,7 +139,7 @@ impl From<&str> for StopReason {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct Usage {
     pub input_tokens:       u64,
     pub output_tokens:      u64,

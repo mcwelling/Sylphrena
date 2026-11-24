@@ -43,7 +43,8 @@ fn any() -> String {
 }
 
 /// How the agent works: `Build` may change files; `Plan` may not.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Mode {
     #[default]
     Build,
@@ -168,8 +169,13 @@ pub fn normalize_path(path: &str) -> String {
     for part in rest.split('/') {
         match part {
             "" | "." => {}
+            // `..` above the start stays: the path leaves the workspace.
             ".." => {
-                parts.pop();
+                if parts.last().is_some_and(|p| *p != "..") {
+                    parts.pop();
+                } else if !absolute {
+                    parts.push("..");
+                }
             }
             p => parts.push(p),
         }
@@ -525,7 +531,11 @@ pub fn save_approval(path: &std::path::Path, tool: &str, subject: &str) -> anyho
         "# Written by Syl when you answer \"always\". Delete a rule to be asked again.\n{}",
         toml::to_string(&all)?
     );
-    std::fs::write(path, text)?;
+    // Write a temp file and rename it over, so a turn reading the file at
+    // that moment never sees it half-written.
+    let tmp = path.with_extension(format!("toml.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, text)?;
+    std::fs::rename(&tmp, path)?;
     Ok(rule)
 }
 

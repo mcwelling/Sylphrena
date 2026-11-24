@@ -113,6 +113,9 @@ pub struct Container {
     /// Where the project is mounted inside the container.
     workdir: String,
     options: ContainerOptions,
+    /// Held while starting or recovering the container, so two sessions
+    /// sharing it don't both recreate it (one `rm -f`-ing the other's).
+    lifecycle: std::sync::Arc<std::sync::Mutex<()>>,
 }
 
 /// Resource limits and network for the container (`[container]` in
@@ -178,6 +181,7 @@ impl Container {
             podman: PathBuf::from("podman"),
             workdir: WORKDIR.to_string(),
             options: ContainerOptions::default(),
+            lifecycle: Default::default(),
         }
     }
 
@@ -322,15 +326,20 @@ impl Container {
         )
     }
 
+    /// Run podman for its effect. Its stdout (container ids, names) is
+    /// discarded: in `syl -p` and `syl acp` our stdout carries the answer or
+    /// protocol messages, and a stray line would corrupt it. Its stderr goes
+    /// into the error.
     fn run_podman(&self, args: &[&str]) -> anyhow::Result<()> {
-        let status = self.podman().args(args).status()?;
-        if status.success() {
+        let out = self.podman().args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).output()?;
+        if out.status.success() {
             Ok(())
         } else {
             anyhow::bail!(
-                "podman {} failed (exit {})",
+                "podman {} failed (exit {}): {}",
                 args.first().copied().unwrap_or(""),
-                status.code().unwrap_or(-1)
+                out.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&out.stderr).trim()
             )
         }
     }
@@ -343,6 +352,11 @@ impl Container {
     /// remove any stale one and cold-start. `fresh` also removes the baked
     /// image.
     pub fn start_or_resume(&self, fresh: bool, progress: &dyn Fn(&str)) -> anyhow::Result<()> {
+        let _held = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+        self.start_or_resume_locked(fresh, progress)
+    }
+
+    fn start_or_resume_locked(&self, fresh: bool, progress: &dyn Fn(&str)) -> anyhow::Result<()> {
         let saved_id = if fresh { None } else { self.read_marker() };
         let live_id = if saved_id.is_some() { self.inspect_id().ok() } else { None };
 
@@ -374,8 +388,13 @@ impl Container {
         if self.alive() {
             return Ok(false);
         }
+        let _held = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+        // Another session may have brought it back while we waited.
+        if self.alive() {
+            return Ok(false);
+        }
         progress("[Syl] Container is gone — resummoning...");
-        self.start_or_resume(false, progress)?;
+        self.start_or_resume_locked(false, progress)?;
         progress("[Syl] Container restored. Continuing.");
         Ok(true)
     }
