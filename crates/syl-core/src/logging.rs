@@ -7,9 +7,14 @@ use std::path::Path;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 pub fn init_logging(syl_dir: &Path) -> anyhow::Result<tracing_appender::non_blocking::WorkerGuard> {
+    init_logging_named(syl_dir, "syl.log")
+}
+
+/// Log to `<dir>/<file>`.
+pub fn init_logging_named(syl_dir: &Path, file: &str) -> anyhow::Result<tracing_appender::non_blocking::WorkerGuard> {
     std::fs::create_dir_all(syl_dir)?;
 
-    let file_appender = tracing_appender::rolling::never(syl_dir, "syl.log");
+    let file_appender = tracing_appender::rolling::never(syl_dir, file);
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
     let filter = EnvFilter::try_from_default_env()

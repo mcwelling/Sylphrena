@@ -360,7 +360,7 @@ fn is_tool_results(m: &Message) -> bool {
 // ---------------------------------------------------------------------------
 
 /// What a client is told about the current session.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SessionInfo {
     pub id: String,
     pub name: Option<String>,

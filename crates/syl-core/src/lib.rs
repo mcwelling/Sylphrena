@@ -1,6 +1,7 @@
 //! Syl's agent core: the loop, tools, sessions, compaction and the model
 //! client. It has no terminal dependency; clients drive it through
 //! `agent::spawn`, `AgentCommand` and `AgentEvent`.
+pub mod acp;
 pub mod agent;
 pub mod attachments;
 pub mod checkpoint;

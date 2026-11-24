@@ -19,6 +19,7 @@ This document covers the implementation details behind Syl's main subsystems.
 - [File Tools](#file-tools)
 - [Steering and Images](#steering-and-images)
 - [Control and Safety](#control-and-safety)
+- [Headless and ACP](#headless-and-acp)
 - [Output Handling](#output-handling)
 - [Status Bar](#status-bar)
 - [Thinking Animation](#thinking-animation)
@@ -290,6 +291,57 @@ Nothing prompts by default: the container limits the damage, and checkpoints and
 
 ---
 
+## Headless and ACP
+
+**`syl -p "prompt"`** (`src/headless.rs`) runs one turn without the terminal UI, which suits scripts and CI.
+- **Prompt:** taken from the argument (or any arguments that aren't flags), or from stdin when it is omitted or `-`. A terminal on stdin is an error rather than a wait.
+- **Output:** the answer's text streams to stdout, and notices, errors and container progress go to stderr. With `--output json`, every `AgentEvent` is printed instead, one JSON object per line, tagged by `type` (`{"type":"text_delta","text":"…"}`, `{"type":"turn_ended","reason":"end_turn"}`).
+- **Options:** `--plan` runs the turn in plan mode. `--continue` and `--resume` work as in the TUI.
+- **Permissions:** nobody can answer a question, so a call an `ask` rule catches is refused, and stderr says so.
+- **Exit status:**
+  - 0 when the turn completes.
+  - 2 when the answer was cut off (`max_tokens`) or refused.
+  - 1 when the turn fails, or a `--resume` can't resume (it doesn't quietly start a new session).
+  - 130 when the turn is cancelled, by Ctrl+C or by stdout closing early (`| head`).
+- **Container:** left running for the next run. Podman's own output never reaches stdout.
+
+**`syl acp`** (`crates/syl-core/src/acp.rs`) is an [Agent Client Protocol](https://agentclientprotocol.com) v1 agent on stdio, for Zed, Bondsmith or any ACP client.
+- **Transport:** JSON-RPC 2.0, one message per line. Only protocol messages go to stdout; logs go to `~/.syl/acp.log`. A line that isn't UTF-8 or JSON gets a -32700 and the connection goes on.
+- **Ordering:** requests are applied in the order they arrive, even from a client that doesn't wait for replies. `initialize`, `session/set_mode`, `session/prompt` and `session/cancel` are handled as they are read, so a mode switch applies to the prompt after it, prompts run in order, and a cancel reaches its prompt. Responses may arrive in any order, as JSON-RPC allows.
+- **Sessions:**
+  - Each ACP session is its own Syl agent loop and session log, and the ACP session id is the Syl session id.
+  - Sessions on one project share one container, started once per process.
+  - The process exits when the client closes stdin, stopping every session.
+
+| ACP | Syl |
+|---|---|
+| `initialize` | protocol version 1. Capabilities: `loadSession`, image and embedded-resource prompts, `session/close`. No auth methods. |
+| `session/new {cwd, mcpServers}` | a new session in `cwd` (which must be absolute) with `.syl/config.toml` from there. `mcpServers` is ignored until MCP lands (Phase 5). Returns the modes `build` and `plan`. |
+| `session/load` | resumes the session from its log and replays it before answering. Prompts become `user_message_chunk`, replies `agent_message_chunk`, tool calls `tool_call` and `tool_call_update`. |
+| `session/prompt` | a `Prompt` / `PromptWithImages`. Text and images pass through. A `resource_link` under the project becomes a note to `read_file` it; an embedded `resource` is inlined. Answered with `stopReason` (`end_turn`, `max_tokens`, `refusal`, `cancelled`), or a JSON-RPC error when the turn fails. |
+| `session/cancel` | `Cancel`; prompts queued behind the turn are cancelled too, and every waiting prompt answers `cancelled` |
+| `session/set_mode {modeId}` | `SetMode`; `current_mode_update` follows when it applies |
+| `session/close` | `Shutdown`; prompts still waiting answer `cancelled`; answered once the session's log is released |
+| `TextDelta` / `ThinkingDelta` | `agent_message_chunk` / `agent_thought_chunk` |
+| `ToolCallStarted` / `ToolCallFinished` | `tool_call` (`in_progress`, with kind, title, raw input and locations) / `tool_call_update` (`completed` or `failed`, with the output) |
+| `PermissionRequested` | a pending `tool_call`, then `session/request_permission` offering `allow_once`, `allow_always` (saved for the project) and `reject_once`. Anything but a selected allow is a reject. |
+| `Notice` | `notice`, when the client advertises `session.notices`; otherwise only logged |
+
+**Sessions side by side.** Sessions in one process share their project's container, whose start and recovery are serialised. A plan-mode command holds a per-project lock from its snapshot to its put-back, and file-changing calls in other sessions wait for it, so a put-back only undoes what that command did. Known limits:
+- That lock doesn't reach across processes, such as a TUI and a `syl acp` on the same project.
+- The TUI removes the container when it exits, even while another process is using it. The other process's next tool call recreates it.
+- Each session keeps its own tokens-per-minute budget.
+
+To use Syl in Zed, add it as an external agent in Zed's settings. Check Zed's own docs for the current shape:
+
+```json
+"agent_servers": {
+  "Syl": { "command": "/path/to/syl", "args": ["acp"] }
+}
+```
+
+---
+
 ## Output Handling
 
 Tool output is processed before it reaches the model (`process_tool_output` in `crates/syl-core/src/util.rs`):
@@ -362,6 +414,7 @@ Cargo.toml                 # workspace + the syl-rs TUI package
 src/                       # syl-rs: the terminal client (binary `syl`)
 ├── main.rs                # startup, REPL, renders AgentEvents
 ├── slash.rs               # slash command handlers
+├── headless.rs            # syl -p and syl acp
 └── tui/
     ├── state.rs           # TuiState (stdout, spinner, animation, stats)
     ├── terminal.rs        # raw mode, scroll region, DECSC/DECRC, SIGWINCH
@@ -379,6 +432,7 @@ crates/syl-container/src/
 
 crates/syl-core/src/
 ├── agent.rs               # AgentEvent, AgentCommand, spawn, the loop
+├── acp.rs                 # Agent Client Protocol agent (syl acp)
 ├── model.rs               # ModelAdapter trait, AnthropicAdapter
 ├── config.rs              # AppConfig, CLI parser, CLAUDE_MODELS fallback
 ├── shared.rs              # SharedState (history, tokens, model, system prompt)

@@ -242,7 +242,27 @@ pub struct CliArgs {
     pub no_banner: bool,
     pub light: bool,
     pub help: bool,
+    /// `-p` / `--print [prompt]`: run one turn without the terminal UI and
+    /// print the answer. Some("") means read the prompt from stdin.
+    pub print: Option<String>,
+    /// `--output json`: with `-p`, stream every agent event as a JSON line.
+    pub output_json: bool,
+    /// `--plan`: with `-p`, run the turn in plan mode.
+    pub plan: bool,
+    /// `syl acp`: serve the Agent Client Protocol on stdio.
+    pub acp: bool,
+    /// Arguments that are not flags, in order (the `-p` prompt, `acp`).
+    pub positional: Vec<String>,
+    /// Problems with the arguments, to report before doing anything.
+    pub errors: Vec<String>,
 }
+
+/// Flags the parser knows, so `-p` can tell a prompt that starts with `-`
+/// from the next flag.
+const FLAGS: &[&str] = &[
+    "--model", "--timeout", "--thinking", "--rate-limit", "--image", "--continue", "-c", "--resume", "--fresh",
+    "--no-banner", "--light", "--help", "-h", "-p", "--print", "--output", "--plan",
+];
 
 pub fn parse_cli_args(args: &[&str]) -> CliArgs {
     let mut out = CliArgs::default();
@@ -317,14 +337,60 @@ pub fn parse_cli_args(args: &[&str]) -> CliArgs {
                 out.light = true;
                 i += 1;
             }
-            "--help" => {
+            "--help" | "-h" => {
                 out.help = true;
                 i += 1;
             }
-            _ => {
+            "-p" | "--print" => {
+                // The next argument is the prompt unless it is one of our
+                // flags (so "-1 is the answer" is a prompt).
+                match args.get(i + 1) {
+                    Some(q) if !FLAGS.contains(q) => {
+                        out.print = Some(if *q == "-" { String::new() } else { q.to_string() });
+                        i += 2;
+                    }
+                    _ => {
+                        out.print = Some(String::new());
+                        i += 1;
+                    }
+                }
+            }
+            "--output" => {
+                match args.get(i + 1).map(|v| v.to_ascii_lowercase()) {
+                    Some(v) if v == "json" => out.output_json = true,
+                    Some(v) if v == "text" => out.output_json = false,
+                    Some(v) if !FLAGS.contains(&v.as_str()) => {
+                        out.errors.push(format!("--output takes json or text, not {v:?}"))
+                    }
+                    _ => {
+                        out.errors.push("--output needs a value: json or text".to_string());
+                        i += 1;
+                        continue;
+                    }
+                }
+                i += 2;
+            }
+            "--plan" => {
+                out.plan = true;
+                i += 1;
+            }
+            other => {
+                if other.starts_with('-') && other != "-" {
+                    out.errors.push(format!("unknown option {other}"));
+                } else {
+                    out.positional.push(other.to_string());
+                }
                 i += 1;
             }
         }
+    }
+    if out.positional.first().map(String::as_str) == Some("acp") {
+        out.acp = true;
+        out.positional.remove(0);
+    }
+    // `syl -p --plan "explain x"`: the prompt came after other flags.
+    if matches!(&out.print, Some(p) if p.is_empty()) && !out.positional.is_empty() {
+        out.print = Some(std::mem::take(&mut out.positional).join(" "));
     }
     out
 }

@@ -149,6 +149,9 @@ In the terminal, your messages sit on the right and Syl's replies on the left, a
 ```bash
 syl                          # standard session
 syl --thinking 8000          # show Claude's thinking as it streams
+syl -p "run the tests and fix what fails"   # one turn, no UI; the answer goes to stdout
+syl -p "summarise the diff" --output json   # every event as a JSON line, for scripts
+syl acp                      # an Agent Client Protocol agent, for Zed or Bondsmith
 syl --continue               # continue the most recent session
 syl --resume 20261122-1530   # resume a particular one
 syl --fresh                  # clean slate (new container)
