@@ -457,7 +457,7 @@ pub fn syl_tools() -> serde_json::Value {
         },
         {
             "name": "read_file",
-            "description": "Read a file from the project (paginated).",
+            "description": "Read lines of a file, numbered (100 lines by default; set start_line/end_line for other windows). Read-only; runs in parallel with other read-only calls.",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -466,6 +466,71 @@ pub fn syl_tools() -> serde_json::Value {
                     "end_line":   {"type": "integer"}
                 },
                 "required": ["path"]
+            }
+        },
+        {
+            "name": "edit_file",
+            "description": "Edit a file by exact string replacement. old_string must match the file's current text exactly (including indentation and line breaks) and occur exactly once, unless replace_all is true. Include enough surrounding lines to make it unique. Returns a unified diff of the change. Use write_file to create a file or replace all of it.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "path":        {"type": "string", "description": "File path, relative to /workspace or absolute."},
+                    "old_string":  {"type": "string", "description": "Exact text to replace."},
+                    "new_string":  {"type": "string", "description": "Replacement text."},
+                    "replace_all": {"type": "boolean", "description": "Replace every occurrence instead of requiring exactly one. Default false."}
+                },
+                "required": ["path", "old_string", "new_string"]
+            }
+        },
+        {
+            "name": "write_file",
+            "description": "Create a file, or replace a file's whole contents. Parent directories are created. Returns a unified diff against the previous contents. Prefer edit_file for changes to part of an existing file.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "path":    {"type": "string", "description": "File path, relative to /workspace or absolute."},
+                    "content": {"type": "string", "description": "The complete new contents."}
+                },
+                "required": ["path", "content"]
+            }
+        },
+        {
+            "name": "grep",
+            "description": "Search file contents with a regular expression (ripgrep syntax; respects .gitignore). Returns matching lines as path:line:text. Read-only; several calls in one response run in parallel.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "pattern":     {"type": "string", "description": "Regular expression to search for."},
+                    "path":        {"type": "string", "description": "File or directory to search. Default: the workspace."},
+                    "glob":        {"type": "string", "description": "Only search files matching this glob, e.g. '*.rs' or 'src/**/*.ts'."},
+                    "ignore_case": {"type": "boolean"},
+                    "context":     {"type": "integer", "description": "Lines of context around each match (0-10). Default 0."},
+                    "files_only":  {"type": "boolean", "description": "List matching file paths only."}
+                },
+                "required": ["pattern"]
+            }
+        },
+        {
+            "name": "glob",
+            "description": "List files whose paths match a glob, e.g. 'src/**/*.rs' or '*.md'. Hidden files are skipped unless the pattern names them. Read-only; runs in parallel with other read-only calls.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Glob pattern; ** matches any number of directories."},
+                    "path":    {"type": "string", "description": "Directory to search from. Default: the workspace."}
+                },
+                "required": ["pattern"]
+            }
+        },
+        {
+            "name": "ls",
+            "description": "List a directory with sizes and permissions. Read-only; runs in parallel with other read-only calls.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Directory to list. Default: the workspace."}
+                },
+                "required": []
             }
         },
         {

@@ -242,7 +242,7 @@ fn test_workflow_write_and_delete() {
 #[test]
 fn test_build_system_blocks_structure() {
     let tmp = tempfile::tempdir().unwrap();
-    let blocks = build_system_blocks("### WORKSPACE\nFiles: syl.bb", tmp.path());
+    let blocks = build_system_blocks("### WORKSPACE\nFiles: syl.bb", tmp.path(), None);
     assert_eq!(blocks.len(), 1);
     if let ContentBlock::Text {
         text,
@@ -265,7 +265,7 @@ fn test_build_system_blocks_structure() {
 fn test_build_system_blocks_includes_memories() {
     let tmp = tempfile::tempdir().unwrap();
     memory_write(tmp.path(), "test-key", "Test memory content");
-    let blocks = build_system_blocks("workspace ctx", tmp.path());
+    let blocks = build_system_blocks("workspace ctx", tmp.path(), None);
     if let ContentBlock::Text { text, .. } = &blocks[0] {
         assert!(
             text.contains("PERSISTENT MEMORIES"),

@@ -28,10 +28,16 @@ impl InputEditor {
     ///
     /// Moves the cursor to the input row before calling rustyline so the prompt
     /// always appears on the correct row regardless of prior scroll activity.
-    pub fn readline(&mut self, prompt: &str, rows: u16) -> RlResult<String> {
+    /// `initial` is put in the line to start with (text typed at the end
+    /// of a turn, say).
+    pub fn readline(&mut self, prompt: &str, rows: u16, initial: &str) -> RlResult<String> {
         // Anchor cursor at input row: rows-1 (1-indexed) = rows-2 (0-indexed)
         let _ = execute!(io::stdout(), cursor::MoveTo(0, rows.saturating_sub(2)));
-        self.rl.readline(prompt)
+        if initial.is_empty() {
+            self.rl.readline(prompt)
+        } else {
+            self.rl.readline_with_initial(prompt, (initial, ""))
+        }
     }
 
     /// Add an entry to the in-memory history (not persisted).

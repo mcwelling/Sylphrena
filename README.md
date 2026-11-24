@@ -97,16 +97,29 @@ Priority: **CLI flag > environment variable > `.syl/config.toml` > default**
 
 ## Tools
 
-Claude has eight built-in tools inside the container:
+Claude has these built-in tools, all running inside the container:
 
 | Tool | Description |
 |---|---|
-| `run_bash` | Execute shell commands (output capped at 40 lines in TUI; full output sent to model) |
-| `read_file` | Paginated file read from the workspace |
+| `run_bash` | Execute shell commands (output capped at 40 lines in the TUI; long output is saved to a file the model can page) |
+| `read_file` | Read numbered lines of a file, in windows |
+| `edit_file` | Exact string replacement (must be unique unless `replace_all`); shows a diff |
+| `write_file` | Create or replace a file; shows a diff |
+| `grep` | Search contents with ripgrep (or grep in older images) |
+| `glob` | Find files by pattern, e.g. `src/**/*.rs` |
+| `ls` | List a directory |
 | `memory_read` / `memory_write` | Persistent key-value notes in `.syl/memory/*.md` |
 | `workflow_write` / `workflow_delete` | Create or remove named workflow pipelines |
 | `dispatch_agent` | Fetch a URL and process it with a fast Haiku sub-agent |
 | `show_image` | Render an image in the terminal |
+
+Read-only calls (`read_file`, `grep`, `glob`, `ls`, `memory_read`) made together run in parallel.
+
+**Project instructions:** `AGENTS.md` (or `CLAUDE.md` where there is no `AGENTS.md`) in the project and every directory above it is loaded into the system prompt when a conversation starts; the project's own file comes last.
+
+**Images:** name an image in a prompt (`@screenshot.png`, or drag a file into the terminal) and it is sent with the prompt. PNG, JPEG, GIF and WebP, up to 3.75 MB each and 15 MB per prompt.
+
+**Steering:** while Syl works, type on the bottom line and press Enter. The message reaches the model after the tool calls running now, together with their results. If the turn ends first, it becomes the next prompt. Ctrl+C cancels the turn; at the prompt it clears the line (Ctrl+D or `/exit` quits).
 
 ## Common Patterns
 

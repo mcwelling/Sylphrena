@@ -292,3 +292,35 @@ fn spilled_html_and_long_lines_stay_pageable() {
     assert_eq!(saved.lines().count(), 6);
     assert!(saved.lines().all(|l| l.len() <= SPILL_LINE_CHARS));
 }
+
+#[test]
+fn an_empty_agents_md_falls_back_to_claude_md_and_the_project_file_gets_the_budget() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("a/b");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(project.join("AGENTS.md"), "  \n").unwrap();
+    std::fs::write(project.join("CLAUDE.md"), "project rule").unwrap();
+    // Outer files big enough to use the whole budget on their own.
+    std::fs::write(tmp.path().join("AGENTS.md"), "x".repeat(50_000)).unwrap();
+    std::fs::write(tmp.path().join("a/AGENTS.md"), "y".repeat(50_000)).unwrap();
+    let text = syl_core::system_prompt::load_project_instructions(&project).unwrap();
+    assert!(text.contains("project rule"));
+    assert!(text.ends_with("project rule"), "the project's file comes last");
+}
+
+#[test]
+fn images_dropped_replaces_older_images_and_strips_thinking() {
+    use syl_core::api::types::ImageSource;
+    let img = |d: &str| ContentBlock::Image { source: ImageSource::base64("image/png", d) };
+    let tmp = tempfile::tempdir().unwrap();
+    let mut log = SessionLog::create(None, tmp.path());
+    log.append(msg(Message { role: "user".into(), content: MessageContent::Blocks(vec![img("old")]) })).unwrap();
+    log.append(msg(assistant_with_thinking("seen"))).unwrap();
+    log.append(msg(Message { role: "user".into(), content: MessageContent::Blocks(vec![img("new")]) })).unwrap();
+    assert_eq!(syl_core::session::image_load(log.messages()), (2, 6));
+    log.append(EntryKind::ImagesDropped { all: false }).unwrap();
+    assert_eq!(syl_core::session::image_load(log.messages()), (1, 3));
+    assert!(matches!(&log.messages()[1].content, MessageContent::Blocks(b) if !b.iter().any(|b| b.is_thinking())));
+    log.append(EntryKind::ImagesDropped { all: true }).unwrap();
+    assert_eq!(syl_core::session::image_load(log.messages()), (0, 0));
+}

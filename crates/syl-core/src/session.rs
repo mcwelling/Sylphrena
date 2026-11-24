@@ -66,6 +66,9 @@ pub enum EntryKind {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         is_error: bool,
     },
+    /// A message the user typed while a turn was running, delivered after
+    /// the tool results it waited for (in the same user message).
+    Steer { text: String },
     /// History before `first_kept` is replaced by `summary`. With no summary
     /// (the summarizer failed) it is dropped.
     Compaction {
@@ -82,6 +85,11 @@ pub enum EntryKind {
     /// from before this point are not sent again: they were signed in a
     /// conversation the new process can't vouch for (tools may differ).
     Resumed,
+    /// Images are taken out of the history (each becomes a text marker),
+    /// all of them or all but those of the newest message that has any:
+    /// too many images make every request fail. Thinking blocks are removed
+    /// too, since editing earlier messages invalidates them.
+    ImagesDropped { all: bool },
     /// Reserved for the permission engine (Phase 3).
     Approval { tool_use_id: String, approved: bool },
 }
@@ -176,6 +184,24 @@ impl History {
                     }
                 }
             }
+            EntryKind::Steer { text } => {
+                let block = ContentBlock::Text { text: text.clone(), cache_control: None };
+                match self.messages.last_mut() {
+                    Some(Message { role, content: MessageContent::Blocks(blocks) })
+                        if role == "user"
+                            && blocks.iter().any(|b| matches!(b, ContentBlock::ToolResult { .. })) =>
+                    {
+                        blocks.push(block);
+                    }
+                    _ => {
+                        self.messages.push(Message {
+                            role: "user".to_string(),
+                            content: MessageContent::Blocks(vec![block]),
+                        });
+                        self.starts.push(e.id.clone());
+                    }
+                }
+            }
             EntryKind::Compaction { summary, first_kept, .. } => {
                 let Some(pos) = self.starts.iter().position(|s| s == first_kept) else {
                     tracing::warn!(first_kept, "compaction entry names an unknown message; ignored");
@@ -204,6 +230,25 @@ impl History {
             EntryKind::ModelChange { model } => self.model = Some(model.clone()),
             EntryKind::Name { name } => self.name = Some(name.clone()),
             EntryKind::Resumed => {
+                self.messages = strip_thinking(std::mem::take(&mut self.messages));
+            }
+            EntryKind::ImagesDropped { all } => {
+                let keep = if *all { None } else { self.messages.iter().rposition(has_image) };
+                for (i, m) in self.messages.iter_mut().enumerate() {
+                    if Some(i) == keep {
+                        continue;
+                    }
+                    if let MessageContent::Blocks(blocks) = &mut m.content {
+                        for b in blocks.iter_mut() {
+                            if matches!(b, ContentBlock::Image { .. }) {
+                                *b = ContentBlock::Text {
+                                    text: "[image removed from the context to save space]".to_string(),
+                                    cache_control: None,
+                                };
+                            }
+                        }
+                    }
+                }
                 self.messages = strip_thinking(std::mem::take(&mut self.messages));
             }
             EntryKind::Approval { .. } => {}
@@ -239,6 +284,27 @@ impl History {
             })
             .collect()
     }
+}
+
+/// Whether a message carries an image.
+pub fn has_image(m: &Message) -> bool {
+    matches!(&m.content, MessageContent::Blocks(b) if b.iter().any(|b| matches!(b, ContentBlock::Image { .. })))
+}
+
+/// The number of images in `messages`, and their base64 bytes.
+pub fn image_load(messages: &[Message]) -> (usize, usize) {
+    messages
+        .iter()
+        .filter_map(|m| match &m.content {
+            MessageContent::Blocks(b) => Some(b),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|b| match b {
+            ContentBlock::Image { source } => Some(source.data.len()),
+            _ => None,
+        })
+        .fold((0, 0), |(n, bytes), len| (n + 1, bytes + len))
 }
 
 fn is_tool_results(m: &Message) -> bool {
@@ -668,20 +734,33 @@ pub struct Prompt {
     pub text: String,
 }
 
-/// The typed prompts of a chain, oldest first (tool results excluded).
+/// The typed prompts of a chain, oldest first (tool results and steering
+/// messages excluded; a prompt with images counts, by its text).
 pub fn user_prompts(entries: &[Entry]) -> Vec<Prompt> {
     entries
         .iter()
-        .filter_map(|e| match &e.kind {
-            EntryKind::Message { message } if message.role == "user" => match &message.content {
-                MessageContent::Text(t) => Some(Prompt {
-                    entry: e.id.clone(),
-                    parent: e.parent_id.clone(),
-                    text: t.clone(),
-                }),
-                _ => None,
-            },
-            _ => None,
+        .filter_map(|e| {
+            let EntryKind::Message { message } = &e.kind else { return None };
+            if message.role != "user" {
+                return None;
+            }
+            let text = match &message.content {
+                MessageContent::Text(t) => t.clone(),
+                MessageContent::Blocks(blocks) => {
+                    if blocks.iter().any(|b| matches!(b, ContentBlock::ToolResult { .. })) {
+                        return None;
+                    }
+                    blocks
+                        .iter()
+                        .filter_map(|b| match b {
+                            ContentBlock::Text { text, .. } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                }
+            };
+            Some(Prompt { entry: e.id.clone(), parent: e.parent_id.clone(), text })
         })
         .collect()
 }

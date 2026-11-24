@@ -1,6 +1,6 @@
 pub mod bash;
 pub mod dispatch;
-pub mod files;
+pub mod fs;
 pub mod image;
 pub mod memory;
 pub mod workflow;
@@ -25,6 +25,12 @@ pub struct ToolContext<'a> {
     pub spill: Option<&'a SpillDir>,
 }
 
+/// Tools that only read: a run of these in one turn is executed
+/// concurrently. Everything else runs one at a time, in order.
+pub fn is_read_only(name: &str) -> bool {
+    matches!(name, "read_file" | "grep" | "glob" | "ls" | "memory_read")
+}
+
 /// Run one tool call. Returns `(output, is_error)`.
 pub async fn execute(
     name: &str,
@@ -46,7 +52,12 @@ pub async fn execute(
             false,
         ),
         "workflow_delete" => (workflow::workflow_delete(ctx.workflow_dir, &str_field("name")), false),
-        "read_file" => files::read_file(input, ctx.container),
+        "read_file" => fs::read_file(input, ctx.config, ctx.container, &cancel).await,
+        "edit_file" => fs::edit_file(input, ctx.config, ctx.container, &cancel).await,
+        "write_file" => fs::write_file(input, ctx.config, ctx.container, &cancel).await,
+        "grep" => fs::grep(input, ctx.config, ctx.container, &cancel).await,
+        "glob" => fs::glob(input, ctx.config, ctx.container, &cancel).await,
+        "ls" => fs::ls(input, ctx.config, ctx.container, &cancel).await,
         "dispatch_agent" => {
             dispatch::dispatch_agent(input, ctx.config, ctx.model, ctx.container, cancel).await
         }

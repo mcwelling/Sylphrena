@@ -23,6 +23,7 @@ use syl_rs::tui::{
     input::InputEditor,
     spinner,
     state::TuiState,
+    steer::{carry_over, KeyReader, SteerKey, SteerLine},
     terminal,
 };
 
@@ -172,6 +173,7 @@ async fn main() -> anyhow::Result<()> {
         syl_dir: &syl_dir,
         sessions_dir: &sessions_dir,
         session: None,
+        carry: String::new(),
     };
     let result = match repl.await_session_reply(&mut handle.events).await {
         true => repl.run(&mut handle.events, resize_rx).await,
@@ -327,6 +329,8 @@ struct Repl<'a> {
     sessions_dir: &'a Path,
     /// The current session, as the agent last reported it.
     session: Option<SessionInfo>,
+    /// Text typed at the end of a turn, to start the next prompt with.
+    carry: String,
 }
 
 impl Repl<'_> {
@@ -406,10 +410,13 @@ impl Repl<'_> {
             }
             self.redraw_bars();
 
-            let line = match editor.readline("> ", self.rows) {
+            let initial = std::mem::take(&mut self.carry);
+            let line = match editor.readline("> ", self.rows, &initial) {
                 Ok(l) => l,
-                Err(rustyline::error::ReadlineError::Eof)
-                | Err(rustyline::error::ReadlineError::Interrupted) => break,
+                Err(rustyline::error::ReadlineError::Eof) => break,
+                // Ctrl+C clears the line; it often lands just after a turn it
+                // was meant to cancel. Ctrl+D or /exit quits.
+                Err(rustyline::error::ReadlineError::Interrupted) => continue,
                 Err(e) => return Err(e.into()),
             };
             let line = line.trim().to_string();
@@ -473,7 +480,18 @@ impl Repl<'_> {
                 continue;
             }
 
-            let _ = self.commands.send(AgentCommand::Prompt(line));
+            let project_dir = self.syl_dir.parent().unwrap_or(self.syl_dir);
+            let attached = syl_core::attachments::attach_images(&line, project_dir);
+            for problem in &attached.problems {
+                self.print(&format!("\x1b[33m[image not attached: {problem}]\x1b[0m\r\n"));
+            }
+            let cmd = if attached.images.is_empty() {
+                AgentCommand::Prompt(line)
+            } else {
+                self.print(&format!("\x1b[2m[{} image(s) attached]\x1b[0m\r\n", attached.images.len()));
+                AgentCommand::PromptWithImages { text: attached.text, images: attached.images }
+            };
+            let _ = self.commands.send(cmd);
             if !self.drive_turn(events, &mut resize_rx).await {
                 anyhow::bail!("the agent stopped unexpectedly");
             }
@@ -492,12 +510,42 @@ impl Repl<'_> {
         let mut streaming = false;
         let mut inputs: HashMap<String, serde_json::Value> = HashMap::new();
         let mut resize_open = true;
+        let mut reader = KeyReader::start();
+        let mut steer = SteerLine::default();
+        // Steering sent and not yet answered. The agent answers each with
+        // SteerDelivered, SteerQueued (a turn for it follows, rendered here
+        // too) or SteerDropped, so this keeps reading until all are settled.
+        let mut unanswered = 0usize;
+        let mut turns_expected = 0usize;
+        let mut in_turn = true;
+        steer.draw(&self.tui.stdout, self.rows, self.cols);
 
         let ended = loop {
             let event = tokio::select! {
                 ev = events.recv() => match ev {
                     Some(ev) => ev,
                     None => break false,
+                },
+                Some(key) = reader.keys.recv() => {
+                    match steer.handle_event(key) {
+                        SteerKey::Edited => steer.draw(&self.tui.stdout, self.rows, self.cols),
+                        SteerKey::Send(text) => {
+                            if streaming {
+                                let _ = terminal::end_streaming(&self.tui.stdout, self.rows);
+                                streaming = false;
+                            }
+                            self.print(&format!("\x1b[2m» {}\x1b[0m\r\n", one_line(&text, 200)));
+                            let _ = self.commands.send(AgentCommand::Steer(text));
+                            unanswered += 1;
+                            steer.draw(&self.tui.stdout, self.rows, self.cols);
+                        }
+                        SteerKey::Cancel => {
+                            let _ = self.commands.send(AgentCommand::Cancel);
+                            steer.draw(&self.tui.stdout, self.rows, self.cols);
+                        }
+                        SteerKey::Ignored => {}
+                    }
+                    continue;
                 },
                 changed = resize_rx.changed(), if resize_open => {
                     if changed.is_err() {
@@ -506,6 +554,7 @@ impl Repl<'_> {
                     }
                     let (nc, nr) = *resize_rx.borrow_and_update();
                     self.apply_resize(nc, nr, true);
+                    steer.draw(&self.tui.stdout, nr, nc);
                     if streaming {
                         // Text is already flowing: no thinking animation, and
                         // re-anchor the streaming line inside the new region.
@@ -524,7 +573,10 @@ impl Repl<'_> {
             }
 
             match event {
-                AgentEvent::TurnStarted => {}
+                AgentEvent::TurnStarted => {
+                    in_turn = true;
+                    turns_expected = turns_expected.saturating_sub(1);
+                }
                 AgentEvent::RequestStarted => {
                     self.tui.stop_spinner();
                     let mut anim = self.tui.anim.lock().unwrap();
@@ -567,6 +619,22 @@ impl Repl<'_> {
                     self.print(&format!("\x1b[2m[context compacted: {before} → {after} messages]\x1b[0m\r\n"));
                 }
                 AgentEvent::SessionChanged { info } => self.session = Some(info),
+                AgentEvent::SteerQueued { text, count } => {
+                    unanswered = unanswered.saturating_sub(count);
+                    turns_expected += 1;
+                    self.print(&format!("\x1b[2m[sending as the next prompt: {}]\x1b[0m\r\n", one_line(&text, 70)));
+                }
+                AgentEvent::SteerDropped { text, count } => {
+                    unanswered = unanswered.saturating_sub(count);
+                    self.print(&format!("\x1b[33m[not delivered, the turn stopped: {}]\x1b[0m\r\n", one_line(&text, 70)));
+                    if !in_turn && unanswered == 0 && turns_expected == 0 {
+                        break true;
+                    }
+                }
+                AgentEvent::SteerDelivered { text } => {
+                    unanswered = unanswered.saturating_sub(1);
+                    self.print(&format!("\x1b[2m[delivered: {}]\x1b[0m\r\n", one_line(&text, 70)))
+                }
                 AgentEvent::Notice { message } => self.print(&format!("{message}\r\n")),
                 AgentEvent::Error { message } => self.print(&format!("[Error: {message}]\r\n")),
                 AgentEvent::TurnEnded { reason } => {
@@ -580,6 +648,10 @@ impl Repl<'_> {
                         TurnEnd::Cancelled => self.print("[cancelled]\r\n"),
                         TurnEnd::Completed(_) | TurnEnd::Failed => {}
                     }
+                    in_turn = false;
+                    if unanswered > 0 || turns_expected > 0 {
+                        continue;
+                    }
                     break true;
                 }
             }
@@ -587,6 +659,9 @@ impl Repl<'_> {
 
         self.tui.stop_anim();
         self.tui.stop_spinner();
+        let left = reader.stop().await;
+        self.carry = carry_over(&steer, left);
+        SteerLine::clear(&self.tui.stdout, self.rows);
         ended
     }
 
@@ -647,8 +722,24 @@ impl Repl<'_> {
     }
 }
 
+/// `text` with control characters other than newline and tab shown as
+/// visible symbols, so tool output (file contents, a diff, a file name)
+/// can't send escape sequences to the terminal.
+fn sanitize(text: &str) -> String {
+    text.chars()
+        .map(|c| match c {
+            '\n' | '\t' => c,
+            '\x1b' => '␛',
+            c if c.is_control() => '�',
+            c => c,
+        })
+        .collect()
+}
+
 /// How a finished tool call is shown in the scroll region.
 fn tool_display(name: &str, input: &serde_json::Value, content: &str) -> String {
+    let content = &sanitize(content);
+    let input = &sanitize_json(input);
     match name {
         "run_bash" => {
             // Bordered output clipped to 40 lines
@@ -670,6 +761,18 @@ fn tool_display(name: &str, input: &serde_json::Value, content: &str) -> String 
             let path = input["path"].as_str().unwrap_or("?");
             format!("[read_file: {path}] ({} chars)", content.len())
         }
+        "edit_file" | "write_file" => color_diff(content),
+        "grep" | "glob" => {
+            let pattern = input["pattern"].as_str().unwrap_or("?");
+            let n = content.lines().filter(|l| !l.starts_with("[...")).count();
+            let found = if content.starts_with("No ") { "no matches".to_string() } else { format!("{n} lines") };
+            format!("[{name}: {pattern}] ({found})")
+        }
+        "ls" => {
+            let path = input["path"].as_str().unwrap_or(".");
+            let n = content.lines().filter(|l| !l.starts_with("total ")).count();
+            format!("[ls: {path}] ({n} entries)")
+        }
         "dispatch_agent" => {
             let source = input["source"].as_str().unwrap_or("?");
             let task = input["task"].as_str().unwrap_or("?");
@@ -680,6 +783,43 @@ fn tool_display(name: &str, input: &serde_json::Value, content: &str) -> String 
             format!("[show_image: {path}]")
         }
         _ => content.to_string(),
+    }
+}
+
+/// An edit's result: the summary line, then the diff in colour, clipped.
+fn color_diff(content: &str) -> String {
+    const MAX_LINES: usize = 60;
+    let lines: Vec<&str> = content.lines().collect();
+    let mut out = String::new();
+    for (i, l) in lines.iter().take(MAX_LINES).enumerate() {
+        let colored = if i == 0 {
+            format!("\x1b[1m{l}\x1b[0m")
+        } else if l.starts_with("+++") || l.starts_with("---") {
+            format!("\x1b[2m{l}\x1b[0m")
+        } else if l.starts_with('+') {
+            format!("\x1b[32m{l}\x1b[0m")
+        } else if l.starts_with('-') {
+            format!("\x1b[31m{l}\x1b[0m")
+        } else if l.starts_with("@@") {
+            format!("\x1b[36m{l}\x1b[0m")
+        } else {
+            l.to_string()
+        };
+        out.push_str(&colored);
+        out.push_str("\r\n");
+    }
+    if lines.len() > MAX_LINES {
+        out.push_str(&format!("\x1b[2m... ({} more diff lines)\x1b[0m\r\n", lines.len() - MAX_LINES));
+    }
+    out.trim_end_matches("\r\n").to_string()
+}
+
+fn sanitize_json(v: &serde_json::Value) -> serde_json::Value {
+    match v {
+        serde_json::Value::String(s) => serde_json::Value::String(sanitize(s)),
+        serde_json::Value::Array(a) => a.iter().map(sanitize_json).collect(),
+        serde_json::Value::Object(o) => o.iter().map(|(k, v)| (k.clone(), sanitize_json(v))).collect(),
+        other => other.clone(),
     }
 }
 
