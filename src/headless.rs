@@ -60,6 +60,9 @@ pub async fn run_print(cli: &CliArgs) -> anyhow::Result<i32> {
     for w in &config.config_warnings {
         eprintln!("[syl] {w}");
     }
+    if let Some(n) = config.untrusted_notice() {
+        eprintln!("[syl] {n}");
+    }
 
     let paths = SessionPaths::for_project(&project_dir);
     let start = match &cli.resume {

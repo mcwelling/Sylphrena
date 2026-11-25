@@ -56,6 +56,9 @@ pub enum EntryKind {
     },
     /// The system prompt, frozen for the conversation from here on.
     SystemPrompt { blocks: Vec<PromptBlock> },
+    /// Tool definitions sent besides the built-in ones (MCP tools, the
+    /// `skill` tool), frozen with the system prompt.
+    ToolSet { tools: Vec<serde_json::Value> },
     /// A user prompt or an assistant turn, exactly as sent or received.
     Message { message: Message },
     /// One tool result, logged as soon as the tool finishes. Consecutive
@@ -153,6 +156,8 @@ pub struct History {
     /// The id of the entry that began each message, in step with `messages`.
     starts: Vec<String>,
     pub system: Option<Vec<PromptBlock>>,
+    /// Extra tool definitions for this conversation.
+    pub tools: Option<Vec<serde_json::Value>>,
     pub name: Option<String>,
     pub model: Option<String>,
     pub forked_from: Option<ForkOrigin>,
@@ -178,6 +183,7 @@ impl History {
                 self.forked_from = forked_from.clone();
             }
             EntryKind::SystemPrompt { blocks } => self.system = Some(blocks.clone()),
+            EntryKind::ToolSet { tools } => self.tools = Some(tools.clone()),
             EntryKind::Message { message } => {
                 self.messages.push(message.clone());
                 self.starts.push(e.id.clone());
@@ -425,12 +431,23 @@ impl SessionLog {
     pub fn open(dir: &Path, id: &str) -> anyhow::Result<Self> {
         let path = session_path(dir, id)?;
         let file = OpenOptions::new().append(true).open(&path)?;
-        match file.try_lock() {
-            Ok(()) => {}
-            Err(std::fs::TryLockError::WouldBlock) => {
-                anyhow::bail!("session {id} is open in another Syl process")
+        // A lock belongs to the open file, which a child process forked
+        // just before the last holder closed it shares until it execs (and
+        // close-on-exec drops it): so a lock just released can still look
+        // held for a moment. Another Syl really holding it still fails.
+        let mut tries = 0;
+        loop {
+            match file.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) if tries < 25 => {
+                    tries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    anyhow::bail!("session {id} is open in another Syl process")
+                }
+                Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
             }
-            Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
         }
         let bytes = fs::read(&path)?;
         // Whole lines end at the last newline; a torn tail is cut off at the

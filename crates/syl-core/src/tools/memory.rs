@@ -17,7 +17,7 @@ pub fn memory_write(memory_dir: &Path, key: &str, content: &str) -> String {
         return format!("Error creating memory dir: {}", e);
     }
     let path = memory_dir.join(format!("{}.md", key));
-    match fs::write(&path, content) {
+    match crate::util::write_regular(&path, content) {
         Ok(())  => format!("Remembered '{}'. Written to {}", key, path.display()),
         Err(e)  => format!("Error writing memory: {}", e),
     }
@@ -44,7 +44,7 @@ pub fn memory_read(memory_dir: &Path, key: &str) -> String {
                 files.sort();
                 let parts: Vec<String> = files.iter().map(|fname| {
                     let k = fname.trim_end_matches(".md");
-                    let content = fs::read_to_string(memory_dir.join(fname)).unwrap_or_default();
+                    let content = crate::util::read_regular(&memory_dir.join(fname)).unwrap_or_default();
                     format!("## {}\n{}", k, content)
                 }).collect();
                 parts.join("\n\n")
@@ -55,7 +55,7 @@ pub fn memory_read(memory_dir: &Path, key: &str) -> String {
             return bad_key(key);
         }
         let path = memory_dir.join(format!("{}.md", key));
-        match fs::read_to_string(&path) {
+        match crate::util::read_regular(&path) {
             Ok(s)  => s,
             Err(_) => format!("No memory found for '{}'.", key),
         }
@@ -89,7 +89,7 @@ pub fn load_all_memories(memory_dir: &Path) -> Option<String> {
     files.sort();
     let parts: Vec<String> = files.iter().map(|fname| {
         let k = fname.trim_end_matches(".md");
-        let content = fs::read_to_string(memory_dir.join(fname)).unwrap_or_default();
+        let content = crate::util::read_regular(&memory_dir.join(fname)).unwrap_or_default();
         format!("## {}\n{}", k, content)
     }).collect();
     Some(parts.join("\n\n"))

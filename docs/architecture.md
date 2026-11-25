@@ -20,6 +20,7 @@ This document covers the implementation details behind Syl's main subsystems.
 - [Steering and Images](#steering-and-images)
 - [Control and Safety](#control-and-safety)
 - [Headless and ACP](#headless-and-acp)
+- [Extensibility](#extensibility)
 - [Output Handling](#output-handling)
 - [Status Bar](#status-bar)
 - [Thinking Animation](#thinking-animation)
@@ -342,6 +343,53 @@ To use Syl in Zed, add it as an external agent in Zed's settings. Check Zed's ow
 
 ---
 
+## Extensibility
+
+Everything here is plain files in `.syl/` (or `~/.syl/`), which other tools such as Bondsmith can read and write too. There is no plugin runtime.
+
+**Where things run.** A project's `.syl/` comes with the project: clone a repository and you get its `config.toml`, commands and skills. So nothing from there runs on the host. Hooks and MCP servers run in the container. An MCP server can run on the host only when it is defined in `~/.syl/config.toml` with `host = true`, or passed in by an ACP client. The same goes for a `url` server, because Syl makes those requests from the host: a project could otherwise point it at your localhost or a cloud metadata address.
+
+**Trust.** Running in the container doesn't make a project's hooks and MCP servers harmless: the container has the network and your SSH keys (`~/.ssh`, mounted read-only), and they run without a tool call or a permission prompt. So a project's `[[hook]]`s and `[[mcp]]` servers are held back until you trust them (`trust.rs`). The TUI lists them at startup and asks; yes is kept in `~/.syl/trusted.json` against a SHA-256 of exactly those entries, so any change to them asks again. Headless mode and ACP can't ask: they leave the entries out and say so (ACP as a message in the session). Run in your home directory, the project's config is `~/.syl/config.toml`, which is yours and needs no trust.
+
+**What the container can write, and what a clone can ship.** Only `.syl/` is mounted read-only; the rest of the workspace, `.agents/` and `AGENTS.md` included, is writable by code in the container, and a cloned repository can ship symbolic links anywhere in it, `.syl/` too. Syl reads these files on the host, so it never follows a symbolic link to one: skills and their file lists, custom commands, memories, workflows and the project's own `AGENTS.md`/`CLAUDE.md` (`util::read_regular`). Memory and workflow writes don't follow one either (`util::write_regular`, with `O_NOFOLLOW`). A skill or command directory that resolves outside the project (or home) is skipped.
+
+**MCP** (`mcp.rs`). `[[mcp]]` tables define servers: `command`/`args`/`env` for stdio, or `url`/`headers` for Streamable HTTP. Syl speaks MCP `2025-06-18`.
+- **Startup:** stdio servers start inside the container (`podman exec -i`) with the first turn, all at once and within 60 seconds, and serve every session of the agent. Cancelling the turn stops the wait, and the next turn tries again. Values in `env` reach the container through podman's environment, not its command line, so they don't show in `ps`.
+- **Schemas:** each tool's `inputSchema` is made acceptable to the Messages API: an object schema, with top-level `oneOf`/`anyOf`/`allOf`/`$ref` removed (and the schema loosened to allow any properties), since one rejected tool would fail every request of the conversation.
+- **Transport:** stdio lines that aren't JSON are skipped; once a server exits, its calls fail at once. Streamable HTTP responses are read as they arrive, SSE events have their `data:` lines joined, and a `ping` from the server inside the stream is answered.
+- **Tools:** offered to the model as `<server>__<tool>`, cut to the API's name rules. Server instructions go into the system prompt.
+- **Frozen per conversation:** the tool list is fixed with the system prompt and logged as a `tool_set` entry, which keeps the prompt cache and resumed sessions intact. A resumed session keeps the tools it had even if a server is gone now; calling one of those then fails with an unknown-tool error.
+- **Results:** text parts become the tool result; images and binary resources are named but not shown. Large results are spilled like `run_bash` output.
+- **Permissions:** rules match MCP tools by name (`tool = "github__*"`), with the arguments as compact JSON for the subject. Plan mode refuses MCP tools that don't declare `readOnlyHint`, and runs the rest between two snapshots like `run_bash`, since a server in the container could write anyway.
+- **Cancel and size:** a cancelled or timed-out stdio call is forgotten and the server gets `notifications/cancelled`. A message over 16 MB is skipped (stdio) or fails the call (HTTP).
+- **Plan mode and host or HTTP servers:** plan mode goes by a tool's `readOnlyHint`, and its snapshot only covers the workspace. A tool on a host or HTTP server that says it only reads but writes anyway changes things no snapshot can put back.
+- **Not parallel:** `skill` and MCP calls run one at a time, not alongside read-only built-in tools.
+- **Limit:** stopping Syl stops the `podman exec` client and closes the server's stdin; a server that ignores EOF keeps running in the container until the container stops.
+- **Not supported:** server-to-client requests (sampling, roots, elicitation) are answered "not supported", and there's no OAuth (use `headers`).
+
+**Skills** (`commands.rs`). Directories with a `SKILL.md` (Agent Skills format: front matter `name`, `description`) in `.syl/skills/`, `.agents/skills/` and `~/.syl/skills/`.
+- **In the prompt:** only names and descriptions go into the system prompt.
+- **Loading:** the model loads a skill with the `skill` tool, which returns the instructions and lists the other files. Files under the project are readable from the container; files under `~/.syl/skills` are not. `/skill:<name> task` loads one directly.
+
+**Custom commands.** `.syl/commands/<name>.md` (or `~/.syl/commands/`; the project's wins) is a prompt template with optional `description` front matter. `/name words` replaces `$ARGUMENTS` (or `{{args}}`) with the words, or appends them. The core expands commands (in prompts, prompts with images and steering), so they work in the TUI and over ACP; ACP clients get them, and the skills, in `available_commands_update`, sent right after the `session/new` or `session/load` reply. The expanded text is what the session log keeps, so `/history` shows it.
+
+Front matter is `key: value` lines between two `---` lines; `key: >` and `key: |` take the indented lines after them (folded or kept as lines), as Agent Skills descriptions often do. `$ARGUMENTS` and `{{args}}` are replaced in one pass, so the arguments themselves are never substituted into.
+
+**Hooks** (`hooks.rs`). `[[hook]]` tables: `event` (`session_start`, `pre_tool`, `post_tool`, `turn_end`), `command`, an optional `tool` glob and `timeout_secs`. The command runs with `sh -c` in the container, with the event as JSON on stdin. A `pre_tool` hook that exits non-zero blocks the call, and its stderr (else stdout) is the reason the model sees. Other events report a failure as a notice.
+- **Cancel:** Ctrl+C (or ACP `session/cancel`) stops a running hook.
+- **Session hooks and plan mode:** `session_start` and `turn_end` hooks share the project lock like any write, and in plan mode they too run in a snapshot, with a notice listing anything they changed and that was put back. `turn_end` hooks are part of the turn: `TurnEnded` comes after them, so headless mode waits for them.
+- **Plan mode:** a call with tool hooks runs, hooks included, between two snapshots, and what the hooks wrote is put back with the rest.
+- **Checkpoints:** a call with tool hooks counts as one that may change files, so the turn is checkpointed before it and `/undo` covers what the hooks wrote.
+
+**Recipes** (`tools/workflow.rs`). Workflows keep their markdown format and gain three things:
+- **Parameters:** `params: version, branch` front matter, used as `{{version}}`.
+- **Retries:** `(retry N)` on a command step.
+- **Prompt steps:** `- Label: ask: a prompt` runs a turn.
+
+`/workflow name 1.2 branch=main` fills the parameters, in order or by name. The words are split like a shell's, so a value with spaces is quoted (`message="fix the build"`); after a named value, an unnamed one is an error rather than a guess. A word with `=` is a named value only when the name is a declared parameter. Steps run one by one, and the first failure stops the run. A command step can run for ten minutes; Ctrl+C stops it. A prompt step succeeds only if the turn ends normally (not cut off at the token limit). Values go into commands as typed, unquoted: write `'{{message}}'` in the recipe if a value may hold spaces or quotes, and remember that `;` in a value starts another command. Workflows that only run commands work as before. Not yet: choosing the model per recipe, a JSON schema for structured output, and running recipes over ACP.
+
+---
+
 ## Output Handling
 
 Tool output is processed before it reaches the model (`process_tool_output` in `crates/syl-core/src/util.rs`):
@@ -441,6 +489,9 @@ crates/syl-core/src/
 ├── system_prompt.rs       # system prompt assembly, AGENTS.md / CLAUDE.md loading
 ├── attachments.rs         # images named in prompts
 ├── checkpoint.rs          # shadow-git snapshots and restore
+├── commands.rs            # custom slash commands and Agent Skills
+├── hooks.rs               # [[hook]] commands
+├── mcp.rs                 # MCP client (stdio in the container, Streamable HTTP)
 ├── permissions.rs         # allow/ask/deny rules, command splitter, modes
 ├── control.rs             # permission answers, the reviewer
 ├── workspace.rs           # workspace context (ls + git status)

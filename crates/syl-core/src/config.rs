@@ -107,6 +107,16 @@ pub struct AppConfig {
     pub config_error: Option<String>,
     /// Things in config.toml that were ignored, for the client to show.
     pub config_warnings: Vec<String>,
+    /// `[[hook]]` commands (they run in the container).
+    pub hooks: Vec<crate::hooks::Hook>,
+    /// `[[mcp]]` servers: `~/.syl/config.toml`'s, then the project's.
+    pub mcp: Vec<crate::mcp::McpServerConfig>,
+    /// The project's hooks and MCP servers when they aren't trusted yet:
+    /// not in `hooks` or `mcp` until [`AppConfig::trust_project`].
+    pub untrusted: Option<crate::trust::ProjectExtensions>,
+    /// Tool definitions sent with the built-in ones: MCP tools and the
+    /// `skill` tool, fixed for the conversation.
+    pub extra_tools: std::sync::Arc<Vec<serde_json::Value>>,
 }
 
 /// `[reviewer]` in config.toml.
@@ -166,6 +176,10 @@ impl Default for AppConfig {
             container: ContainerConfig::default(),
             config_error: None,
             config_warnings: Vec::new(),
+            hooks: Vec::new(),
+            mcp: Vec::new(),
+            untrusted: None,
+            extra_tools: Default::default(),
         }
     }
 }
@@ -192,12 +206,49 @@ struct FileConfig {
     reviewer: Option<ReviewerConfig>,
     #[serde(default)]
     container: ContainerConfig,
+    #[serde(default)]
+    hook: Vec<crate::hooks::Hook>,
+    #[serde(default)]
+    mcp: Vec<crate::mcp::McpServerConfig>,
 }
 
 const KNOWN_KEYS: &[&str] = &[
     "model", "rate_limit", "theme", "image", "context_window", "compact_buffer", "compact_keep_tokens",
-    "permission", "reviewer", "container",
+    "permission", "reviewer", "container", "hook", "mcp",
 ];
+
+/// `[[mcp]]` servers from `~/.syl/config.toml`, the one place a server may
+/// be set to run on the host.
+#[derive(Debug, Default, serde::Deserialize)]
+struct UserConfig {
+    #[serde(default)]
+    mcp: Vec<crate::mcp::McpServerConfig>,
+}
+
+fn load_user_mcp(errors: &mut Vec<String>) -> Vec<crate::mcp::McpServerConfig> {
+    let Some(home) = std::env::var_os("HOME") else { return Vec::new() };
+    let path = std::path::PathBuf::from(home).join(".syl/config.toml");
+    let Ok(text) = std::fs::read_to_string(&path) else { return Vec::new() };
+    let table = match toml::from_str::<toml::Table>(&text) {
+        Ok(t) => t,
+        Err(e) => {
+            errors.push(format!("{}: {e}", path.display()));
+            return Vec::new();
+        }
+    };
+    // Only the mcp tables matter here; the rest of the file is the user's.
+    let mut only_mcp = toml::Table::new();
+    if let Some(m) = table.get("mcp") {
+        only_mcp.insert("mcp".into(), m.clone());
+    }
+    match toml::Value::Table(only_mcp).try_into::<UserConfig>() {
+        Ok(u) => u.mcp,
+        Err(e) => {
+            errors.push(format!("{} [[mcp]]: {e}", path.display()));
+            Vec::new()
+        }
+    }
+}
 
 /// Load the TOML config file. Missing → defaults. Unparseable → defaults
 /// and the error, which the caller must surface. Unknown top-level keys
@@ -401,6 +452,29 @@ pub fn parse_cli_args(args: &[&str]) -> CliArgs {
 
 /// Build an `AppConfig` from CLI args, environment, and the config file.
 /// Priority: CLI flag > env var > config file > default.
+impl AppConfig {
+    /// Trust the project's held-back hooks and MCP servers: remember it, and
+    /// put them in effect.
+    pub fn trust_project(&mut self) -> anyhow::Result<()> {
+        if let Some(ext) = self.untrusted.take() {
+            let saved = crate::trust::trust(&ext);
+            self.hooks = ext.hooks.clone();
+            self.mcp.extend(ext.mcp.clone());
+            saved?;
+        }
+        Ok(())
+    }
+
+    /// The notice for hooks and servers that are held back.
+    pub fn untrusted_notice(&self) -> Option<String> {
+        let ext = self.untrusted.as_ref()?;
+        Some(format!(
+            "This project's .syl/config.toml has hooks or MCP servers that aren't trusted yet, so they don't run:\n  {}\nRun `syl` in this project and answer yes to trust them.",
+            ext.describe().join("\n  ")
+        ))
+    }
+}
+
 pub fn build_config(cli: &CliArgs, syl_dir: &Path) -> AppConfig {
     let toml_path = syl_dir.join("config.toml");
     let (file, config_error, config_warnings) = load_toml_config(&toml_path);
@@ -465,6 +539,61 @@ pub fn build_config(cli: &CliArgs, syl_dir: &Path) -> AppConfig {
         cfg.compact_keep_tokens = v;
     }
     cfg.permissions = file.permission;
+    let mut user_errors = Vec::new();
+    let mut mcp: Vec<crate::mcp::McpServerConfig> = Vec::new();
+    for server in load_user_mcp(&mut user_errors) {
+        if mcp.iter().any(|s| s.name == server.name) {
+            user_errors.push(format!("MCP server {} is defined twice in ~/.syl/config.toml; the first is used", server.name));
+        } else {
+            mcp.push(server);
+        }
+    }
+    cfg.config_warnings.extend(user_errors);
+    // Run in the home directory, the project's config *is* ~/.syl/config.toml.
+    let is_home = std::env::var_os("HOME").is_some_and(|h| {
+        let user = std::path::PathBuf::from(h).join(".syl/config.toml");
+        std::fs::canonicalize(&user).ok().is_some_and(|u| std::fs::canonicalize(&toml_path).ok() == Some(u))
+    });
+    let project_mcp = if is_home { Vec::new() } else { file.mcp };
+    let mut kept_mcp: Vec<crate::mcp::McpServerConfig> = Vec::new();
+    let mut seen_in_project: Vec<String> = Vec::new();
+    for server in project_mcp {
+        if seen_in_project.contains(&server.name) {
+            cfg.config_warnings.push(format!("MCP server {} is defined twice in .syl/config.toml; the first is used", server.name));
+            continue;
+        }
+        seen_in_project.push(server.name.clone());
+        if server.url.is_some() {
+            // Syl, on the host, would make the requests: a project could
+            // point it at your localhost or a cloud metadata address.
+            cfg.config_warnings.push(format!(
+                "MCP server {} has a url; only ~/.syl/config.toml (or your editor) may add a remote server, \
+                 since Syl makes those requests from your machine. It is left out.",
+                server.name
+            ));
+        } else if server.host {
+            cfg.config_warnings.push(format!(
+                "MCP server {} asks to run on the host; only ~/.syl/config.toml may do that (a project's \
+                 config comes with the project). It is left out.",
+                server.name
+            ));
+        } else if mcp.iter().any(|s| s.name == server.name) {
+            cfg.config_warnings.push(format!("MCP server {} is defined twice; the one in ~/.syl/config.toml is used", server.name));
+        } else {
+            kept_mcp.push(server);
+        }
+    }
+    cfg.mcp = mcp;
+    // In the home directory the file is the user's own; elsewhere the
+    // project's hooks and servers wait to be trusted.
+    let project_dir = syl_dir.parent().unwrap_or(syl_dir);
+    let ext = crate::trust::ProjectExtensions::new(project_dir, file.hook, kept_mcp);
+    if is_home || ext.is_empty() || crate::trust::is_trusted(&ext) {
+        cfg.hooks = ext.hooks;
+        cfg.mcp.extend(ext.mcp);
+    } else {
+        cfg.untrusted = Some(ext);
+    }
     if cfg.config_error.is_some() {
         // The rules that were meant to apply are unknown: ask before every
         // tool call until the file is fixed, rather than allow everything.

@@ -90,7 +90,11 @@ fn build_payload(
         "messages": messages,
     });
     if config.tools {
-        body["tools"] = syl_tools();
+        let mut tools = syl_tools();
+        if let Some(list) = tools.as_array_mut() {
+            list.extend(config.extra_tools.iter().cloned());
+        }
+        body["tools"] = tools;
     }
 
     if let Some(thinking) = thinking_param(config) {
@@ -439,7 +443,7 @@ pub fn syl_tools() -> serde_json::Value {
                 "type": "object",
                 "properties": {
                     "name":    {"type": "string", "description": "Workflow name in kebab-case (e.g. 'ship', 'deploy-staging'). Must be unique."},
-                    "content": {"type": "string", "description": "Workflow content in markdown. Format: a `# Title` heading, a description line, then steps as list items like `- Label: \\`command\\``. Example:\n# Ship\nTest and push.\n\n- Run tests: `bb test`\n- Push: `git push`"}
+                    "content": {"type": "string", "description": "Workflow (recipe) content in markdown: a `# Title` heading, a description line, then steps as list items. A command step is `- Label: \\`command\\`` (append `(retry N)` to retry a failing command); an ask step is `- Label: ask: a prompt for Syl`, run as a turn. Optional front matter `---\\nparams: version, branch\\n---` declares parameters, used as {{version}} in steps and given as `/workflow name version=1.2`. Example:\n# Ship\nTest and push.\n\n- Run tests: `cargo test` (retry 1)\n- Push: `git push`"}
                 },
                 "required": ["name", "content"]
             }

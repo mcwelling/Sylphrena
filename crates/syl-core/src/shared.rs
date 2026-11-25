@@ -33,6 +33,10 @@ pub struct SharedState {
     /// models) reject or drop thinking blocks once `system` changes under
     /// them. Also keeps the prompt cache warm.
     pub system_prompt: Mutex<Option<Vec<SystemBlock>>>,
+
+    /// Tool definitions sent besides the built-in ones, frozen with the
+    /// system prompt (MCP tools, the `skill` tool).
+    pub extra_tools: Mutex<std::sync::Arc<Vec<serde_json::Value>>>,
 }
 
 impl SharedState {
@@ -44,6 +48,7 @@ impl SharedState {
             current_model: Mutex::new(String::new()),
             available_models: Mutex::new(crate::api::models::static_fallback()),
             system_prompt: Mutex::new(None),
+            extra_tools: Mutex::new(Default::default()),
         })
     }
 }

@@ -85,6 +85,23 @@ memory = "4g"
 cpus = "2"
 # network = "none"
 
+# MCP servers (optional; tools appear as <name>__<tool>). Stdio servers run in
+# the container. `host = true` and remote `url` servers are only honoured in
+# ~/.syl/config.toml, since a project's config comes with the project. A
+# project's hooks and servers run only once you trust them (Syl asks).
+[[mcp]]
+name = "github"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
+env = { GITHUB_TOKEN = "..." }
+
+# Hooks (optional; run in the container with the event as JSON on stdin;
+# a failing pre_tool hook blocks the call)
+[[hook]]
+event = "pre_tool"
+tool = "run_bash"
+command = "./scripts/check-command.sh"
+
 # Context compaction (optional)
 context_window      = 1000000  # override the model's window, in tokens
 compact_buffer      = 0.15     # compact when within 15% of the window
@@ -141,6 +158,10 @@ In the terminal, your messages sit on the right and Syl's replies on the left, a
 **Project instructions:** `AGENTS.md` (or `CLAUDE.md` where there is no `AGENTS.md`) in the project and every directory above it is loaded into the system prompt when a conversation starts; the project's own file comes last.
 
 **Images:** name an image in a prompt (`@screenshot.png`, or drag a file into the terminal) and it is sent with the prompt. PNG, JPEG, GIF and WebP, up to 3.75 MB each and 15 MB per prompt.
+
+**Skills and commands:** `SKILL.md` skills in `.syl/skills/`, `.agents/skills/` or `~/.syl/skills/` are listed to Syl, who loads one when a task calls for it (`/skill:name` loads one yourself). Markdown files in `.syl/commands/` (or `~/.syl/commands/`) become slash commands: `/review error handling` sends `review.md` with `$ARGUMENTS` filled in.
+
+**Recipes:** workflows can take parameters (`params: version` front matter, `{{version}}` in steps), retry a command (`(retry 2)`), and hand a step to Syl (`- Changelog: ask: update CHANGELOG.md for {{version}}`). Run one with `/workflow release 1.4.0` (quote a value with spaces: `message="fix the build"`). Ctrl+C stops a running step.
 
 **Steering:** while Syl works, type on the bottom line and press Enter. The message reaches the model after the tool calls running now, together with their results. If the turn ends first, it becomes the next prompt. Ctrl+C cancels the turn; at the prompt it clears the line (Ctrl+D or `/exit` quits).
 

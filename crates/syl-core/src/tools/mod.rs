@@ -23,6 +23,23 @@ pub struct ToolContext<'a> {
     pub workflow_dir: &'a Path,
     /// Where `run_bash` saves output too long to show in full.
     pub spill: Option<&'a SpillDir>,
+    /// The project on the host (for skills).
+    pub project_dir: &'a Path,
+    /// MCP servers' tools.
+    pub mcp: Option<&'a crate::mcp::McpHub>,
+}
+
+/// The `skill` tool's definition, offered when there are skills.
+pub fn skill_tool() -> serde_json::Value {
+    serde_json::json!({
+        "name": "skill",
+        "description": "Load a skill's instructions by name (skills are listed in the system prompt under SKILLS). Do this before a task a skill covers, then follow it.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"name": {"type": "string", "description": "The skill's name."}},
+            "required": ["name"]
+        }
+    })
 }
 
 /// Tools that only read: a run of these in one turn is executed
@@ -62,6 +79,13 @@ pub async fn execute(
             dispatch::dispatch_agent(input, ctx.config, ctx.model, ctx.container, cancel).await
         }
         "show_image" => image::show_image(input, ctx.container),
-        other => (format!("[Tool error: unknown tool `{other}`]"), true),
+        "skill" => crate::commands::load_skill(ctx.project_dir, &str_field("name")),
+        other => match ctx.mcp.filter(|m| m.has(other)) {
+            Some(mcp) => {
+                let (out, is_error) = mcp.call(other, input, &cancel).await;
+                (crate::util::process_tool_output_spilled(&out, ctx.spill, call_id), is_error)
+            }
+            None => (format!("[Tool error: unknown tool `{other}`]"), true),
+        },
     }
 }

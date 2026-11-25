@@ -112,6 +112,15 @@ impl Policy {
         &self.rules
     }
 
+    /// Also deny these tools outright (plan mode's MCP tools that don't say
+    /// they only read). Added last, so they win.
+    pub fn deny_tools(mut self, tools: &[String]) -> Policy {
+        for t in tools {
+            self.rules.push(Rule { tool: t.clone(), pattern: any(), action: Action::Deny });
+        }
+        self
+    }
+
     /// These rules plus the ones `mode` adds, which come last and so win.
     pub fn with_mode(&self, mode: Mode) -> Policy {
         let mut rules = self.rules.clone();
@@ -217,8 +226,9 @@ pub fn subjects(tool: &str, input: &serde_json::Value) -> Vec<String> {
         }
         "dispatch_agent" => vec![s("source")],
         "memory_read" | "memory_write" => vec![s("key")],
-        "workflow_write" | "workflow_delete" => vec![s("name")],
-        _ => vec![String::new()],
+        "workflow_write" | "workflow_delete" | "skill" => vec![s("name")],
+        // MCP tools: their arguments, as compact JSON.
+        _ => vec![if input.is_null() { String::new() } else { input.to_string() }],
     }
 }
 

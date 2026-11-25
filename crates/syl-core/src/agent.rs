@@ -283,6 +283,11 @@ async fn run(agent: Agent, mut commands: mpsc::UnboundedReceiver<AgentCommand>, 
     let mut deferred: VecDeque<AgentCommand> = VecDeque::new();
     let mut mode = Mode::Build;
     let pending: Pending = Default::default();
+    // MCP servers start with the first turn and serve every session after.
+    let mcp: tokio::sync::OnceCell<Arc<crate::mcp::McpHub>> = tokio::sync::OnceCell::new();
+    if run_session_start_hooks(&agent, &session, &events, mode, &mut commands, &mut deferred).await {
+        return;
+    }
     loop {
         let cmd = match deferred.pop_front() {
             Some(c) => c,
@@ -313,6 +318,9 @@ async fn run(agent: Agent, mut commands: mpsc::UnboundedReceiver<AgentCommand>, 
             AgentCommand::NewSession => {
                 session = SessionLog::create(dir, cwd);
                 switch_to(&agent, &session, &mut ctx, &events);
+                if run_session_start_hooks(&agent, &session, &events, mode, &mut commands, &mut deferred).await {
+                    break;
+                }
                 continue;
             }
             AgentCommand::LoadSession(id) if id == session.id() => {
@@ -325,6 +333,9 @@ async fn run(agent: Agent, mut commands: mpsc::UnboundedReceiver<AgentCommand>, 
                     Ok(s) => {
                         session = s;
                         switch_to(&agent, &session, &mut ctx, &events);
+                        if run_session_start_hooks(&agent, &session, &events, mode, &mut commands, &mut deferred).await {
+                            break;
+                        }
                     }
                     Err(e) => emit(AgentEvent::Error { message: format!("could not load session {id}: {e}") }),
                 }
@@ -335,6 +346,9 @@ async fn run(agent: Agent, mut commands: mpsc::UnboundedReceiver<AgentCommand>, 
                     Ok(s) => {
                         session = s;
                         switch_to(&agent, &session, &mut ctx, &events);
+                        if run_session_start_hooks(&agent, &session, &events, mode, &mut commands, &mut deferred).await {
+                            break;
+                        }
                     }
                     Err(e) => emit(AgentEvent::Error { message: format!("could not fork: {e}") }),
                 }
@@ -347,12 +361,16 @@ async fn run(agent: Agent, mut commands: mpsc::UnboundedReceiver<AgentCommand>, 
             }
             AgentCommand::Steer(p) => {
                 emit(AgentEvent::SteerQueued { text: p.clone(), count: 1 });
-                Message::user_text(p)
+                Message::user_text(crate::commands::expand(&agent.paths.project_dir, &p).unwrap_or(p))
             }
-            AgentCommand::Prompt(p) => Message::user_text(p),
+            // `/name args` runs a custom command or a skill.
+            AgentCommand::Prompt(p) => {
+                Message::user_text(crate::commands::expand(&agent.paths.project_dir, &p).unwrap_or(p))
+            }
             AgentCommand::PromptWithImages { text, images } => {
                 let mut blocks: Vec<ContentBlock> =
                     images.into_iter().map(|source| ContentBlock::Image { source }).collect();
+                let text = crate::commands::expand(&agent.paths.project_dir, &text).unwrap_or(text);
                 // The API rejects empty text blocks: an image alone is fine.
                 if !text.trim().is_empty() {
                     blocks.push(ContentBlock::Text { text, cache_control: None });
@@ -369,7 +387,7 @@ async fn run(agent: Agent, mut commands: mpsc::UnboundedReceiver<AgentCommand>, 
         let mut shutting_down = false;
         let mut dropped_prompts = 0usize;
         let reason = {
-            let turn = run_turn(&agent, &mut session, &mut ctx, &events, &steer, &pending, mode, cancel.clone());
+            let turn = run_turn(&agent, &mut session, &mut ctx, &events, &steer, &pending, mode, &mcp, cancel.clone());
             tokio::pin!(turn);
             loop {
                 tokio::select! {
@@ -396,13 +414,20 @@ async fn run(agent: Agent, mut commands: mpsc::UnboundedReceiver<AgentCommand>, 
                                 let _ = tx.send(answer);
                             }
                         }
-                        Some(AgentCommand::Steer(text)) => steer.lock().unwrap().push(text),
+                        Some(AgentCommand::Steer(text)) => steer.lock().unwrap().push(crate::commands::expand(&agent.paths.project_dir, &text).unwrap_or(text)),
                         // Prompts and session commands wait for the turn.
                         Some(other) => deferred.push_back(other),
                     },
                 }
             }
         };
+        // turn_end hooks are part of the turn: Cancel stops them, and a
+        // client waiting for TurnEnded (headless) waits for them too.
+        if !shutting_down {
+            let payload = serde_json::json!({ "event": "turn_end", "session_id": session.id(), "reason": reason });
+            let ev = crate::hooks::HookEvent::TurnEnd;
+            shutting_down |= run_event_hooks(&agent, &events, mode, ev, "turn_end", payload, &mut commands, &mut deferred).await;
+        }
         let undelivered = std::mem::take(&mut *steer.lock().unwrap());
         emit(AgentEvent::TurnEnded { reason: reason.clone() });
         // Each prompt the cancel dropped still gets its turn's start and end.
@@ -436,6 +461,7 @@ async fn run(agent: Agent, mut commands: mpsc::UnboundedReceiver<AgentCommand>, 
 /// Make `session` the one the shared state shows.
 fn adopt(agent: &Agent, session: &SessionLog) {
     *agent.state.messages.lock().unwrap() = session.messages().to_vec();
+    *agent.state.extra_tools.lock().unwrap() = Arc::new(session.history().tools.clone().unwrap_or_default());
     *agent.state.system_prompt.lock().unwrap() = session
         .history()
         .system
@@ -487,6 +513,7 @@ fn system_prompt(
     session: &mut SessionLog,
     ctx: &mut ContextState,
     events: &Events,
+    mcp: &crate::mcp::McpHub,
 ) -> Vec<SystemBlock> {
     // Fresh until the first assistant turn is logged (compaction can leave
     // a history with none, but the conversation isn't new).
@@ -497,7 +524,19 @@ fn system_prompt(
     if let (false, Some(blocks)) = (fresh_conversation, current) {
         return blocks;
     }
-    let workspace = gather_workspace_context(&agent.paths.project_dir);
+    // Skills and MCP tools are fixed with the prompt, for the conversation.
+    let skills = crate::commands::list_skills(&agent.paths.project_dir);
+    let mut workspace = gather_workspace_context(&agent.paths.project_dir);
+    workspace.push_str(&crate::commands::skills_prompt(&skills).unwrap_or_default());
+    workspace.push_str(&crate::mcp::instructions_prompt(mcp).unwrap_or_default());
+    let mut tools = mcp.definitions.clone();
+    if !skills.is_empty() {
+        tools.push(tools::skill_tool());
+    }
+    if session.history().tools.as_ref().map_or(!tools.is_empty(), |t| *t != tools) {
+        record(agent, session, ctx, events, EntryKind::ToolSet { tools: tools.clone() });
+    }
+    *agent.state.extra_tools.lock().unwrap() = Arc::new(tools);
     let instructions = crate::system_prompt::load_project_instructions(&agent.paths.project_dir);
     let blocks: Vec<SystemBlock> = build_system_blocks(&workspace, &agent.paths.memory_dir, instructions.as_deref())
         .into_iter()
@@ -539,7 +578,7 @@ fn context_window(agent: &Agent, config: &AppConfig, ctx: &ContextState) -> u64 
 
 /// Tokens the next request will send: the last measured request plus an
 /// estimate of what was added since, or an estimate of everything.
-fn context_estimate(ctx: &ContextState, messages: &[Message], system: &[SystemBlock]) -> u64 {
+fn context_estimate(ctx: &ContextState, messages: &[Message], system: &[SystemBlock], extra_tools: &[serde_json::Value]) -> u64 {
     match ctx.measured {
         Some((n, tokens)) if n <= messages.len() => {
             tokens + messages[n..].iter().map(compaction::estimate_tokens).sum::<u64>()
@@ -548,6 +587,7 @@ fn context_estimate(ctx: &ContextState, messages: &[Message], system: &[SystemBl
             messages.iter().map(compaction::estimate_tokens).sum::<u64>()
                 + system.iter().map(|b| compaction::estimate_text_tokens(&b.text)).sum::<u64>()
                 + compaction::estimate_text_tokens(&syl_tools().to_string())
+                + extra_tools.iter().map(|t| compaction::estimate_text_tokens(&t.to_string())).sum::<u64>()
         }
     }
 }
@@ -611,6 +651,7 @@ async fn run_turn(
     steer: &std::sync::Mutex<Vec<String>>,
     pending: &Pending,
     mode: Mode,
+    mcp_cell: &tokio::sync::OnceCell<Arc<crate::mcp::McpHub>>,
     cancel: CancellationToken,
 ) -> TurnEnd {
     let emit = |e: AgentEvent| {
@@ -618,7 +659,7 @@ async fn run_turn(
     };
 
     // The model is fixed for the whole turn.
-    let config = {
+    let mut config = {
         let mut c = agent.config.clone();
         let model = agent.state.current_model.lock().unwrap().clone();
         if !model.is_empty() {
@@ -626,6 +667,33 @@ async fn run_turn(
         }
         c
     };
+    // Started on the first turn. Cancelling leaves it unstarted, so the next
+    // turn tries again.
+    let started = mcp_cell
+        .get_or_try_init(|| async {
+            if agent.config.mcp.is_empty() {
+                return Ok(Arc::new(crate::mcp::McpHub::default()));
+            }
+            emit(AgentEvent::Notice { message: format!("[Syl] Starting {} MCP server(s)...", agent.config.mcp.len()) });
+            let http = reqwest::Client::new();
+            let start = crate::mcp::McpHub::start(
+                &agent.config.mcp,
+                &agent.container,
+                &agent.paths.project_dir,
+                &http,
+                std::time::Duration::from_secs(60),
+            );
+            let (hub, problems) = tokio::select! {
+                r = start => r,
+                _ = cancel.cancelled() => return Err(()),
+            };
+            for p in problems {
+                emit(AgentEvent::Notice { message: format!("[Syl] {p}") });
+            }
+            Ok(Arc::new(hub))
+        })
+        .await;
+    let Ok(mcp) = started.cloned() else { return TurnEnd::Cancelled };
     if session.history().model.as_deref() != Some(config.model.as_str()) {
         record(agent, session, ctx, events, EntryKind::ModelChange { model: config.model.clone() });
     }
@@ -656,7 +724,8 @@ async fn run_turn(
     let mut overflow: Option<String> = None;
     loop {
         emit(AgentEvent::RequestStarted);
-        let system = system_prompt(agent, session, ctx, events);
+        let system = system_prompt(agent, session, ctx, events, &mcp);
+        config.extra_tools = agent.state.extra_tools.lock().unwrap().clone();
 
         // Compact before every model call, not just between user messages:
         // a long tool chain inside one turn can otherwise grow without bound.
@@ -664,7 +733,7 @@ async fn run_turn(
         // thinking from the turn in progress, so it waits until the context
         // is twice as close to full.
         let window = context_window(agent, &config, ctx);
-        let estimate = context_estimate(ctx, session.messages(), &system)
+        let estimate = context_estimate(ctx, session.messages(), &system, &config.extra_tools)
             + crate::api::client::request_max_tokens(&config);
         let mid_chain = session.messages().last().is_some_and(|m| {
             matches!(&m.content, crate::api::types::MessageContent::Blocks(b)
@@ -813,7 +882,10 @@ async fn run_turn(
             memory_dir: &agent.paths.memory_dir,
             workflow_dir: &agent.paths.workflow_dir,
             spill: spill.as_ref(),
+            project_dir: &agent.paths.project_dir,
+            mcp: Some(&mcp),
         };
+        let plan_denied = if mode == Mode::Plan { mcp.mutating() } else { Vec::new() };
         // Consecutive read-only calls run together; anything else runs alone.
         let mut i = 0;
         while i < calls.len() {
@@ -838,7 +910,7 @@ async fn run_turn(
             // Permissions first, one call at a time (asking is sequential).
             let mut results: Vec<Option<(String, bool)>> = vec![None; group.len()];
             for (k, (id, name, input)) in group.iter().enumerate() {
-                let gate = Gate { agent, config: &config, pending, mode, cancel: &cancel };
+                let gate = Gate { agent, config: &config, pending, mode, cancel: &cancel, plan_denied: &plan_denied };
                 if let Err(denied) = gate.authorize(session, ctx, events, &mut approvals, id, name, input).await {
                     results[k] = Some((denied, true));
                 }
@@ -847,7 +919,9 @@ async fn run_turn(
             let will_change = group
                 .iter()
                 .zip(&results)
-                .any(|((_, name, _), r)| r.is_none() && CHANGES_FILES.contains(&name.as_str()));
+                .any(|((_, name, _), r)| {
+                    r.is_none() && may_write(agent, &mcp, name)
+                });
             if will_change && !checkpointed && agent.paths.checkpoints && !cancel.is_cancelled() {
                 checkpointed = true;
                 let label = crate::session::user_prompts(session.entries())
@@ -865,7 +939,7 @@ async fn run_turn(
             let runnable: Vec<usize> = (0..group.len()).filter(|&k| results[k].is_none()).collect();
             let outputs = futures_util::future::join_all(runnable.iter().map(|&k| {
                 let (id, name, input) = &group[k];
-                execute_call(agent, &tool_ctx, mode, id, name, input, cancel.clone())
+                execute_call(agent, &tool_ctx, mode, session.id(), id, name, input, cancel.clone())
             }))
             .await;
             for (k, (output, is_error, put_back)) in runnable.into_iter().zip(outputs) {
@@ -907,6 +981,46 @@ async fn run_turn(
 
         if cancel.is_cancelled() {
             return TurnEnd::Cancelled;
+        }
+    }
+}
+
+/// `session_start` hooks; a failure is a notice.
+/// Returns true when a Shutdown came while they ran.
+async fn run_session_start_hooks(
+    agent: &Agent,
+    session: &SessionLog,
+    events: &Events,
+    mode: Mode,
+    commands: &mut mpsc::UnboundedReceiver<AgentCommand>,
+    deferred: &mut VecDeque<AgentCommand>,
+) -> bool {
+    let payload = serde_json::json!({ "event": "session_start", "session_id": session.id(), "resumed": session.info().resumed });
+    let ev = crate::hooks::HookEvent::SessionStart;
+    run_event_hooks(agent, events, mode, ev, "session_start", payload, commands, deferred).await
+}
+
+/// Await `fut` while taking commands: Cancel and Shutdown cancel it (the
+/// bool says a Shutdown came), anything else waits its turn.
+async fn listening<F: std::future::Future>(
+    fut: F,
+    commands: &mut mpsc::UnboundedReceiver<AgentCommand>,
+    deferred: &mut VecDeque<AgentCommand>,
+    cancel: &CancellationToken,
+) -> (F::Output, bool) {
+    tokio::pin!(fut);
+    let mut shutdown = false;
+    loop {
+        tokio::select! {
+            out = &mut fut => return (out, shutdown),
+            cmd = commands.recv(), if !shutdown => match cmd {
+                Some(AgentCommand::Shutdown) | None => {
+                    shutdown = true;
+                    cancel.cancel();
+                }
+                Some(AgentCommand::Cancel) => cancel.cancel(),
+                Some(other) => deferred.push_back(other),
+            },
         }
     }
 }
@@ -1027,52 +1141,116 @@ async fn restore(agent: &Agent, session: &mut SessionLog, ctx: &mut ContextState
     }
 }
 
-/// Run one tool call. In plan mode `run_bash` runs between two snapshots,
-/// and anything it changed in the workspace is put back; it is refused
-/// when no snapshot can be taken, since nothing could be put back. Returns
-/// the output, and for a put-back the checkpoint and the safety snapshot.
+/// Whether a call may change files: a file tool, an MCP tool that doesn't
+/// say it only reads, or any call a tool hook runs around.
+fn may_write(agent: &Agent, mcp: &crate::mcp::McpHub, name: &str) -> bool {
+    CHANGES_FILES.contains(&name)
+        || (mcp.has(name) && !mcp.is_read_only(name))
+        || has_tool_hooks(agent, name)
+}
+
+fn has_tool_hooks(agent: &Agent, name: &str) -> bool {
+    use crate::hooks::{matching, HookEvent};
+    !matching(&agent.config.hooks, HookEvent::PreTool, Some(name)).is_empty()
+        || !matching(&agent.config.hooks, HookEvent::PostTool, Some(name)).is_empty()
+}
+
+/// Run one tool call, with its hooks. In plan mode a call that could write
+/// (`run_bash`, any MCP tool, any call with hooks) runs between two
+/// snapshots, and anything it or its hooks changed in the workspace is put
+/// back; it is refused when no snapshot can be taken, since nothing could
+/// be put back. Returns the output, and for a put-back the checkpoint and
+/// the safety snapshot.
+#[allow(clippy::too_many_arguments)]
 async fn execute_call(
     agent: &Agent,
     tool_ctx: &ToolContext<'_>,
     mode: Mode,
+    session_id: &str,
     id: &str,
     name: &str,
     input: &serde_json::Value,
     cancel: CancellationToken,
 ) -> (String, bool, Option<(String, String)>) {
     let lock = project_lock(&agent.paths.project_dir);
-    if !(mode == Mode::Plan && name == "run_bash") {
-        // Calls that change files wait while a plan-mode command (in another
-        // session on this project) is between its snapshot and its put-back.
-        let _shared = if CHANGES_FILES.contains(&name) { Some(lock.read().await) } else { None };
-        let (o, e) = tools::execute(name, id, input, tool_ctx, cancel).await;
+    let is_mcp = tool_ctx.mcp.is_some_and(|m| m.has(name));
+    let hooked = has_tool_hooks(agent, name);
+    if !(mode == Mode::Plan && (name == "run_bash" || is_mcp || hooked)) {
+        // Calls that may change files wait while a plan-mode command (in
+        // another session on this project) is between its snapshot and its
+        // put-back.
+        let writes = CHANGES_FILES.contains(&name) || is_mcp || hooked;
+        let _shared = if writes { Some(lock.read().await) } else { None };
+        let (o, e) = run_hooked(agent, tool_ctx, session_id, id, name, input, &cancel).await;
         return (o, e, None);
     }
-    // Exclusive from the snapshot to the put-back, so the put-back can only
-    // undo what this command did.
-    let _exclusive = lock.write().await;
-    let refuse = |why: String| {
-        (
-            format!("[Plan mode: run_bash is unavailable because the workspace can't be snapshotted ({why}), so changes couldn't be put back.]"),
-            true,
-            None,
-        )
+    let run = run_hooked(agent, tool_ctx, session_id, id, name, input, &cancel);
+    let ((output, is_error), put_back) = match in_snapshot(agent, run).await {
+        Ok(r) => r,
+        Err(why) => {
+            return (
+                format!("[Plan mode: {name} is unavailable because the workspace can't be snapshotted ({why}), so changes couldn't be put back.]"),
+                true,
+                None,
+            )
+        }
     };
+    if let Some(e) = put_back.error {
+        return (format!("{output}\n\n[Plan mode: could not check for file changes: {e}]"), true, None);
+    }
+    let mut notes = Vec::new();
+    if !put_back.changed.is_empty() {
+        notes.push(format!(
+            "[Plan mode: this call changed files in the workspace, so they were put back ({}). In plan \
+             mode, investigate and propose changes instead of making them.]",
+            put_back.changed.join(", ")
+        ));
+    }
+    if !put_back.lost.is_empty() {
+        notes.push(format!("[Plan mode: these ignored paths were removed and can't be put back: {}.]", put_back.lost.join(", ")));
+    }
+    if notes.is_empty() {
+        (output, is_error, None)
+    } else {
+        (format!("{output}\n\n{}", notes.join("\n")), true, put_back.safety)
+    }
+}
+
+/// What a plan-mode put-back did.
+#[derive(Default)]
+struct PutBack {
+    /// Paths that were changed and put back (at most 10).
+    changed: Vec<String>,
+    /// Ignored paths that were removed and can't be put back (at most 10).
+    lost: Vec<String>,
+    /// The snapshot before, and the safety snapshot of what was undone.
+    safety: Option<(String, String)>,
+    /// The check itself failed.
+    error: Option<String>,
+}
+
+/// Run `work` between two snapshots, holding the project lock exclusively
+/// (so the put-back can only undo what `work` did), and put back whatever
+/// it changed in the workspace. Err (and `work` not run) when no snapshot
+/// can be taken.
+async fn in_snapshot<F: std::future::Future>(agent: &Agent, work: F) -> Result<(F::Output, PutBack), String> {
+    let lock = project_lock(&agent.paths.project_dir);
+    let _exclusive = lock.write().await;
     if !agent.paths.checkpoints {
-        return refuse("checkpoints are off".to_string());
+        return Err("checkpoints are off".to_string());
     }
     let cp = Checkpoints::for_project(&agent.paths.project_dir);
     let snap = cp.clone();
     let before = tokio::task::spawn_blocking(move || -> anyhow::Result<(String, Vec<String>)> {
-        Ok((snap.snapshot("plan mode: before run_bash")?, snap.ignored_paths().unwrap_or_default()))
+        Ok((snap.snapshot("plan mode: before a call")?, snap.ignored_paths().unwrap_or_default()))
     })
     .await;
     let (before, ignored_before) = match before {
         Ok(Ok(b)) => b,
-        Ok(Err(e)) => return refuse(e.to_string()),
-        Err(e) => return refuse(e.to_string()),
+        Ok(Err(e)) => return Err(e.to_string()),
+        Err(e) => return Err(e.to_string()),
     };
-    let (output, is_error) = tools::execute(name, id, input, tool_ctx, cancel).await;
+    let out = work.await;
     let check = before.clone();
     let put_back = tokio::task::spawn_blocking(move || -> anyhow::Result<(Vec<crate::checkpoint::Change>, Option<String>, Vec<String>)> {
         let changes = cp.preview(&check)?;
@@ -1082,36 +1260,119 @@ async fn execute_call(
         Ok((changes, safety, lost))
     })
     .await;
-    match put_back {
-        Ok(Ok((changes, safety, lost))) => {
-            let mut notes = Vec::new();
-            if !changes.is_empty() {
-                let list: Vec<&str> = changes.iter().take(10).map(|c| c.path.as_str()).collect();
-                notes.push(format!(
-                    "[Plan mode: this command changed files in the workspace, so they were put back ({}). In plan \
-                     mode, investigate and propose changes instead of making them.]",
-                    list.join(", ")
-                ));
+    let result = match put_back {
+        Ok(Ok((changes, safety, lost))) => PutBack {
+            changed: changes.iter().take(10).map(|c| c.path.clone()).collect(),
+            lost: lost.into_iter().take(10).collect(),
+            safety: safety.map(|s| (before, s)),
+            error: None,
+        },
+        Ok(Err(e)) => PutBack { error: Some(e.to_string()), ..Default::default() },
+        Err(e) => PutBack { error: Some(e.to_string()), ..Default::default() },
+    };
+    Ok((out, result))
+}
+
+/// Run the hooks for a session event (`session_start`, `turn_end`) while
+/// taking commands (see [`listening`]). In build mode they share the
+/// project lock like any write; in plan mode they run in a snapshot and
+/// what they changed is put back. Returns true when a Shutdown came.
+#[allow(clippy::too_many_arguments)]
+async fn run_event_hooks(
+    agent: &Agent,
+    events: &Events,
+    mode: Mode,
+    event: crate::hooks::HookEvent,
+    label: &str,
+    payload: serde_json::Value,
+    commands: &mut mpsc::UnboundedReceiver<AgentCommand>,
+    deferred: &mut VecDeque<AgentCommand>,
+) -> bool {
+    use crate::hooks::{run_all, HookOutcome};
+    if crate::hooks::matching(&agent.config.hooks, event, None).is_empty() {
+        return false;
+    }
+    let notice = |m: String| {
+        let _ = events.send(AgentEvent::Notice { message: m });
+    };
+    let cancel = CancellationToken::new();
+    let hooks = run_all(&agent.container, &agent.config.hooks, event, None, &payload, &cancel);
+    let (outcome, shutdown) = if mode == Mode::Plan {
+        let (result, shutdown) = listening(in_snapshot(agent, hooks), commands, deferred, &cancel).await;
+        match result {
+            Err(why) => {
+                notice(format!("[Syl] Plan mode: the {label} hooks didn't run, because the workspace can't be snapshotted ({why})."));
+                (HookOutcome::Ok, shutdown)
             }
-            if !lost.is_empty() {
-                notes.push(format!(
-                    "[Plan mode: these ignored paths were removed and can't be put back: {}.]",
-                    lost.iter().take(10).cloned().collect::<Vec<_>>().join(", ")
-                ));
-            }
-            if notes.is_empty() {
-                (output, is_error, None)
-            } else {
-                (format!("{output}\n\n{}", notes.join("\n")), true, safety.map(|s| (before, s)))
+            Ok((outcome, put_back)) => {
+                if let Some(e) = put_back.error {
+                    notice(format!("[Syl] Plan mode: could not check what the {label} hooks changed: {e}"));
+                } else if !put_back.changed.is_empty() {
+                    notice(format!(
+                        "[Syl] Plan mode: the {label} hooks changed files, so they were put back ({}).",
+                        put_back.changed.join(", ")
+                    ));
+                }
+                (outcome, shutdown)
             }
         }
-        Ok(Err(e)) => (format!("{output}\n\n[Plan mode: could not check for file changes: {e}]"), true, None),
-        Err(e) => (format!("{output}\n\n[Plan mode: could not check for file changes: {e}]"), true, None),
+    } else {
+        let lock = project_lock(&agent.paths.project_dir);
+        let shared = async {
+            let _shared = lock.read().await;
+            hooks.await
+        };
+        listening(shared, commands, deferred, &cancel).await
+    };
+    if let HookOutcome::Failed(why) = outcome {
+        if !cancel.is_cancelled() {
+            notice(format!("[Syl] {label} hook: {why}"));
+        }
     }
+    shutdown
+}
+
+/// The pre_tool hooks, the call, then the post_tool hooks.
+#[allow(clippy::too_many_arguments)]
+async fn run_hooked(
+    agent: &Agent,
+    tool_ctx: &ToolContext<'_>,
+    session_id: &str,
+    id: &str,
+    name: &str,
+    input: &serde_json::Value,
+    cancel: &CancellationToken,
+) -> (String, bool) {
+    use crate::hooks::{matching, run_all, HookEvent, HookOutcome};
+    let hooks = &agent.config.hooks;
+    if !matching(hooks, HookEvent::PreTool, Some(name)).is_empty() {
+        let payload = serde_json::json!({
+            "event": "pre_tool", "session_id": session_id, "tool": name, "tool_use_id": id, "input": input,
+        });
+        if let HookOutcome::Failed(why) = run_all(&agent.container, hooks, HookEvent::PreTool, Some(name), &payload, cancel).await {
+            if cancel.is_cancelled() {
+                return ("[Cancelled]".to_string(), true);
+            }
+            return (format!("[Blocked by a pre_tool hook: {why}]"), true);
+        }
+    }
+    let (output, is_error) = tools::execute(name, id, input, tool_ctx, cancel.clone()).await;
+    if !matching(hooks, HookEvent::PostTool, Some(name)).is_empty() && !cancel.is_cancelled() {
+        let payload = serde_json::json!({
+            "event": "post_tool", "session_id": session_id, "tool": name, "tool_use_id": id, "input": input,
+            "output": output, "is_error": is_error,
+        });
+        if let HookOutcome::Failed(why) = run_all(&agent.container, hooks, HookEvent::PostTool, Some(name), &payload, cancel).await {
+            return (format!("{output}\n\n[post_tool hook: {why}]"), is_error);
+        }
+    }
+    (output, is_error)
 }
 
 /// Decides whether a tool call may run.
 struct Gate<'a> {
+    /// In plan mode, MCP tools that don't say they only read.
+    plan_denied: &'a [String],
     agent: &'a Agent,
     config: &'a AppConfig,
     pending: &'a Pending,
@@ -1135,7 +1396,10 @@ impl Gate<'_> {
         if self.cancel.is_cancelled() {
             return Err("[Tool error: cancelled by user]".to_string());
         }
-        let policy = Policy::new(self.config.permissions.clone()).with_approvals(approvals.clone()).with_mode(self.mode);
+        let policy = Policy::new(self.config.permissions.clone())
+            .with_approvals(approvals.clone())
+            .with_mode(self.mode)
+            .deny_tools(self.plan_denied);
         let decision = policy.decide(name, input);
         // What the user is asked about: every part that needs it.
         let asked = decision.asks.join("  ·  ");
