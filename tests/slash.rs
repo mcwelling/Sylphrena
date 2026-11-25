@@ -54,6 +54,7 @@ fn build_ctx<'a>(
         model,
         timeout_ms,
         rate_limit,
+        api_limits: None,
         input_tokens,
         output_tokens,
         message_count,
@@ -119,20 +120,24 @@ async fn slash_status_output_contains_model() {
     let text = result.output.unwrap();
     assert!(text.contains("claude-opus-4-6"), "status should show model");
     assert!(text.contains("120"),             "status should show timeout");
-    assert!(text.contains("60000 tpm"),       "status should show rate limit");
+    assert!(text.contains("own cap 60000 tpm"), "status should show rate limit");
     assert!(text.contains("in:100"),          "status should show input tokens");
     assert!(text.contains("out:50"),          "status should show output tokens");
 }
 
 #[tokio::test]
-async fn slash_status_unlimited_rate() {
+async fn slash_status_without_a_cap_shows_the_api_limits() {
     let tmp = TempDir::new().unwrap();
     let (sp, wd, md, lp) = make_paths(&tmp);
     let cfg = AppConfig::default();
-    let ctx = build_ctx(&sp, &wd, &md, &lp, "claude-opus-4-6", 60_000, 0, 0, 0, 0, &cfg);
-    let result = handle_slash("/status", &ctx).await.unwrap();
-    let text = result.output.unwrap();
-    assert!(text.contains("unlimited"));
+    let mut ctx = build_ctx(&sp, &wd, &md, &lp, "claude-opus-4-6", 60_000, 0, 0, 0, 0, &cfg);
+    let text = handle_slash("/status", &ctx).await.unwrap().output.unwrap();
+    assert!(text.contains("API limits not seen yet") && !text.contains("own cap"), "{text}");
+    let far = syl_core::api::rate_limit::now_ms() + 3_600_000;
+    let bucket = |limit, remaining| syl_core::api::rate_limit::Bucket { limit, remaining, reset_ms: far, seen_ms: far };
+    ctx.api_limits = Some(syl_core::api::rate_limit::ApiLimits { input: Some(bucket(400_000, 100_000)), output: Some(bucket(80_000, 80_000)) });
+    let text = handle_slash("/status", &ctx).await.unwrap().output.unwrap();
+    assert!(text.contains("API in 400k/min (100k left), out 80k/min (80k left)"), "{text}");
 }
 
 #[tokio::test]

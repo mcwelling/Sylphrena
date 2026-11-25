@@ -326,10 +326,19 @@ fn draw_bars(tui: &TuiState, state: &SharedState, config: &AppConfig, model: &st
         None => (0.0, 0),
     };
 
-    let tokens_per_min = {
-        let mut calls = state.recent_calls.lock().unwrap();
-        syl_core::api::rate_limit::prune_old_calls(&mut calls);
-        syl_core::api::rate_limit::window_tokens(&calls) as f64
+    // How full the API's input-token bucket is (from its last response's
+    // headers), else Syl's own cap's window; hidden with neither.
+    let api_input = state.api_limits.lock().unwrap().and_then(|l| l.input);
+    let (tokens_per_min, tpm_limit) = match api_input {
+        Some(b) => {
+            let now = syl_core::api::rate_limit::now_ms();
+            ((b.limit - b.available(now)) as f64, b.limit as f64)
+        }
+        None => {
+            let mut calls = state.recent_calls.lock().unwrap();
+            syl_core::api::rate_limit::prune_old_calls(&mut calls);
+            (syl_core::api::rate_limit::window_tokens(&calls) as f64, config.rate_limit as f64)
+        }
     };
 
     let data = BarData {
@@ -337,7 +346,7 @@ fn draw_bars(tui: &TuiState, state: &SharedState, config: &AppConfig, model: &st
         input_tokens,
         output_tokens,
         tokens_per_min,
-        tpm_limit: config.rate_limit as f64,
+        tpm_limit,
         cost_usd,
         cpu_pct,
         mem_mb,
@@ -870,6 +879,7 @@ impl Repl<'_> {
                     model: &self.model,
                     timeout_ms: self.config.timeout_ms,
                     rate_limit: self.config.rate_limit,
+                    api_limits: *self.state.api_limits.lock().unwrap(),
                     input_tokens,
                     output_tokens,
                     message_count,

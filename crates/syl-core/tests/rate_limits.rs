@@ -1,0 +1,130 @@
+//! Rate limits: the API's headers and `retry-after` decide the waits.
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+use tokio_util::sync::CancellationToken;
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+use syl_core::api::client::{call_with_retry_shared, SystemBlock};
+use syl_core::api::types::Message;
+use syl_core::config::AppConfig;
+
+const SSE: &str = concat!(
+    "event: message_start\n",
+    "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+    "event: content_block_start\n",
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+    "event: content_block_delta\n",
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
+    "event: message_delta\n",
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+    "event: message_stop\n",
+    "data: {\"type\":\"message_stop\"}\n\n",
+);
+
+fn config(server: &MockServer) -> AppConfig {
+    AppConfig { api_url: format!("{}/v1/messages", server.uri()), api_key: "test-key".into(), ..AppConfig::default() }
+}
+
+fn rfc3339_in(ms: u64) -> String {
+    let t = syl_core::api::rate_limit::now_ms() + ms;
+    let s = syl_core::session::format_utc(t); // "YYYY-MM-DD HH:MM"
+    format!("{}T{}:{:02}.{:03}Z", &s[..10], &s[11..16], (t / 1000) % 60, t % 1000)
+}
+
+async fn call(server: &MockServer, state: &std::sync::Arc<syl_core::shared::SharedState>, notices: &Mutex<Vec<String>>) {
+    let cfg = config(server);
+    call_with_retry_shared(
+        &reqwest::Client::new(),
+        &cfg,
+        state,
+        &[Message::user_text("hi")],
+        &[SystemBlock::text("sys")],
+        CancellationToken::new(),
+        |n| notices.lock().unwrap().push(n.to_string()),
+        |_| {},
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn a_429_waits_as_long_as_retry_after_says() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "2").set_body_string(
+            r#"{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}"#,
+        ))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(SSE, "text/event-stream"))
+        .mount(&server)
+        .await;
+    let state = syl_core::shared::SharedState::new();
+    let notices = Mutex::new(Vec::new());
+    let started = Instant::now();
+    call(&server, &state, &notices).await;
+    assert!(started.elapsed() >= Duration::from_millis(1900), "{:?}", started.elapsed());
+    let notices = notices.into_inner().unwrap();
+    assert!(notices.iter().any(|n| n.contains("rate limit was reached; retrying in 2s")), "{notices:?}");
+}
+
+#[tokio::test]
+async fn a_nearly_empty_bucket_is_waited_for_and_only_as_long_as_it_needs() {
+    let server = MockServer::start().await;
+    // 60k a minute is 1 token a ms; nothing left, and the next request is
+    // assumed to need at least 1000: about a second.
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(SSE, "text/event-stream")
+                .insert_header("anthropic-ratelimit-input-tokens-limit", "60000")
+                .insert_header("anthropic-ratelimit-input-tokens-remaining", "0")
+                .insert_header("anthropic-ratelimit-input-tokens-reset", rfc3339_in(60_000).as_str()),
+        )
+        .mount(&server)
+        .await;
+    let state = syl_core::shared::SharedState::new();
+    let notices = Mutex::new(Vec::new());
+    call(&server, &state, &notices).await;
+    let limits = state.api_limits.lock().unwrap().expect("headers were read");
+    assert_eq!(limits.input.unwrap().limit, 60_000);
+    let started = Instant::now();
+    call(&server, &state, &notices).await;
+    let took = started.elapsed();
+    assert!(took >= Duration::from_millis(800) && took < Duration::from_secs(5), "{took:?}");
+    let notices = notices.into_inner().unwrap();
+    assert!(notices.iter().any(|n| n.contains("the API's per-minute token limit")), "{notices:?}");
+}
+
+#[tokio::test]
+async fn without_a_cap_or_low_headers_nothing_waits() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(SSE, "text/event-stream")
+                .insert_header("anthropic-ratelimit-input-tokens-limit", "400000")
+                .insert_header("anthropic-ratelimit-input-tokens-remaining", "390000")
+                .insert_header("anthropic-ratelimit-input-tokens-reset", rfc3339_in(2_000).as_str()),
+        )
+        .mount(&server)
+        .await;
+    let state = syl_core::shared::SharedState::new();
+    // Plenty of earlier traffic in the window: with no cap it doesn't matter.
+    syl_core::api::rate_limit::record_rate_call(&mut state.recent_calls.lock().unwrap(), 10_000_000);
+    let notices = Mutex::new(Vec::new());
+    let started = Instant::now();
+    for _ in 0..5 {
+        call(&server, &state, &notices).await;
+    }
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(notices.into_inner().unwrap().is_empty());
+}

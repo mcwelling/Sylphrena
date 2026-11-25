@@ -323,7 +323,7 @@ async fn cancel_during_retry_backoff_returns_promptly() {
     .await
     .unwrap_err();
     assert!(err.to_string().contains("cancelled"), "{err}");
-    // Full backoff would be 0.5 + 1 + 2 + 4 s.
+    // Full backoff would be 1 + 2 + 4 + 8 + 16 + 30 s.
     assert!(started.elapsed().as_secs() < 2, "took {:?}", started.elapsed());
 }
 

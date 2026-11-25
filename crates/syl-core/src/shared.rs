@@ -16,8 +16,15 @@ pub struct SharedState {
     /// Cumulative token counts for this session.
     pub session_tokens: Mutex<Usage>,
 
-    /// Sliding window of API calls for the TPM budget.
+    /// Sliding window of API calls, for the optional `rate_limit` cap.
     pub recent_calls: Mutex<Vec<RateCall>>,
+
+    /// The API's rate limits, from the last response's headers.
+    pub api_limits: Mutex<Option<crate::api::rate_limit::ApiLimits>>,
+
+    /// Uncached input tokens (input plus cache writes) of the last request:
+    /// about what the next one will need from the input bucket.
+    pub last_request_input: Mutex<u64>,
 
     /// Model for the next turn. Initialised from `AppConfig::model` and
     /// changed with `AgentCommand::SetModel`.
@@ -45,6 +52,8 @@ impl SharedState {
             messages: Mutex::new(Vec::new()),
             session_tokens: Mutex::new(Usage::default()),
             recent_calls: Mutex::new(Vec::new()),
+            api_limits: Mutex::new(None),
+            last_request_input: Mutex::new(0),
             current_model: Mutex::new(String::new()),
             available_models: Mutex::new(crate::api::models::static_fallback()),
             system_prompt: Mutex::new(None),

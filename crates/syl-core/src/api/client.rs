@@ -32,8 +32,36 @@ impl std::error::Error for CancelledError {}
 // Retry config
 // ---------------------------------------------------------------------------
 
-const MAX_RETRIES: u32 = 4;
-const BASE_DELAY_MS: u64 = 500;
+/// Retries after a 429 / 529. With `retry-after` the API says how long; without
+/// it the waits double from 1s to at most 30s (about a minute and a half in all).
+const MAX_RETRIES: u32 = 6;
+const BASE_DELAY_MS: u64 = 1000;
+const MAX_BACKOFF_MS: u64 = 30_000;
+/// The longest Syl waits on the API's say-so (`retry-after`, or a bucket
+/// refilling) before a request.
+const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// A 429 (rate limited) or 529 (overloaded), before or during the stream.
+/// Its text starts with `rate_limit:` like the errors it replaces.
+#[derive(Debug)]
+pub struct RateLimited {
+    pub status: u16,
+    /// From the `retry-after` header.
+    pub retry_after: Option<std::time::Duration>,
+    pub detail: String,
+}
+
+impl std::fmt::Display for RateLimited {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "rate_limit:{}", self.status)?;
+        if !self.detail.is_empty() {
+            write!(f, " ({})", self.detail)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for RateLimited {}
 
 // ---------------------------------------------------------------------------
 // Request building
@@ -239,6 +267,19 @@ pub async fn stream_turn(
     cancel:   CancellationToken,
     on_delta: &impl Fn(BlockDeltaEvent),
 ) -> anyhow::Result<TurnResult> {
+    stream_turn_observed(client, config, messages, system, cancel, on_delta, None).await
+}
+
+/// `stream_turn`, also storing the response's rate-limit headers in `limits`.
+async fn stream_turn_observed(
+    client:   &reqwest::Client,
+    config:   &AppConfig,
+    messages: &[Message],
+    system:   &[SystemBlock],
+    cancel:   CancellationToken,
+    on_delta: &impl Fn(BlockDeltaEvent),
+    limits:   Option<&std::sync::Mutex<Option<crate::api::rate_limit::ApiLimits>>>,
+) -> anyhow::Result<TurnResult> {
     let messages = crate::api::cache::attach_cache_breakpoints(messages.to_vec());
 
     let payload = build_payload(&messages, system, config);
@@ -255,9 +296,18 @@ pub async fn stream_turn(
     };
 
     let status = resp.status();
+    if let (Some(slot), Some(l)) = (limits, crate::api::rate_limit::ApiLimits::from_headers(resp.headers(), crate::api::rate_limit::now_ms())) {
+        *slot.lock().unwrap() = Some(l);
+    }
     if status == 429 || status.as_u16() == 529 {
-        // Return a typed error so call_with_retry can detect and retry
-        anyhow::bail!("rate_limit:{}", status.as_u16());
+        // A typed error, so the retry loop can retry and honour retry-after.
+        let retry_after = crate::api::rate_limit::retry_after(resp.headers());
+        let body = resp.text().await.unwrap_or_default();
+        let detail = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| v["error"]["message"].as_str().map(str::to_string))
+            .unwrap_or_default();
+        return Err(RateLimited { status: status.as_u16(), retry_after, detail }.into());
     }
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
@@ -300,8 +350,10 @@ pub async fn stream_turn(
 /// instead of being returned as a silently truncated turn.
 fn stream_error_to_anyhow(err: &crate::api::sse::StreamError) -> anyhow::Error {
     match err.kind.as_str() {
-        "overloaded_error" => anyhow::anyhow!("rate_limit:529 (overloaded mid-stream: {})", err.message),
-        "rate_limit_error" => anyhow::anyhow!("rate_limit:429 (mid-stream: {})", err.message),
+        "overloaded_error" => {
+            RateLimited { status: 529, retry_after: None, detail: format!("overloaded mid-stream: {}", err.message) }.into()
+        }
+        "rate_limit_error" => RateLimited { status: 429, retry_after: None, detail: format!("mid-stream: {}", err.message) }.into(),
         _ => anyhow::anyhow!("API stream error {}: {}", err.kind, err.message),
     }
 }
@@ -315,8 +367,45 @@ fn is_rate_limit_error(e: &anyhow::Error) -> bool {
 }
 
 fn backoff_delay(attempt: u32) -> std::time::Duration {
-    let ms = BASE_DELAY_MS * (1u64 << attempt.min(5));
+    let ms = (BASE_DELAY_MS * (1u64 << attempt.min(5))).min(MAX_BACKOFF_MS);
     std::time::Duration::from_millis(ms)
+}
+
+/// How long to wait before a retry: what the API asked for, else backoff.
+fn retry_delay(e: &anyhow::Error, attempt: u32) -> std::time::Duration {
+    e.downcast_ref::<RateLimited>()
+        .and_then(|r| r.retry_after)
+        .map(|d| d.min(MAX_WAIT))
+        .unwrap_or_else(|| backoff_delay(attempt))
+}
+
+/// Output tokens a request is assumed to need from the output bucket.
+const OUTPUT_NEED: u64 = 4096;
+
+/// How long to wait before the next request: until the API's buckets (as
+/// the last response left them, refilled since) can hold about what the
+/// last request used, and, with a `rate_limit` cap, until the window is
+/// under 80% of it.
+fn wait_before_request(config: &AppConfig, state: &crate::shared::SharedState) -> std::time::Duration {
+    use crate::api::rate_limit as rl;
+    let now = rl::now_ms();
+    let need_in = (*state.last_request_input.lock().unwrap()).max(1000);
+    let need_out = OUTPUT_NEED.min(config.max_tokens as u64);
+    let api = state.api_limits.lock().unwrap().map_or(std::time::Duration::ZERO, |l| l.wait_for(need_in, need_out, now));
+    let own = if config.rate_limit == 0 {
+        std::time::Duration::ZERO
+    } else {
+        let mut calls = state.recent_calls.lock().unwrap();
+        rl::prune_old_calls(&mut calls);
+        if rl::window_tokens(&calls) > config.rate_limit * 8 / 10 {
+            calls.first().map_or(std::time::Duration::ZERO, |oldest| {
+                std::time::Duration::from_millis(rl::RATE_WINDOW_MS.saturating_sub(now.saturating_sub(oldest.ts)))
+            })
+        } else {
+            std::time::Duration::ZERO
+        }
+    };
+    api.min(MAX_WAIT).max(own)
 }
 
 // ---------------------------------------------------------------------------
@@ -338,42 +427,32 @@ pub async fn call_with_retry_shared(
     notify_fn: impl Fn(&str),
     on_delta:  impl Fn(BlockDeltaEvent),
 ) -> anyhow::Result<TurnResult> {
-    // Pre-call throttle: compute sleep duration without holding the lock.
-    let sleep_dur = {
-        let mut calls = state.recent_calls.lock().unwrap();
-        crate::api::rate_limit::prune_old_calls(&mut calls);
-        let used   = crate::api::rate_limit::window_tokens(&calls);
-        let budget = config.rate_limit;
-        if used > (budget as f64 * 0.8) as u64 {
-            calls.first().map(|oldest| {
-                let elapsed = crate::api::rate_limit::now_ms().saturating_sub(oldest.ts);
-                let wait_ms = crate::api::rate_limit::RATE_WINDOW_MS.saturating_sub(elapsed);
-                std::time::Duration::from_millis(wait_ms)
-            })
+    // Locks are taken and released inside; none is held across an await.
+    let wait = wait_before_request(config, state);
+    if wait >= std::time::Duration::from_millis(500) {
+        let why = if config.rate_limit > 0 && state.api_limits.lock().unwrap().is_none() {
+            "Syl's own rate_limit cap"
         } else {
-            None
-        }
-    }; // lock released
-    if let Some(dur) = sleep_dur {
-        if !dur.is_zero() {
-            tracing::info!(wait_ms = dur.as_millis(), "token budget at 80% — cooling down");
-            notify_fn(&format!("[Token budget] Cooling down for {}s...", dur.as_secs().max(1)));
-            tokio::select! {
-                _ = tokio::time::sleep(dur) => {}
-                _ = cancel.cancelled() => return Err(CancelledError.into()),
-            }
+            "the API's per-minute token limit"
+        };
+        tracing::info!(wait_ms = wait.as_millis(), "waiting for {why}");
+        notify_fn(&format!("[Rate limit] Waiting {}s for {why}...", wait.as_secs().max(1)));
+        tokio::select! {
+            _ = tokio::time::sleep(wait) => {}
+            _ = cancel.cancelled() => return Err(CancelledError.into()),
         }
     }
 
     let mut attempts = 0u32;
     loop {
-        match stream_turn(client, config, messages, system, cancel.clone(), &on_delta).await {
+        match stream_turn_observed(client, config, messages, system, cancel.clone(), &on_delta, Some(&state.api_limits)).await {
             Ok(result) => {
-                // Record call — brief lock, no await
+                let uncached = result.usage.input_tokens + result.usage.cache_write_tokens;
+                *state.last_request_input.lock().unwrap() = uncached;
                 {
                     let mut calls = state.recent_calls.lock().unwrap();
-                    crate::api::rate_limit::record_rate_call(&mut calls, result.usage.input_tokens);
-                } // lock released
+                    crate::api::rate_limit::record_rate_call(&mut calls, uncached);
+                }
                 tracing::debug!(
                     input_tokens  = result.usage.input_tokens,
                     output_tokens = result.usage.output_tokens,
@@ -382,8 +461,12 @@ pub async fn call_with_retry_shared(
                 return Ok(result);
             }
             Err(e) if is_rate_limit_error(&e) && attempts < MAX_RETRIES => {
-                let delay = backoff_delay(attempts);
-                tracing::warn!(attempt = attempts, delay_ms = delay.as_millis(), "rate limited, retrying");
+                let delay = retry_delay(&e, attempts);
+                tracing::warn!(attempt = attempts, delay_ms = delay.as_millis(), error = %e, "rate limited, retrying");
+                if delay >= std::time::Duration::from_secs(2) {
+                    let what = if e.to_string().starts_with("rate_limit:529") { "The API is overloaded" } else { "The API's rate limit was reached" };
+                    notify_fn(&format!("[Rate limit] {what}; retrying in {}s...", delay.as_secs()));
+                }
                 tokio::select! {
                     _ = tokio::time::sleep(delay) => {}
                     _ = cancel.cancelled() => return Err(CancelledError.into()),

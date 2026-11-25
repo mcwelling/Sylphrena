@@ -45,6 +45,8 @@ pub struct SlashContext<'a> {
     pub model: &'a str,
     pub timeout_ms: u64,
     pub rate_limit: u64,
+    /// The API's limits, from the last response.
+    pub api_limits: Option<syl_core::api::rate_limit::ApiLimits>,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub message_count: usize,
@@ -191,10 +193,19 @@ Slash commands:
 
     if trimmed == "/status" {
         let timeout_s = ctx.timeout_ms / 1000;
+        let now = syl_core::api::rate_limit::now_ms();
+        let bucket = |name: &str, b: Option<syl_core::api::rate_limit::Bucket>| {
+            b.map(|b| format!("{name} {}/min ({} left)", syl_core::util::fmt_num(b.limit), syl_core::util::fmt_num(b.available(now))))
+        };
+        let api: Vec<String> = ctx
+            .api_limits
+            .map(|l| [bucket("in", l.input), bucket("out", l.output)].into_iter().flatten().collect())
+            .unwrap_or_default();
+        let api = if api.is_empty() { "API limits not seen yet".to_string() } else { format!("API {}", api.join(", ")) };
         let rate_display = if ctx.rate_limit == 0 {
-            "unlimited".to_string()
+            api
         } else {
-            format!("{} tpm", ctx.rate_limit)
+            format!("{api}; own cap {} tpm", ctx.rate_limit)
         };
         let output = format!(
             "model:    {}\ntimeout:  {}s             rate:    {}\nmessages: {}               tokens:  in:{} out:{}\nsession:  {}",
