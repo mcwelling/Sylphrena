@@ -38,7 +38,30 @@ use tokio_util::sync::CancellationToken;
 /// The MCP protocol version Syl speaks.
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+/// The largest message read from a server; a bigger one is dropped (stdio)
+/// or fails the request (HTTP), so a misbehaving server can't use up memory.
+const MAX_MESSAGE: usize = 16 * 1024 * 1024;
+
+/// A stdio request waiting for its answer. Dropped before the answer came
+/// (cancelled, timed out), it forgets the request and tells the server.
+struct Waiting<'a> {
+    id: u64,
+    pending: &'a Pending,
+    out: &'a mpsc::UnboundedSender<String>,
+    done: bool,
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.pending.lock().unwrap().remove(&self.id);
+        if !self.done {
+            let note = json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": self.id}});
+            let _ = self.out.send(note.to_string());
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct McpServerConfig {
     pub name: String,
@@ -114,8 +137,11 @@ impl Server {
                     pending.lock().unwrap().remove(&id);
                     return Err("the server has stopped".to_string());
                 }
+                let mut waiting = Waiting { id, pending, out, done: false };
                 let answer = tokio::time::timeout(timeout, rx).await;
-                pending.lock().unwrap().remove(&id);
+                // Answered, or the server is gone: nothing to cancel.
+                waiting.done = answer.is_ok();
+                drop(waiting);
                 match answer {
                     Ok(Ok(r)) => r,
                     Ok(Err(_)) => Err("the server has stopped".to_string()),
@@ -155,25 +181,38 @@ impl Server {
             .get("content-type")
             .and_then(|v| v.to_str().ok())
             .is_some_and(|c| c.starts_with("text/event-stream"));
+        if resp.content_length().is_some_and(|n| n as usize > MAX_MESSAGE) {
+            return Err(format!("the response is over {} MB", MAX_MESSAGE >> 20));
+        }
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             return Err(format!("HTTP {status}: {}", crate::session::one_line(&body, 200)));
         }
         let Some(id) = id else { return Ok(Value::Null) };
+        use futures_util::StreamExt;
         if !is_sse {
-            let body = resp.text().await.map_err(|e| e.to_string())?;
-            let v: Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+            let mut body = Vec::new();
+            let mut stream = resp.bytes_stream();
+            while let Some(chunk) = stream.next().await {
+                body.extend_from_slice(&chunk.map_err(|e| e.to_string())?);
+                if body.len() > MAX_MESSAGE {
+                    return Err(format!("the response is over {} MB", MAX_MESSAGE >> 20));
+                }
+            }
+            let v: Value = serde_json::from_slice(&body).map_err(|e| e.to_string())?;
             let found = match v {
                 Value::Array(items) => items.into_iter().find(|m| m["id"] == json!(id)),
                 m => Some(m),
             };
             return found.map(response_result).unwrap_or_else(|| Err("the server sent no response".to_string()));
         }
-        use futures_util::StreamExt;
         let mut stream = resp.bytes_stream();
         let mut events = SseEvents::default();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| e.to_string())?;
+            if events.pending_len() > MAX_MESSAGE {
+                return Err(format!("an event is over {} MB", MAX_MESSAGE >> 20));
+            }
             for data in events.feed(&chunk) {
                 let Ok(m) = serde_json::from_str::<Value>(&data) else { continue };
                 if m.get("method").is_some() {
@@ -220,6 +259,29 @@ impl Server {
     }
 }
 
+/// Read one line into `line`, up to [`MAX_MESSAGE`]. None at the end of
+/// the stream; Some(false) for a line that was too long (skipped through
+/// its newline, and left empty).
+async fn read_line_capped<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R, line: &mut Vec<u8>) -> std::io::Result<Option<bool>> {
+    use tokio::io::AsyncReadExt;
+    let n = (&mut *reader).take(MAX_MESSAGE as u64).read_until(b'\n', line).await?;
+    if n == 0 {
+        return Ok(None);
+    }
+    if line.last() == Some(&b'\n') || n < MAX_MESSAGE {
+        return Ok(Some(true));
+    }
+    // Too long: drop it, and the rest of it up to the newline.
+    line.clear();
+    loop {
+        let mut rest = Vec::new();
+        let n = (&mut *reader).take(MAX_MESSAGE as u64).read_until(b'\n', &mut rest).await?;
+        if n == 0 || rest.last() == Some(&b'\n') {
+            return Ok(Some(false));
+        }
+    }
+}
+
 /// Server-sent events: each event's `data:` lines joined with newlines.
 #[derive(Default)]
 struct SseEvents {
@@ -228,6 +290,11 @@ struct SseEvents {
 }
 
 impl SseEvents {
+    /// Bytes held for the event being read.
+    fn pending_len(&self) -> usize {
+        self.buf.len() + self.data.iter().map(String::len).sum::<usize>()
+    }
+
     fn feed(&mut self, bytes: &[u8]) -> Vec<String> {
         self.buf.extend_from_slice(bytes);
         let mut out = Vec::new();
@@ -282,9 +349,10 @@ fn spawn_stdio(mut cmd: tokio::process::Command) -> anyhow::Result<Transport> {
         let mut line = Vec::new();
         loop {
             line.clear();
-            match reader.read_until(b'\n', &mut line).await {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {}
+            match read_line_capped(&mut reader, &mut line).await {
+                Ok(None) | Err(_) => break,
+                Ok(Some(false)) => continue,
+                Ok(Some(true)) => {}
             }
             // A line that isn't JSON (a stray log line, bad bytes) is skipped.
             let Ok(msg) = serde_json::from_slice::<Value>(&line) else { continue };
@@ -578,6 +646,20 @@ mod tests {
         let loose = api_schema(&json!({"type": "object", "anyOf": [{"required": ["a"]}], "required": ["a"]}));
         assert_eq!(loose, json!({"type": "object", "properties": {}, "additionalProperties": true}));
         assert_eq!(api_schema(&json!(null)), json!({"type": "object", "properties": {}}));
+    }
+
+    #[tokio::test]
+    async fn overlong_lines_are_skipped() {
+        let mut data = vec![b'x'; MAX_MESSAGE + 10];
+        data.extend_from_slice(b"\n{\"ok\":1}\n");
+        let mut reader = BufReader::new(&data[..]);
+        let mut line = Vec::new();
+        assert_eq!(read_line_capped(&mut reader, &mut line).await.unwrap(), Some(false));
+        line.clear();
+        assert_eq!(read_line_capped(&mut reader, &mut line).await.unwrap(), Some(true));
+        assert_eq!(line, b"{\"ok\":1}\n");
+        line.clear();
+        assert_eq!(read_line_capped(&mut reader, &mut line).await.unwrap(), None);
     }
 
     #[test]

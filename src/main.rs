@@ -70,7 +70,28 @@ async fn main() -> anyhow::Result<()> {
     let _log_guard = syl_core::logging::init_logging(&syl_dir)?;
 
     // 4. Build config
-    let config = build_config(&cli, &syl_dir);
+    let mut config = build_config(&cli, &syl_dir);
+    // A project's hooks and MCP servers run without a tool call, in a
+    // container with the network and your SSH keys: ask before the first.
+    if let Some(ext) = &config.untrusted {
+        use std::io::Write;
+        println!("[Syl] This project's .syl/config.toml wants to run these in the container (with network access and your SSH keys):");
+        for line in ext.describe() {
+            println!("  {}", sanitize(&line));
+        }
+        print!("Trust them for this project? They'll run now and whenever Syl starts here, until they change. [y/N] ");
+        let _ = std::io::stdout().flush();
+        let mut answer = String::new();
+        let _ = std::io::stdin().read_line(&mut answer);
+        if matches!(answer.trim(), "y" | "Y" | "yes") {
+            if let Err(e) = config.trust_project() {
+                println!("[Syl] Trusted for now, but couldn't save it: {e}");
+            }
+        } else {
+            println!("[Syl] Left out. Syl will ask again next time.");
+            config.untrusted = None;
+        }
+    }
     if let Some(e) = &config.config_error {
         // Shown before anything else: with config.toml unreadable, its
         // permission rules aren't in force.

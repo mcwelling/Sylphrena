@@ -188,3 +188,57 @@ pub fn fmt_num(n: u64) -> String {
         n.to_string()
     }
 }
+
+/// Read a file that must not be a symbolic link. Files under the project
+/// can be written by code in the container (or shipped by a cloned
+/// repository), and Syl reads them on the host: a link there could point
+/// at `~/.ssh/id_rsa`.
+pub fn read_regular(path: &std::path::Path) -> std::io::Result<String> {
+    let meta = std::fs::symlink_metadata(path)?;
+    if meta.file_type().is_symlink() {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "a symbolic link (not followed)"));
+    }
+    std::fs::read_to_string(path)
+}
+
+/// Write a file without following a symbolic link at `path` (which could
+/// point anywhere on the host).
+pub fn write_regular(path: &std::path::Path, content: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        #[cfg(target_os = "linux")]
+        const O_NOFOLLOW: i32 = 0o400000;
+        #[cfg(not(target_os = "linux"))]
+        const O_NOFOLLOW: i32 = 0x0100;
+        opts.custom_flags(O_NOFOLLOW);
+    }
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "a symbolic link (not followed)"));
+    }
+    opts.open(path)?.write_all(content.as_bytes())
+}
+
+#[cfg(all(test, unix))]
+mod link_tests {
+    use super::*;
+
+    #[test]
+    fn links_are_neither_read_nor_written_through() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target");
+        std::fs::write(&target, "secret").unwrap();
+        let link = tmp.path().join("link.md");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(read_regular(&link).is_err());
+        assert!(write_regular(&link, "pwned").is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "secret");
+        let plain = tmp.path().join("plain.md");
+        write_regular(&plain, "a").unwrap();
+        write_regular(&plain, "b").unwrap();
+        assert_eq!(read_regular(&plain).unwrap(), "b");
+    }
+}

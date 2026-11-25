@@ -19,6 +19,7 @@ pub mod session;
 pub mod shared;
 pub mod system_prompt;
 pub mod tools;
+pub mod trust;
 pub mod util;
 pub mod workspace;
 

@@ -64,7 +64,9 @@ pub fn load_project_instructions(project_dir: &Path) -> Option<String> {
     for dir in project_dir.ancestors() {
         let Some((path, text)) = ["AGENTS.md", "CLAUDE.md"].iter().find_map(|name| {
             let path = dir.join(name);
-            let text = std::fs::read_to_string(&path).ok()?;
+            // In the project, code in the container can write these: a
+            // link there isn't followed. Above it, they're the user's.
+            let text = if dir == project_dir { crate::util::read_regular(&path).ok()? } else { std::fs::read_to_string(&path).ok()? };
             let text = text.trim().to_string();
             (!text.is_empty()).then_some((path, text))
         }) else {

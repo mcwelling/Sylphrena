@@ -87,7 +87,8 @@ cpus = "2"
 
 # MCP servers (optional; tools appear as <name>__<tool>). Stdio servers run in
 # the container. `host = true` and remote `url` servers are only honoured in
-# ~/.syl/config.toml, since a project's config comes with the project.
+# ~/.syl/config.toml, since a project's config comes with the project. A
+# project's hooks and servers run only once you trust them (Syl asks).
 [[mcp]]
 name = "github"
 command = "npx"

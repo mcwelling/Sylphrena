@@ -32,7 +32,7 @@ pub enum HookEvent {
     TurnEnd,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Hook {
     pub event: HookEvent,

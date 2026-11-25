@@ -285,7 +285,7 @@ async fn run(agent: Agent, mut commands: mpsc::UnboundedReceiver<AgentCommand>, 
     let pending: Pending = Default::default();
     // MCP servers start with the first turn and serve every session after.
     let mcp: tokio::sync::OnceCell<Arc<crate::mcp::McpHub>> = tokio::sync::OnceCell::new();
-    if run_session_start_hooks(&agent, &session, &events, &mut commands, &mut deferred).await {
+    if run_session_start_hooks(&agent, &session, &events, mode, &mut commands, &mut deferred).await {
         return;
     }
     loop {
@@ -318,7 +318,7 @@ async fn run(agent: Agent, mut commands: mpsc::UnboundedReceiver<AgentCommand>, 
             AgentCommand::NewSession => {
                 session = SessionLog::create(dir, cwd);
                 switch_to(&agent, &session, &mut ctx, &events);
-                if run_session_start_hooks(&agent, &session, &events, &mut commands, &mut deferred).await {
+                if run_session_start_hooks(&agent, &session, &events, mode, &mut commands, &mut deferred).await {
                     break;
                 }
                 continue;
@@ -333,7 +333,7 @@ async fn run(agent: Agent, mut commands: mpsc::UnboundedReceiver<AgentCommand>, 
                     Ok(s) => {
                         session = s;
                         switch_to(&agent, &session, &mut ctx, &events);
-                        if run_session_start_hooks(&agent, &session, &events, &mut commands, &mut deferred).await {
+                        if run_session_start_hooks(&agent, &session, &events, mode, &mut commands, &mut deferred).await {
                             break;
                         }
                     }
@@ -346,7 +346,7 @@ async fn run(agent: Agent, mut commands: mpsc::UnboundedReceiver<AgentCommand>, 
                     Ok(s) => {
                         session = s;
                         switch_to(&agent, &session, &mut ctx, &events);
-                        if run_session_start_hooks(&agent, &session, &events, &mut commands, &mut deferred).await {
+                        if run_session_start_hooks(&agent, &session, &events, mode, &mut commands, &mut deferred).await {
                             break;
                         }
                     }
@@ -423,24 +423,10 @@ async fn run(agent: Agent, mut commands: mpsc::UnboundedReceiver<AgentCommand>, 
         };
         // turn_end hooks are part of the turn: Cancel stops them, and a
         // client waiting for TurnEnded (headless) waits for them too.
-        if !shutting_down && !crate::hooks::matching(&agent.config.hooks, crate::hooks::HookEvent::TurnEnd, None).is_empty() {
+        if !shutting_down {
             let payload = serde_json::json!({ "event": "turn_end", "session_id": session.id(), "reason": reason });
-            let hook_cancel = CancellationToken::new();
-            let hooks = crate::hooks::run_all(
-                &agent.container,
-                &agent.config.hooks,
-                crate::hooks::HookEvent::TurnEnd,
-                None,
-                &payload,
-                &hook_cancel,
-            );
-            let (outcome, shutdown) = listening(hooks, &mut commands, &mut deferred, &hook_cancel).await;
-            shutting_down |= shutdown;
-            if let crate::hooks::HookOutcome::Failed(why) = outcome {
-                if !hook_cancel.is_cancelled() {
-                    emit(AgentEvent::Notice { message: format!("[Syl] turn_end hook: {why}") });
-                }
-            }
+            let ev = crate::hooks::HookEvent::TurnEnd;
+            shutting_down |= run_event_hooks(&agent, &events, mode, ev, "turn_end", payload, &mut commands, &mut deferred).await;
         }
         let undelivered = std::mem::take(&mut *steer.lock().unwrap());
         emit(AgentEvent::TurnEnded { reason: reason.clone() });
@@ -1005,29 +991,13 @@ async fn run_session_start_hooks(
     agent: &Agent,
     session: &SessionLog,
     events: &Events,
+    mode: Mode,
     commands: &mut mpsc::UnboundedReceiver<AgentCommand>,
     deferred: &mut VecDeque<AgentCommand>,
 ) -> bool {
-    if crate::hooks::matching(&agent.config.hooks, crate::hooks::HookEvent::SessionStart, None).is_empty() {
-        return false;
-    }
     let payload = serde_json::json!({ "event": "session_start", "session_id": session.id(), "resumed": session.info().resumed });
-    let cancel = CancellationToken::new();
-    let hooks = crate::hooks::run_all(
-        &agent.container,
-        &agent.config.hooks,
-        crate::hooks::HookEvent::SessionStart,
-        None,
-        &payload,
-        &cancel,
-    );
-    let (outcome, shutdown) = listening(hooks, commands, deferred, &cancel).await;
-    if let crate::hooks::HookOutcome::Failed(why) = outcome {
-        if !cancel.is_cancelled() {
-            let _ = events.send(AgentEvent::Notice { message: format!("[Syl] session_start hook: {why}") });
-        }
-    }
-    shutdown
+    let ev = crate::hooks::HookEvent::SessionStart;
+    run_event_hooks(agent, events, mode, ev, "session_start", payload, commands, deferred).await
 }
 
 /// Await `fut` while taking commands: Cancel and Shutdown cancel it (the
@@ -1214,18 +1184,60 @@ async fn execute_call(
         let (o, e) = run_hooked(agent, tool_ctx, session_id, id, name, input, &cancel).await;
         return (o, e, None);
     }
-    // Exclusive from the snapshot to the put-back, so the put-back can only
-    // undo what this call did.
-    let _exclusive = lock.write().await;
-    let refuse = |why: String| {
-        (
-            format!("[Plan mode: {name} is unavailable because the workspace can't be snapshotted ({why}), so changes couldn't be put back.]"),
-            true,
-            None,
-        )
+    let run = run_hooked(agent, tool_ctx, session_id, id, name, input, &cancel);
+    let ((output, is_error), put_back) = match in_snapshot(agent, run).await {
+        Ok(r) => r,
+        Err(why) => {
+            return (
+                format!("[Plan mode: {name} is unavailable because the workspace can't be snapshotted ({why}), so changes couldn't be put back.]"),
+                true,
+                None,
+            )
+        }
     };
+    if let Some(e) = put_back.error {
+        return (format!("{output}\n\n[Plan mode: could not check for file changes: {e}]"), true, None);
+    }
+    let mut notes = Vec::new();
+    if !put_back.changed.is_empty() {
+        notes.push(format!(
+            "[Plan mode: this call changed files in the workspace, so they were put back ({}). In plan \
+             mode, investigate and propose changes instead of making them.]",
+            put_back.changed.join(", ")
+        ));
+    }
+    if !put_back.lost.is_empty() {
+        notes.push(format!("[Plan mode: these ignored paths were removed and can't be put back: {}.]", put_back.lost.join(", ")));
+    }
+    if notes.is_empty() {
+        (output, is_error, None)
+    } else {
+        (format!("{output}\n\n{}", notes.join("\n")), true, put_back.safety)
+    }
+}
+
+/// What a plan-mode put-back did.
+#[derive(Default)]
+struct PutBack {
+    /// Paths that were changed and put back (at most 10).
+    changed: Vec<String>,
+    /// Ignored paths that were removed and can't be put back (at most 10).
+    lost: Vec<String>,
+    /// The snapshot before, and the safety snapshot of what was undone.
+    safety: Option<(String, String)>,
+    /// The check itself failed.
+    error: Option<String>,
+}
+
+/// Run `work` between two snapshots, holding the project lock exclusively
+/// (so the put-back can only undo what `work` did), and put back whatever
+/// it changed in the workspace. Err (and `work` not run) when no snapshot
+/// can be taken.
+async fn in_snapshot<F: std::future::Future>(agent: &Agent, work: F) -> Result<(F::Output, PutBack), String> {
+    let lock = project_lock(&agent.paths.project_dir);
+    let _exclusive = lock.write().await;
     if !agent.paths.checkpoints {
-        return refuse("checkpoints are off".to_string());
+        return Err("checkpoints are off".to_string());
     }
     let cp = Checkpoints::for_project(&agent.paths.project_dir);
     let snap = cp.clone();
@@ -1235,10 +1247,10 @@ async fn execute_call(
     .await;
     let (before, ignored_before) = match before {
         Ok(Ok(b)) => b,
-        Ok(Err(e)) => return refuse(e.to_string()),
-        Err(e) => return refuse(e.to_string()),
+        Ok(Err(e)) => return Err(e.to_string()),
+        Err(e) => return Err(e.to_string()),
     };
-    let (output, is_error) = run_hooked(agent, tool_ctx, session_id, id, name, input, &cancel).await;
+    let out = work.await;
     let check = before.clone();
     let put_back = tokio::task::spawn_blocking(move || -> anyhow::Result<(Vec<crate::checkpoint::Change>, Option<String>, Vec<String>)> {
         let changes = cp.preview(&check)?;
@@ -1248,32 +1260,76 @@ async fn execute_call(
         Ok((changes, safety, lost))
     })
     .await;
-    match put_back {
-        Ok(Ok((changes, safety, lost))) => {
-            let mut notes = Vec::new();
-            if !changes.is_empty() {
-                let list: Vec<&str> = changes.iter().take(10).map(|c| c.path.as_str()).collect();
-                notes.push(format!(
-                    "[Plan mode: this call changed files in the workspace, so they were put back ({}). In plan \
-                     mode, investigate and propose changes instead of making them.]",
-                    list.join(", ")
-                ));
+    let result = match put_back {
+        Ok(Ok((changes, safety, lost))) => PutBack {
+            changed: changes.iter().take(10).map(|c| c.path.clone()).collect(),
+            lost: lost.into_iter().take(10).collect(),
+            safety: safety.map(|s| (before, s)),
+            error: None,
+        },
+        Ok(Err(e)) => PutBack { error: Some(e.to_string()), ..Default::default() },
+        Err(e) => PutBack { error: Some(e.to_string()), ..Default::default() },
+    };
+    Ok((out, result))
+}
+
+/// Run the hooks for a session event (`session_start`, `turn_end`) while
+/// taking commands (see [`listening`]). In build mode they share the
+/// project lock like any write; in plan mode they run in a snapshot and
+/// what they changed is put back. Returns true when a Shutdown came.
+#[allow(clippy::too_many_arguments)]
+async fn run_event_hooks(
+    agent: &Agent,
+    events: &Events,
+    mode: Mode,
+    event: crate::hooks::HookEvent,
+    label: &str,
+    payload: serde_json::Value,
+    commands: &mut mpsc::UnboundedReceiver<AgentCommand>,
+    deferred: &mut VecDeque<AgentCommand>,
+) -> bool {
+    use crate::hooks::{run_all, HookOutcome};
+    if crate::hooks::matching(&agent.config.hooks, event, None).is_empty() {
+        return false;
+    }
+    let notice = |m: String| {
+        let _ = events.send(AgentEvent::Notice { message: m });
+    };
+    let cancel = CancellationToken::new();
+    let hooks = run_all(&agent.container, &agent.config.hooks, event, None, &payload, &cancel);
+    let (outcome, shutdown) = if mode == Mode::Plan {
+        let (result, shutdown) = listening(in_snapshot(agent, hooks), commands, deferred, &cancel).await;
+        match result {
+            Err(why) => {
+                notice(format!("[Syl] Plan mode: the {label} hooks didn't run, because the workspace can't be snapshotted ({why})."));
+                (HookOutcome::Ok, shutdown)
             }
-            if !lost.is_empty() {
-                notes.push(format!(
-                    "[Plan mode: these ignored paths were removed and can't be put back: {}.]",
-                    lost.iter().take(10).cloned().collect::<Vec<_>>().join(", ")
-                ));
-            }
-            if notes.is_empty() {
-                (output, is_error, None)
-            } else {
-                (format!("{output}\n\n{}", notes.join("\n")), true, safety.map(|s| (before, s)))
+            Ok((outcome, put_back)) => {
+                if let Some(e) = put_back.error {
+                    notice(format!("[Syl] Plan mode: could not check what the {label} hooks changed: {e}"));
+                } else if !put_back.changed.is_empty() {
+                    notice(format!(
+                        "[Syl] Plan mode: the {label} hooks changed files, so they were put back ({}).",
+                        put_back.changed.join(", ")
+                    ));
+                }
+                (outcome, shutdown)
             }
         }
-        Ok(Err(e)) => (format!("{output}\n\n[Plan mode: could not check for file changes: {e}]"), true, None),
-        Err(e) => (format!("{output}\n\n[Plan mode: could not check for file changes: {e}]"), true, None),
+    } else {
+        let lock = project_lock(&agent.paths.project_dir);
+        let shared = async {
+            let _shared = lock.read().await;
+            hooks.await
+        };
+        listening(shared, commands, deferred, &cancel).await
+    };
+    if let HookOutcome::Failed(why) = outcome {
+        if !cancel.is_cancelled() {
+            notice(format!("[Syl] {label} hook: {why}"));
+        }
     }
+    shutdown
 }
 
 /// The pre_tool hooks, the call, then the post_tool hooks.

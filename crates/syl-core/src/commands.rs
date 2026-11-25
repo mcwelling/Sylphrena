@@ -107,22 +107,29 @@ fn skill_dirs(project: &Path) -> Vec<PathBuf> {
     dirs
 }
 
-/// Every custom command, the project's first; a name already seen is skipped.
+/// Every custom command, the project's first; a name already seen is
+/// skipped. Symbolic links are not followed: a cloned project could ship
+/// `review.md -> ~/.ssh/id_rsa`.
 pub fn list_commands(project: &Path) -> Vec<Template> {
     let mut out: Vec<Template> = Vec::new();
+    let home = home();
     for dir in command_dirs(project) {
+        let base = if dir.starts_with(project) { project.to_path_buf() } else { home.clone().unwrap_or_default() };
+        if !contained(&dir, &base) {
+            continue;
+        }
         let Ok(read) = std::fs::read_dir(&dir) else { continue };
         let mut paths: Vec<PathBuf> = read.filter_map(|e| e.ok()).map(|e| e.path()).collect();
         paths.sort();
         for path in paths {
-            if path.extension().is_none_or(|e| e != "md") {
+            if path.extension().is_none_or(|e| e != "md") || is_link(&path) {
                 continue;
             }
             let Some(name) = path.file_stem().and_then(|s| s.to_str()).map(str::to_string) else { continue };
             if !crate::util::is_safe_key(&name) || out.iter().any(|t| t.name == name) {
                 continue;
             }
-            let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            let Ok(text) = crate::util::read_regular(&path) else { continue };
             let (fields, body) = front_matter(&text);
             let description = field(&fields, "description").unwrap_or_else(|| first_line(&body));
             out.push(Template { name, description, body, path });
@@ -163,7 +170,7 @@ pub fn list_skills(project: &Path) -> Vec<Template> {
             if is_link(&skill_dir) || is_link(&file) {
                 continue;
             }
-            let Ok(text) = std::fs::read_to_string(&file) else { continue };
+            let Ok(text) = crate::util::read_regular(&file) else { continue };
             let (fields, body) = front_matter(&text);
             let dir_name = skill_dir.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
             let name = field(&fields, "name").unwrap_or(dir_name);
@@ -305,6 +312,26 @@ mod tests {
     #[test]
     fn arguments_are_substituted_once() {
         assert_eq!(substitute("A $ARGUMENTS B {{args}}", "x {{args}} $ARGUMENTS"), "A x {{args}} $ARGUMENTS B x {{args}} $ARGUMENTS");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn commands_do_not_follow_symbolic_links() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("id_rsa"), "PRIVATE KEY").unwrap();
+        let dir = tmp.path().join(".syl/commands");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("id_rsa"), dir.join("review.md")).unwrap();
+        std::fs::write(dir.join("ok.md"), "fine").unwrap();
+        assert_eq!(list_commands(tmp.path()).into_iter().map(|c| c.name).collect::<Vec<_>>(), ["ok"]);
+        assert!(expand(tmp.path(), "/review").is_none());
+        let tmp2 = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp2.path().join(".syl")).unwrap();
+        std::fs::create_dir_all(outside.path().join("cmds")).unwrap();
+        std::fs::write(outside.path().join("cmds/x.md"), "secret").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("cmds"), tmp2.path().join(".syl/commands")).unwrap();
+        assert!(list_commands(tmp2.path()).is_empty());
     }
 
     #[cfg(unix)]

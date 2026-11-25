@@ -90,6 +90,9 @@ struct Session {
     /// last error message of that turn.
     prompts: Mutex<VecDeque<TurnWaiter>>,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Said once the session is open: the project's hooks and MCP servers
+    /// that aren't trusted (an ACP client can't be asked).
+    notice: Option<String>,
 }
 
 struct Server {
@@ -286,6 +289,10 @@ impl Server {
     /// Slash commands the client can offer: custom commands and skills.
     fn advertise_commands(&self, id: &str) {
         let Some(session) = self.session(id) else { return };
+        if let Some(n) = &session.notice {
+            let text = format!("[Syl] {n}\n\n");
+            self.update(id, json!({ "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": text } }));
+        }
         let cwd = &session.cwd;
         let mut available: Vec<Value> = crate::commands::list_commands(cwd)
             .into_iter()
@@ -396,6 +403,7 @@ impl Server {
             }
         }
         let mut config = (self.opts.config)(&cwd);
+        let notice = config.untrusted_notice();
         // The client's own servers run where the client says (on the host),
         // and replace a configured server of the same name.
         config.mcp.retain(|s| !client_mcp.iter().any(|c| c.name == s.name));
@@ -456,6 +464,7 @@ impl Server {
             cwd: cwd.clone(),
             prompts: Mutex::new(VecDeque::new()),
             task: Mutex::new(None),
+            notice,
         });
         self.sessions.lock().unwrap().insert(id.clone(), session.clone());
         let pump = tokio::spawn(pump(self.clone(), session.clone(), id.clone(), cwd.clone(), handle.events));

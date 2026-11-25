@@ -1317,3 +1317,20 @@ async fn cancel_stops_a_slow_session_start_hook_and_mcp_startup() {
     assert!(matches!(events.last(), Some(AgentEvent::TurnEnded { reason: TurnEnd::Cancelled })), "{events:?}");
     assert!(started.elapsed() < Duration::from_secs(20), "took {:?}", started.elapsed());
 }
+
+#[tokio::test]
+async fn in_plan_mode_a_turn_end_hooks_writes_are_put_back() {
+    let server = model_server(vec![ok(text_stream("plan"))]).await;
+    let hook: syl_core::hooks::Hook = toml::from_str("event = \"turn_end\"\ncommand = \"echo x > end.txt\"").unwrap();
+    let config = AppConfig { hooks: vec![hook], ..test_config(&server) };
+    let mut h = start_with(config, tempfile::tempdir().unwrap(), SessionStart::New).await;
+    h.send(AgentCommand::SetMode(Mode::Plan));
+    assert_eq!(next_event(&mut h).await, AgentEvent::ModeChanged { mode: Mode::Plan });
+    h.send(AgentCommand::Prompt("look".into()));
+    let events = until_turn_ended(&mut h).await;
+    assert!(
+        events.iter().any(|e| matches!(e, AgentEvent::Notice { message } if message.contains("put back") && message.contains("end.txt"))),
+        "{events:?}"
+    );
+    assert!(!h.project().join("end.txt").exists());
+}

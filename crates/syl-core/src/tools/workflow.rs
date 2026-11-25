@@ -252,7 +252,7 @@ pub fn load_workflow(workflow_dir: &Path, key: &str) -> Option<Workflow> {
         return None;
     }
     let path = workflow_dir.join(format!("{}.md", key));
-    let content = fs::read_to_string(path).ok()?;
+    let content = crate::util::read_regular(&path).ok()?;
     parse_workflow(&content)
 }
 
@@ -265,13 +265,13 @@ pub fn workflow_write(workflow_dir: &Path, key: &str, content: &str) -> String {
         return format!("Error creating workflow dir: {}", e);
     }
     let path = workflow_dir.join(format!("{}.md", key));
-    if path.exists() {
+    if path.exists() || std::fs::symlink_metadata(&path).is_ok() {
         return format!("Error: Workflow '{}' already exists. Use workflow_delete first, then create it again.", key);
     }
     match parse_workflow(content) {
         None => "Error: Invalid workflow format. Must have at least one step like: - Label: `command`".to_string(),
         Some(wf) => {
-            match fs::write(&path, content) {
+            match crate::util::write_regular(&path, content) {
                 Ok(()) => format!("Workflow '{}' created with {} steps.", key, wf.steps.len()),
                 Err(e) => format!("Error writing workflow: {}", e),
             }

