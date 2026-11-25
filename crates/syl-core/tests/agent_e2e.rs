@@ -272,6 +272,7 @@ fn kind_name(e: &Entry) -> &'static str {
         EntryKind::Checkpoint { .. } => "checkpoint",
         EntryKind::Restored { .. } => "restored",
         EntryKind::Note { .. } => "note",
+        EntryKind::ToolSet { .. } => "tool_set",
     }
 }
 
@@ -1136,4 +1137,183 @@ async fn a_turn_is_checkpointed_and_can_be_restored() {
     let receipts = session::receipts(&h.log(&h.session.id));
     assert_eq!(receipts[0].commands, ["rm -rf src"]);
     assert_eq!(receipts[0].checkpoint.as_deref(), Some(commit.as_str()));
+}
+
+// ---------------------------------------------------------------------------
+// Extensibility (Phase 5)
+// ---------------------------------------------------------------------------
+
+/// A tiny MCP server (stdio, NDJSON) written in Python: one read-only tool
+/// `shout` and one `delete_all` that isn't, plus server instructions.
+const MCP_SERVER: &str = r#"
+import json, sys
+for line in sys.stdin:
+    msg = json.loads(line)
+    mid, method = msg.get("id"), msg.get("method")
+    if mid is None:
+        continue
+    if method == "initialize":
+        result = {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}},
+                  "serverInfo": {"name": "toy", "version": "1"}, "instructions": "Use shout for emphasis."}
+    elif method == "tools/list":
+        result = {"tools": [
+            {"name": "shout", "description": "Uppercase text", "annotations": {"readOnlyHint": True},
+             "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}},
+            {"name": "delete_all", "description": "Deletes things",
+             "inputSchema": {"type": "object", "properties": {}}}]}
+    elif method == "tools/call":
+        args = msg["params"].get("arguments", {})
+        if msg["params"]["name"] == "shout":
+            result = {"content": [{"type": "text", "text": args.get("text", "").upper()}]}
+        else:
+            result = {"content": [{"type": "text", "text": "deleted"}], "isError": False}
+    else:
+        print(json.dumps({"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": "no"}}), flush=True)
+        continue
+    print(json.dumps({"jsonrpc": "2.0", "id": mid, "result": result}), flush=True)
+"#;
+
+fn mcp_config(server: &MockServer, tmp: &tempfile::TempDir) -> AppConfig {
+    let script = tmp.path().join("project/toy_mcp.py");
+    std::fs::create_dir_all(tmp.path().join("project")).unwrap();
+    std::fs::write(&script, MCP_SERVER).unwrap();
+    let mcp: syl_core::mcp::McpServerConfig =
+        toml::from_str(&format!("name = \"toy\"\ncommand = \"python3\"\nargs = [\"{}\"]", script.display())).unwrap();
+    AppConfig { mcp: vec![mcp], ..test_config(server) }
+}
+
+#[tokio::test]
+async fn mcp_tools_are_offered_and_called_through_the_container() {
+    let server = model_server(vec![
+        ok(tool_calls_stream(&[("m1", "toy__shout", json!({"text": "hello"}))])),
+        ok(text_stream("done")),
+    ])
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let config = mcp_config(&server, &tmp);
+    let mut h = start_with(config, tmp, SessionStart::New).await;
+    h.send(AgentCommand::Prompt("shout hello".into()));
+    let events = until_turn_ended(&mut h).await;
+    assert_eq!(result_of(&events, "m1"), ("HELLO".to_string(), false));
+    let first = &request_bodies(&server).await[0];
+    let names: Vec<&str> = first["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert!(names.contains(&"toy__shout") && names.contains(&"toy__delete_all") && names.contains(&"run_bash"), "{names:?}");
+    assert!(first["system"][0]["text"].as_str().unwrap().contains("Use shout for emphasis."));
+    // The tool set is logged with the conversation.
+    assert!(h.log(&h.session.id).iter().any(|e| matches!(e.kind, EntryKind::ToolSet { .. })));
+}
+
+#[tokio::test]
+async fn plan_mode_refuses_mcp_tools_that_dont_say_they_only_read() {
+    let server = model_server(vec![
+        ok(tool_calls_stream(&[
+            ("r", "toy__shout", json!({"text": "fine"})),
+            ("w", "toy__delete_all", json!({})),
+        ])),
+        ok(text_stream("planned")),
+    ])
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let config = mcp_config(&server, &tmp);
+    let mut h = start_with(config, tmp, SessionStart::New).await;
+    h.send(AgentCommand::SetMode(Mode::Plan));
+    next_event(&mut h).await;
+    h.send(AgentCommand::Prompt("go".into()));
+    let events = until_turn_ended(&mut h).await;
+    assert_eq!(result_of(&events, "r").0, "FINE");
+    let (w, w_err) = result_of(&events, "w");
+    assert!(w_err && w.contains("denied"), "{w}");
+}
+
+#[tokio::test]
+async fn a_failing_pre_tool_hook_blocks_the_call() {
+    let server = model_server(vec![ok(tool_use_stream("t1", "echo ran > ran.txt")), ok(text_stream("ok"))]).await;
+    let hook: syl_core::hooks::Hook = toml::from_str(
+        "event = \"pre_tool\"\ntool = \"run_bash\"\ncommand = \"grep -q ran.txt && { echo 'no writing ran.txt' >&2; exit 1; } || exit 0\"",
+    )
+    .unwrap();
+    let after: syl_core::hooks::Hook = toml::from_str("event = \"turn_end\"\ncommand = \"cat > turn_end.json\"").unwrap();
+    let config = AppConfig { hooks: vec![hook, after], ..test_config(&server) };
+    let mut h = start_with(config, tempfile::tempdir().unwrap(), SessionStart::New).await;
+    h.send(AgentCommand::Prompt("go".into()));
+    let events = until_turn_ended(&mut h).await;
+    let (out, is_err) = result_of(&events, "t1");
+    assert!(is_err && out.contains("no writing ran.txt"), "{out}");
+    assert!(!h.project().join("ran.txt").exists());
+    // The turn_end hook got the event as JSON on stdin.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let payload: Value = serde_json::from_str(&std::fs::read_to_string(h.project().join("turn_end.json")).unwrap()).unwrap();
+    assert_eq!(payload["event"], "turn_end");
+    assert_eq!(payload["reason"], "end_turn");
+}
+
+#[tokio::test]
+async fn custom_commands_and_skills_expand_and_the_skill_tool_loads_one() {
+    let server = model_server(vec![
+        ok(tool_calls_stream(&[("s1", "skill", json!({"name": "release"}))])),
+        ok(text_stream("ok")),
+    ])
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("project");
+    std::fs::create_dir_all(project.join(".syl/commands")).unwrap();
+    std::fs::create_dir_all(project.join(".syl/skills/release")).unwrap();
+    std::fs::write(project.join(".syl/commands/review.md"), "Review the diff, focusing on $ARGUMENTS.").unwrap();
+    std::fs::write(
+        project.join(".syl/skills/release/SKILL.md"),
+        "---\nname: release\ndescription: How to cut a release\n---\nBump the version, tag, push.",
+    )
+    .unwrap();
+    let mut h = start_with(test_config(&server), tmp, SessionStart::New).await;
+    h.send(AgentCommand::Prompt("/review error handling".into()));
+    let events = until_turn_ended(&mut h).await;
+    assert!(result_of(&events, "s1").0.contains("Bump the version, tag, push."));
+    let first = &request_bodies(&server).await[0];
+    assert_eq!(first["messages"][0]["content"], "Review the diff, focusing on error handling.");
+    assert!(first["system"][0]["text"].as_str().unwrap().contains("- release: How to cut a release"));
+    assert!(first["tools"].as_array().unwrap().iter().any(|t| t["name"] == "skill"));
+}
+
+#[tokio::test]
+async fn in_plan_mode_what_tool_hooks_write_is_put_back_too() {
+    let server = model_server(vec![ok(tool_use_stream("t1", "echo looked")), ok(text_stream("plan"))]).await;
+    let pre: syl_core::hooks::Hook = toml::from_str("event = \"pre_tool\"\ncommand = \"echo pre > pre.txt\"").unwrap();
+    let post: syl_core::hooks::Hook = toml::from_str("event = \"post_tool\"\ncommand = \"echo post >> post.txt\"").unwrap();
+    let config = AppConfig { hooks: vec![pre, post], ..test_config(&server) };
+    let mut h = start_with(config, tempfile::tempdir().unwrap(), SessionStart::New).await;
+    h.send(AgentCommand::SetMode(Mode::Plan));
+    assert_eq!(next_event(&mut h).await, AgentEvent::ModeChanged { mode: Mode::Plan });
+    h.send(AgentCommand::Prompt("look".into()));
+    let events = until_turn_ended(&mut h).await;
+    let (out, is_err) = result_of(&events, "t1");
+    assert!(is_err && out.contains("looked") && out.contains("put back"), "{out}");
+    assert!(!h.project().join("pre.txt").exists());
+    assert!(!h.project().join("post.txt").exists());
+}
+
+#[tokio::test]
+async fn cancel_stops_a_slow_session_start_hook_and_mcp_startup() {
+    let server = model_server(vec![ok(text_stream("hi"))]).await;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("project")).unwrap();
+    let slow: syl_core::hooks::Hook = toml::from_str("event = \"session_start\"\ncommand = \"sleep 60\"\ntimeout_secs = 120").unwrap();
+    // A server that never answers initialize.
+    let hung: syl_core::mcp::McpServerConfig = toml::from_str("name = \"hung\"\ncommand = \"sleep\"\nargs = [\"600\"]").unwrap();
+    let config = AppConfig { hooks: vec![slow], mcp: vec![hung], ..test_config(&server) };
+    let mut h = start_with(config, tmp, SessionStart::New).await;
+    let started = std::time::Instant::now();
+    h.send(AgentCommand::Cancel);
+    h.send(AgentCommand::Prompt("hello".into()));
+    // The hook was stopped; the turn then waits on the MCP server.
+    loop {
+        if let AgentEvent::Notice { message } = next_event(&mut h).await {
+            if message.contains("Starting 1 MCP") {
+                break;
+            }
+        }
+    }
+    h.send(AgentCommand::Cancel);
+    let events = until_turn_ended(&mut h).await;
+    assert!(matches!(events.last(), Some(AgentEvent::TurnEnded { reason: TurnEnd::Cancelled })), "{events:?}");
+    assert!(started.elapsed() < Duration::from_secs(20), "took {:?}", started.elapsed());
 }

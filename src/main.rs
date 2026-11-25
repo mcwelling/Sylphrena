@@ -202,6 +202,7 @@ async fn main() -> anyhow::Result<()> {
         carry: String::new(),
         last_tools: Vec::new(),
         mode: Mode::Build,
+        last_turn_end: None,
     };
     let result = match repl.await_session_reply(&mut handle.events).await {
         true => repl.run(&mut handle.events, resize_rx).await,
@@ -355,6 +356,8 @@ struct Repl<'a> {
     last_tools: Vec<(String, serde_json::Value, String, bool)>,
     /// Plan or build, as last sent to the agent.
     mode: Mode,
+    /// How the last turn rendered here ended.
+    last_turn_end: Option<TurnEnd>,
 }
 
 impl Repl<'_> {
@@ -521,6 +524,96 @@ impl Repl<'_> {
                 Some(_) => {}
             }
         }
+    }
+
+    /// Run a workflow: commands in the container (with retries), `ask`
+    /// steps as turns. Stops at the first step that fails. Returns false if
+    /// the agent went away.
+    async fn run_workflow(
+        &mut self,
+        wf: &syl_core::tools::workflow::Workflow,
+        events: &mut mpsc::UnboundedReceiver<AgentEvent>,
+        resize_rx: &mut tokio::sync::watch::Receiver<(u16, u16)>,
+    ) -> bool {
+        use syl_core::tools::workflow::StepKind;
+        let total = wf.steps.len();
+        self.print(&format!("\x1b[1m[Workflow: {}]\x1b[0m {total} steps\r\n", sanitize(&wf.name)));
+        for (i, step) in wf.steps.iter().enumerate() {
+            let n = i + 1;
+            self.print(&format!("\x1b[1m[{n}/{total}] {}\x1b[0m\r\n", sanitize(&step.label)));
+            let ok = match step.kind {
+                StepKind::Ask => {
+                    self.print(&chat_bubble(&sanitize(&step.command), self.cols, self.config.light));
+                    let _ = self.commands.send(AgentCommand::Prompt(step.command.clone()));
+                    self.last_turn_end = None;
+                    if !self.drive_turn(events, resize_rx).await {
+                        return false;
+                    }
+                    // Cut off (max tokens, a full context) is not done.
+                    matches!(
+                        self.last_turn_end,
+                        Some(TurnEnd::Completed(syl_core::api::types::StopReason::EndTurn | syl_core::api::types::StopReason::Other(_)))
+                    )
+                }
+                StepKind::Run => {
+                    self.print(&format!("\x1b[2m$ {}\x1b[0m\r\n", sanitize(&step.command)));
+                    let mut attempt = 0;
+                    loop {
+                        let result = self.run_step(&step.command).await;
+                        if matches!(result, Err(syl_container::ExecError::Cancelled)) {
+                            self.print(&format!("\x1b[33m[Workflow cancelled at step {n}/{total}]\x1b[0m\r\n"));
+                            return true;
+                        }
+                        let (ok, text) = match result {
+                            Ok(out) if out.success() => (true, out.stdout),
+                            Ok(out) => (false, out.error_text()),
+                            Err(e) => (false, e.to_string()),
+                        };
+                        if !text.trim().is_empty() {
+                            self.print(&format!("{}\r\n", tool_display("run_bash", &serde_json::json!({}), text.trim())));
+                        }
+                        if ok || attempt >= step.retries {
+                            break ok;
+                        }
+                        attempt += 1;
+                        self.print(&format!("\x1b[33m[failed; retrying ({attempt}/{})]\x1b[0m\r\n", step.retries));
+                    }
+                }
+            };
+            if !ok {
+                self.print(&format!("\x1b[31m[Workflow stopped at step {n}/{total}]\x1b[0m\r\n"));
+                return true;
+            }
+        }
+        self.print(&format!("\x1b[32m[Workflow complete: {total} steps]\x1b[0m\r\n"));
+        true
+    }
+
+    /// One recipe command in the container: Ctrl+C stops it, and
+    /// it can run for at most ten minutes. Keys typed meanwhile are kept for
+    /// the prompt.
+    async fn run_step(&mut self, command: &str) -> Result<syl_container::ExecOutput, syl_container::ExecError> {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut reader = KeyReader::start();
+        let mut line = SteerLine::default();
+        let result = {
+            let exec = self.container.exec(command, std::time::Duration::from_secs(600), &cancel);
+            tokio::pin!(exec);
+            loop {
+                tokio::select! {
+                    r = &mut exec => break r,
+                    Some(key) = reader.keys.recv() => {
+                        if line.handle_event(key) == SteerKey::Cancel {
+                            cancel.cancel();
+                        }
+                    }
+                }
+            }
+        };
+        let left = reader.stop().await;
+        let typed = carry_over(&line, left);
+        self.carry.push_str(&typed);
+        result
     }
 
     /// `/receipts`: what the last `n` turns did.
@@ -776,9 +869,25 @@ impl Repl<'_> {
                                     anyhow::bail!("the agent stopped unexpectedly");
                                 }
                             }
+                            SlashAction::RunWorkflow(wf) => {
+                                if !self.run_workflow(&wf, events, &mut resize_rx).await {
+                                    anyhow::bail!("the agent stopped unexpectedly");
+                                }
+                            }
                         }
                     }
-                    None => self.print(&format!("Unknown command: {line}\r\n")),
+                    None => {
+                        // A custom command or skill: the agent expands it.
+                        let project_dir = self.syl_dir.parent().unwrap_or(self.syl_dir);
+                        if syl_core::commands::expand(project_dir, &line).is_some() {
+                            let _ = self.commands.send(AgentCommand::Prompt(line));
+                            if !self.drive_turn(events, &mut resize_rx).await {
+                                anyhow::bail!("the agent stopped unexpectedly");
+                            }
+                        } else {
+                            self.print(&format!("Unknown command: {line}\r\n"));
+                        }
+                    }
                 }
                 continue;
             }
@@ -1029,6 +1138,7 @@ impl Repl<'_> {
                 AgentEvent::Notice { message } => self.print(&format!("{}\r\n", sanitize(&message))),
                 AgentEvent::Error { message } => self.print(&format!("[Error: {message}]\r\n")),
                 AgentEvent::TurnEnded { reason } => {
+                    self.last_turn_end = Some(reason.clone());
                     match reason {
                         TurnEnd::Completed(StopReason::MaxTokens) => {
                             self.print("\x1b[2m[response hit max_tokens and was cut off]\x1b[0m\r\n")

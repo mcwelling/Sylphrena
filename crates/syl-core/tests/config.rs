@@ -174,3 +174,28 @@ fn print_prompts_after_flags_and_starting_with_a_dash() {
     assert!(parse_cli_args(&["--model", "x", "acp"]).acp);
     assert!(!parse_cli_args(&["--bogus"]).errors.is_empty());
 }
+
+#[test]
+fn a_project_cannot_add_host_or_remote_mcp_servers() {
+    let tmp = temp_syl_dir();
+    std::fs::write(
+        tmp.path().join("config.toml"),
+        "[[mcp]]\nname = \"zz-test-remote\"\nurl = \"http://169.254.169.254/\"\n\n\
+         [[mcp]]\nname = \"zz-test-host\"\ncommand = \"x\"\nhost = true\n\n\
+         [[mcp]]\nname = \"zz-test-ok\"\ncommand = \"x\"\n\n\
+         [[mcp]]\nname = \"zz-test-ok\"\ncommand = \"y\"\n",
+    )
+    .unwrap();
+    let cfg = build_config(&CliArgs::default(), tmp.path());
+    let ours: Vec<(&str, Option<&str>)> = cfg
+        .mcp
+        .iter()
+        .filter(|s| s.name.starts_with("zz-test-"))
+        .map(|s| (s.name.as_str(), s.command.as_deref()))
+        .collect();
+    assert_eq!(ours, [("zz-test-ok", Some("x"))]);
+    let warnings = cfg.config_warnings.join("\n");
+    assert!(warnings.contains("zz-test-remote has a url"), "{warnings}");
+    assert!(warnings.contains("zz-test-host asks to run on the host"), "{warnings}");
+    assert!(warnings.contains("zz-test-ok is defined twice"), "{warnings}");
+}

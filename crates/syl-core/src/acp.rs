@@ -262,14 +262,40 @@ impl Server {
             }
             Some(id) => {
                 tokio::spawn(async move {
-                    let result = self.clone().handle(&method, params).await;
+                    let result = self.clone().handle(&method, params.clone()).await;
+                    // A new session's commands follow its id, once the
+                    // client knows that id.
+                    let opened = match (&result, method.as_str()) {
+                        (Ok(r), "session/new") => r["sessionId"].as_str().map(str::to_string),
+                        (Ok(_), "session/load") => params["sessionId"].as_str().map(str::to_string),
+                        _ => None,
+                    };
                     let reply = match result {
                         Ok(r) => json!({"jsonrpc": "2.0", "id": id, "result": r}),
                         Err(e) => json!({"jsonrpc": "2.0", "id": id, "error": e.to_json()}),
                     };
                     self.send(reply);
+                    if let Some(sid) = opened {
+                        self.advertise_commands(&sid);
+                    }
                 });
             }
+        }
+    }
+
+    /// Slash commands the client can offer: custom commands and skills.
+    fn advertise_commands(&self, id: &str) {
+        let Some(session) = self.session(id) else { return };
+        let cwd = &session.cwd;
+        let mut available: Vec<Value> = crate::commands::list_commands(cwd)
+            .into_iter()
+            .map(|c| json!({ "name": c.name, "description": c.description, "input": { "hint": "what to focus on (optional)" } }))
+            .collect();
+        available.extend(crate::commands::list_skills(cwd).into_iter().map(|sk| {
+            json!({ "name": format!("skill:{}", sk.name), "description": sk.description, "input": { "hint": "the task (optional)" } })
+        }));
+        if !available.is_empty() {
+            self.update(id, json!({ "sessionUpdate": "available_commands_update", "availableCommands": available }));
         }
     }
 
@@ -324,7 +350,7 @@ impl Server {
             "agentCapabilities": {
                 "loadSession": true,
                 "promptCapabilities": { "image": true, "audio": false, "embeddedContext": true },
-                "mcpCapabilities": { "http": false, "sse": false },
+                "mcpCapabilities": { "http": true, "sse": false },
                 "sessionCapabilities": { "close": {} },
             },
             "agentInfo": { "name": "syl", "title": "Syl", "version": env!("CARGO_PKG_VERSION") },
@@ -363,15 +389,17 @@ impl Server {
             return Err(RpcError::new(code::INVALID_PARAMS, "cwd must be an absolute path"));
         }
         let cwd = cwd.canonicalize().map_err(|e| RpcError::new(code::INVALID_PARAMS, format!("cwd: {e}")))?;
-        if params["mcpServers"].as_array().is_some_and(|a| !a.is_empty()) {
-            tracing::warn!("ignoring mcpServers: MCP is not supported yet");
-        }
+        let client_mcp = client_mcp_servers(&params["mcpServers"])?;
         if let Some(id) = &resume {
             if self.session(id).is_some() {
                 return Err(RpcError::new(code::INVALID_PARAMS, format!("session {id} is already open")));
             }
         }
-        let config = (self.opts.config)(&cwd);
+        let mut config = (self.opts.config)(&cwd);
+        // The client's own servers run where the client says (on the host),
+        // and replace a configured server of the same name.
+        config.mcp.retain(|s| !client_mcp.iter().any(|c| c.name == s.name));
+        config.mcp.extend(client_mcp);
         let container = self.container_for(&cwd, &config).await?;
 
         let state = SharedState::new();
@@ -430,7 +458,7 @@ impl Server {
             task: Mutex::new(None),
         });
         self.sessions.lock().unwrap().insert(id.clone(), session.clone());
-        let pump = tokio::spawn(pump(self.clone(), session.clone(), id.clone(), cwd, handle.events));
+        let pump = tokio::spawn(pump(self.clone(), session.clone(), id.clone(), cwd.clone(), handle.events));
         // Keep the agent task too: it finishes when the loop stops.
         let agent_task = handle.task;
         *session.task.lock().unwrap() = Some(tokio::spawn(async move {
@@ -497,6 +525,55 @@ async fn finish_prompt(rx: oneshot::Receiver<(TurnEnd, Option<String>)>) -> RpcR
         };
         Ok(json!({ "stopReason": stop }))
     }
+}
+
+/// ACP `mcpServers` as Syl's server configs. They come from the client,
+/// which runs Syl, so stdio servers run on the host as it asks.
+fn client_mcp_servers(list: &Value) -> Result<Vec<crate::mcp::McpServerConfig>, RpcError> {
+    let pairs = |v: &Value| -> std::collections::BTreeMap<String, String> {
+        v.as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|p| Some((p["name"].as_str()?.to_string(), p["value"].as_str()?.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let Some(items) = list.as_array() else { return Ok(Vec::new()) };
+    items
+        .iter()
+        .map(|m| {
+            let name = m["name"].as_str().ok_or_else(|| RpcError::new(code::INVALID_PARAMS, "an MCP server has no name"))?;
+            let mut cfg = crate::mcp::McpServerConfig {
+                name: name.to_string(),
+                command: None,
+                args: Vec::new(),
+                env: Default::default(),
+                url: None,
+                headers: Default::default(),
+                host: true,
+                timeout_secs: None,
+            };
+            match m["type"].as_str() {
+                Some("http") => {
+                    cfg.url = m["url"].as_str().map(str::to_string);
+                    cfg.headers = pairs(&m["headers"]);
+                }
+                Some("sse") => {
+                    return Err(RpcError::new(code::INVALID_PARAMS, format!("MCP server {name}: SSE transport isn't supported")))
+                }
+                _ => {
+                    cfg.command = m["command"].as_str().map(str::to_string);
+                    cfg.args = m["args"]
+                        .as_array()
+                        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                        .unwrap_or_default();
+                    cfg.env = pairs(&m["env"]);
+                }
+            }
+            Ok(cfg)
+        })
+        .collect()
 }
 
 fn str_param(params: &Value, key: &str) -> Result<String, RpcError> {

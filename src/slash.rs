@@ -14,6 +14,8 @@ pub enum SlashAction {
     /// Send this to the agent and show its answer (`SessionChanged` or
     /// `Error`).
     Agent(AgentCommand),
+    /// Run this workflow (parameters filled in), step by step.
+    RunWorkflow(Workflow),
 }
 
 #[derive(Debug, Clone)]
@@ -74,6 +76,22 @@ Slash commands:
   /workflow [name]  List workflows or run one
   /log              Last 20 lines of syl.log
   /exit             Exit";
+        let project = ctx.workflow_dir.parent().and_then(|p| p.parent()).unwrap_or(ctx.workflow_dir);
+        let mut output = output.to_string();
+        let commands = syl_core::commands::list_commands(project);
+        if !commands.is_empty() {
+            output.push_str("\n\nYour commands (.syl/commands, ~/.syl/commands):");
+            for c in &commands {
+                output.push_str(&format!("\n  /{:<16} {}", c.name, syl_core::session::one_line(&c.description, 60)));
+            }
+        }
+        let skills = syl_core::commands::list_skills(project);
+        if !skills.is_empty() {
+            output.push_str("\n\nSkills (Syl loads these when a task needs one; /skill:<name> loads one now):");
+            for sk in &skills {
+                output.push_str(&format!("\n  {:<17} {}", sk.name, syl_core::session::one_line(&sk.description, 60)));
+            }
+        }
         return SlashResult::say(output);
     }
 
@@ -224,25 +242,33 @@ Slash commands:
     }
 
     if trimmed == "/workflow" || trimmed.starts_with("/workflow ") {
-        let wf_name = trimmed.strip_prefix("/workflow").unwrap_or("").trim();
-        let output = if wf_name.is_empty() {
+        let Some(wf_name) = trimmed.strip_prefix("/workflow").unwrap_or("").split_whitespace().next() else {
             let entries = list_workflows(ctx.workflow_dir);
             if entries.is_empty() {
-                "No workflows.".to_string()
-            } else {
-                entries
-                    .iter()
-                    .map(|e| e.key.clone())
-                    .collect::<Vec<_>>()
-                    .join("\n")
+                return SlashResult::say("No workflows.");
             }
-        } else {
-            match load_workflow(ctx.workflow_dir, wf_name) {
-                None => format!("Workflow '{}' not found.", wf_name),
-                Some(wf) => run_workflow(&wf, ctx.container),
-            }
+            let lines: Vec<String> = entries
+                .iter()
+                .map(|e| match load_workflow(ctx.workflow_dir, &e.key) {
+                    Some(wf) if !wf.params.is_empty() => format!("{}  ({})", e.key, wf.params.join(", ")),
+                    _ => e.key.clone(),
+                })
+                .collect();
+            return SlashResult::say(lines.join("\n"));
         };
-        return SlashResult::say(output);
+        let after_name = trimmed.strip_prefix("/workflow").unwrap_or("").trim_start();
+        let after_name = after_name.strip_prefix(wf_name).unwrap_or("");
+        let args = match syl_core::tools::workflow::split_args(after_name) {
+            Ok(a) => a,
+            Err(e) => return SlashResult::say(format!("Couldn't read the values: {e}")),
+        };
+        return match load_workflow(ctx.workflow_dir, wf_name) {
+            None => SlashResult::say(format!("Workflow '{}' not found.", wf_name)),
+            Some(wf) => match wf.fill(&args) {
+                Ok(filled) => Some(SlashResult { action: SlashAction::RunWorkflow(filled), output: None }),
+                Err(e) => SlashResult::say(e),
+            },
+        };
     }
 
     if trimmed == "/exit" || trimmed == "/quit" {
@@ -265,35 +291,3 @@ fn current_prompts(ctx: &SlashContext<'_>) -> Vec<session::Prompt> {
         .unwrap_or_default()
 }
 
-// ---------------------------------------------------------------------------
-// Workflow execution (M5)
-// ---------------------------------------------------------------------------
-
-fn run_workflow(wf: &Workflow, container: &Container) -> String {
-    let total = wf.steps.len();
-    let mut lines = vec![format!("[Workflow: {}] {} steps", wf.name, total)];
-
-    for (i, step) in wf.steps.iter().enumerate() {
-        let step_num = i + 1;
-        lines.push(format!("[{step_num}/{total}] {}", step.label));
-        lines.push(format!("$ {}", step.command));
-
-        let result = tokio::task::block_in_place(|| container.exec_raw(&step.command));
-
-        match result {
-            Ok(output) => {
-                if !output.trim().is_empty() {
-                    lines.push(output.trim().to_string());
-                }
-            }
-            Err(e) => {
-                lines.push(format!("Error: {e}"));
-                lines.push(format!("[Workflow stopped at step {step_num}/{total}]"));
-                return lines.join("\n");
-            }
-        }
-    }
-
-    lines.push(format!("[Workflow complete: {} steps]", total));
-    lines.join("\n")
-}

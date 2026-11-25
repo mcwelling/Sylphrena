@@ -615,6 +615,21 @@ impl Container {
         }
     }
 
+    /// A long-running process in the container that talks over its stdin
+    /// and stdout (an MCP server): `podman exec -i` with these environment
+    /// variables, in the project directory. The caller pipes and spawns it.
+    pub fn interactive(&self, argv: &[&str], env: &[(String, String)]) -> tokio::process::Command {
+        let mut cmd = tokio::process::Command::new(&self.podman);
+        cmd.arg("exec").arg("-i");
+        // `--env NAME` takes the value from podman's own environment, so a
+        // token never appears on a command line (`ps` would show it).
+        for (k, v) in env {
+            cmd.arg("--env").arg(k).env(k, v);
+        }
+        cmd.args(["--workdir", &self.workdir, &self.name]).args(argv);
+        cmd
+    }
+
     /// Run `argv` (no shell) in the container, in the project directory,
     /// feeding it `stdin` when given. Output is drained concurrently; the
     /// process is killed on timeout or cancellation.

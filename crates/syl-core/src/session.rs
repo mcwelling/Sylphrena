@@ -56,6 +56,9 @@ pub enum EntryKind {
     },
     /// The system prompt, frozen for the conversation from here on.
     SystemPrompt { blocks: Vec<PromptBlock> },
+    /// Tool definitions sent besides the built-in ones (MCP tools, the
+    /// `skill` tool), frozen with the system prompt.
+    ToolSet { tools: Vec<serde_json::Value> },
     /// A user prompt or an assistant turn, exactly as sent or received.
     Message { message: Message },
     /// One tool result, logged as soon as the tool finishes. Consecutive
@@ -153,6 +156,8 @@ pub struct History {
     /// The id of the entry that began each message, in step with `messages`.
     starts: Vec<String>,
     pub system: Option<Vec<PromptBlock>>,
+    /// Extra tool definitions for this conversation.
+    pub tools: Option<Vec<serde_json::Value>>,
     pub name: Option<String>,
     pub model: Option<String>,
     pub forked_from: Option<ForkOrigin>,
@@ -178,6 +183,7 @@ impl History {
                 self.forked_from = forked_from.clone();
             }
             EntryKind::SystemPrompt { blocks } => self.system = Some(blocks.clone()),
+            EntryKind::ToolSet { tools } => self.tools = Some(tools.clone()),
             EntryKind::Message { message } => {
                 self.messages.push(message.clone());
                 self.starts.push(e.id.clone());

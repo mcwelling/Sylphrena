@@ -474,3 +474,50 @@ async fn closing_a_session_cancels_its_queued_prompts() {
     let (_, rb) = c.until_response(b).await;
     assert_eq!(rb["result"]["stopReason"], "cancelled", "{rb}");
 }
+
+#[tokio::test]
+async fn client_mcp_servers_and_project_commands_reach_the_session() {
+    let script = r#"
+import json, sys
+for line in sys.stdin:
+    m = json.loads(line)
+    if m.get("id") is None: continue
+    if m["method"] == "initialize":
+        r = {"protocolVersion": "2025-06-18", "capabilities": {}, "serverInfo": {"name": "z", "version": "1"}}
+    elif m["method"] == "tools/list":
+        r = {"tools": [{"name": "now", "description": "The time", "inputSchema": {"type": "object"}}]}
+    else:
+        r = {"content": [{"type": "text", "text": "noon"}]}
+    print(json.dumps({"jsonrpc": "2.0", "id": m["id"], "result": r}), flush=True)
+"#;
+    let call = sse(&[
+        json!({"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":0}}}),
+        json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"c1","name":"zed__now"}}),
+        json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{}"}}),
+        json!({"type":"content_block_stop","index":0}),
+        json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":5}}),
+    ]);
+    let server = model_server(vec![ok(call), ok(text_stream("it's noon"))]).await;
+    let mut c = start(&server, vec![]);
+    let script_path = c.tmp.path().join("zed_mcp.py");
+    std::fs::write(&script_path, script).unwrap();
+    std::fs::create_dir_all(c.tmp.path().join("project/.syl/commands")).unwrap();
+    std::fs::write(c.tmp.path().join("project/.syl/commands/standup.md"), "---\ndescription: Write my standup\n---\nSummarise yesterday.").unwrap();
+
+    c.call("initialize", json!({"protocolVersion": 1})).await;
+    let cwd = c.project();
+    let mcp = json!([{"name": "zed", "command": "python3", "args": [script_path.to_string_lossy()], "env": []}]);
+    let (msgs, r) = c.call("session/new", json!({"cwd": cwd, "mcpServers": mcp})).await;
+    let sid = r["result"]["sessionId"].as_str().unwrap().to_string();
+    // The commands come after the reply, once the client knows the session.
+    assert!(updates(&msgs).iter().all(|u| u["sessionUpdate"] != "available_commands_update"));
+
+    let (msgs, r) = c.call("session/prompt", json!({"sessionId": sid, "prompt": [{"type": "text", "text": "time?"}]})).await;
+    let cmds = updates(&msgs).into_iter().find(|u| u["sessionUpdate"] == "available_commands_update").expect("commands offered");
+    assert_eq!(cmds["sessionId"].as_str().unwrap_or(&sid), sid);
+    assert_eq!(cmds["availableCommands"][0]["name"], "standup");
+    assert_eq!(cmds["availableCommands"][0]["description"], "Write my standup");
+    assert_eq!(r["result"]["stopReason"], "end_turn");
+    let done = updates(&msgs).into_iter().find(|u| u["toolCallId"] == "c1" && u["status"] == "completed").expect("the MCP call finished");
+    assert_eq!(done["rawOutput"], "noon");
+}
