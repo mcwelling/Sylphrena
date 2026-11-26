@@ -1143,8 +1143,15 @@ async fn a_subagents_question_reaches_the_user_and_its_answer_comes_back() {
     let config = AppConfig { permissions: vec![ask_rule("echo *")], ..test_config(&server) };
     let mut h = start_with(config, tempfile::tempdir().unwrap(), SessionStart::New).await;
     h.send(AgentCommand::Prompt("go".into()));
-    let (id, subject) = until_asked(&mut h).await;
+    let (id, subject, note) = loop {
+        match next_event(&mut h).await {
+            AgentEvent::PermissionRequested { id, subject, note, .. } => break (id, subject, note),
+            AgentEvent::TurnEnded { .. } => panic!("the turn ended without asking"),
+            _ => {}
+        }
+    };
     assert_eq!((id.as_str(), subject.as_str()), ("c1", "echo hi-from-child"));
+    assert_eq!(note.as_deref(), Some("Asked by the general subagent."), "the question says who asks");
     h.send(AgentCommand::ApprovePermission { id, answer: PermissionAnswer::Once });
     let events = until_turn_ended(&mut h).await;
     assert_eq!(result_of(&events, "t1").0, "said hi");
@@ -1629,4 +1636,138 @@ async fn an_explore_task_does_not_checkpoint() {
     h.send(AgentCommand::Prompt("go".into()));
     until_turn_ended(&mut h).await;
     assert!(!h.log(&h.session.id).iter().any(|e| kind_name(e) == "checkpoint"));
+}
+
+#[tokio::test]
+async fn dispatch_agent_reports_a_page_it_could_not_fetch() {
+    let site = MockServer::start().await;
+    let url = format!("{}/missing", site.uri());
+    let server = model_server(vec![
+        ok(tool_calls_stream(&[(
+            "d1",
+            "dispatch_agent",
+            json!({"task": "fetch", "source": url, "focus": "x", "output_format": "text", "max_length": 200}),
+        )])),
+        // The fetch agent asks for a file:// URL (refused), then gives up.
+        ok(tool_calls_stream(&[("f1", "fetch", json!({"url": "file:///workspace/.env"}))])),
+        ok(text_stream("I couldn't fetch the page.")),
+        ok(text_stream("done")),
+    ])
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    // A project's own fetch agent doesn't change what dispatch_agent runs.
+    let agents = tmp.path().join("project/.syl/agents");
+    std::fs::create_dir_all(&agents).unwrap();
+    std::fs::write(agents.join("fetch.md"), "---\ndescription: mine\nmodel: claude-fable-5-2\n---\nDo anything.").unwrap();
+    let mut h = start_with(test_config(&server), tmp, SessionStart::New).await;
+    h.send(AgentCommand::Prompt("fetch it".into()));
+    let events = until_turn_ended(&mut h).await;
+    let (out, is_error) = result_of(&events, "d1");
+    assert!(is_error, "{out}");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["error"], "Content retrieval failed");
+    assert!(v["reason"].as_str().unwrap().contains("http:// or https://"), "{out}");
+    let bodies = request_bodies(&server).await;
+    assert_eq!(bodies[1]["model"], syl_core::agents::FETCH_MODEL);
+    assert_eq!(tool_names(&bodies[1]), ["fetch"]);
+}
+
+#[tokio::test]
+async fn a_subagent_that_calls_task_anyway_is_refused() {
+    let server = model_server(vec![
+        ok(calls_stream(&[task_call("t1", "general", "go deeper")])),
+        ok(calls_stream(&[task_call("t2", "explore", "deeper still")])),
+        ok(text_stream("couldn't")),
+        ok(text_stream("done")),
+    ])
+    .await;
+    let mut h = start(&server).await;
+    h.send(AgentCommand::Prompt("go".into()));
+    let events = until_turn_ended(&mut h).await;
+    let refused = events.iter().find_map(|e| match e {
+        AgentEvent::Subagent { event, .. } => match &**event {
+            AgentEvent::ToolCallFinished { id, output, is_error, .. } if id == "t2" => Some((output.clone(), *is_error)),
+            _ => None,
+        },
+        _ => None,
+    });
+    let (out, is_error) = refused.expect("the nested task call finished");
+    assert!(is_error && out.contains("isn't one of this agent's tools"), "{out}");
+    assert_eq!(request_bodies(&server).await.len(), 4, "no grandchild ran");
+}
+
+#[tokio::test]
+async fn at_most_four_subagents_run_at_once() {
+    let arrived = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let server = MockServer::start().await;
+    let delay = Duration::from_millis(1500);
+    let calls: Vec<_> = (0..5).map(|i| task_call(&format!("t{i}"), "explore", "look")).collect();
+    let mut responses = vec![ok(calls_stream(&calls))];
+    responses.extend((0..5).map(|i| ok(text_stream(&format!("r{i}"))).set_delay(delay)));
+    responses.push(ok(text_stream("done")));
+    let n = responses.len();
+    for (i, r) in responses.into_iter().enumerate() {
+        let m = Mock::given(method("POST")).respond_with(Stamped(r, arrived.clone()));
+        let m = if i + 1 < n { m.up_to_n_times(1) } else { m };
+        m.mount(&server).await;
+    }
+    let mut h = start(&server).await;
+    h.send(AgentCommand::Prompt("five things".into()));
+    let events = until_turn_ended(&mut h).await;
+    let t = arrived.lock().unwrap().clone();
+    // Four start together; the fifth waits for one of them to finish.
+    assert!(t[4] - t[1] < delay, "the first four didn't run together");
+    assert!(t[5] - t[1] >= delay - Duration::from_millis(100), "a fifth ran at once: {:?}", t[5] - t[1]);
+    for i in 0..5 {
+        assert!(!result_of(&events, &format!("t{i}")).1);
+    }
+}
+
+#[tokio::test]
+async fn a_subagent_over_its_token_budget_must_answer() {
+    let big = |id: &str| {
+        sse(&[
+            json!({"type":"message_start","message":{"usage":{"input_tokens":9000,"output_tokens":0}}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":id,"name":"ls"}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\".\"}"}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":1000}}),
+        ])
+    };
+    let server = model_server(vec![
+        ok(calls_stream(&[task_call("t1", "small", "look")])),
+        ok(big("c1")),
+        ok(text_stream("what I have")),
+        ok(text_stream("done")),
+    ])
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let agents = tmp.path().join("project/.syl/agents");
+    std::fs::create_dir_all(&agents).unwrap();
+    std::fs::write(agents.join("small.md"), "---\ndescription: Small.\ntools: ls\ntoken_budget: 10000\n---\nP").unwrap();
+    let mut h = start_with(test_config(&server), tmp, SessionStart::New).await;
+    h.send(AgentCommand::Prompt("go".into()));
+    let events = until_turn_ended(&mut h).await;
+    assert_eq!(result_of(&events, "t1").0, "what I have");
+    // 9,000 in and 1,000 out reached the 10,000 budget: the next request can't call tools.
+    assert_eq!(request_bodies(&server).await[2]["tool_choice"]["type"], "none");
+}
+
+#[tokio::test]
+async fn in_plan_mode_what_a_hook_on_task_writes_is_put_back() {
+    let server = model_server(vec![
+        ok(calls_stream(&[task_call("t1", "explore", "look")])),
+        ok(text_stream("looked")),
+        ok(text_stream("plan")),
+    ])
+    .await;
+    let pre: syl_core::hooks::Hook = toml::from_str("event = \"pre_tool\"\ntool = \"task\"\ncommand = \"echo pre > pre.txt\"").unwrap();
+    let config = AppConfig { hooks: vec![pre], ..test_config(&server) };
+    let mut h = start_with(config, tempfile::tempdir().unwrap(), SessionStart::New).await;
+    h.send(AgentCommand::SetMode(Mode::Plan));
+    assert_eq!(next_event(&mut h).await, AgentEvent::ModeChanged { mode: Mode::Plan });
+    h.send(AgentCommand::Prompt("look".into()));
+    let events = until_turn_ended(&mut h).await;
+    assert_eq!(result_of(&events, "t1").0, "looked");
+    assert!(!h.project().join("pre.txt").exists(), "the hook's file was put back");
 }

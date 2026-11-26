@@ -263,6 +263,10 @@ struct ContextState {
     checkpoint_error_reported: bool,
     /// Nested git repositories were already reported.
     nested_repos_reported: bool,
+    /// A subagent's model requests and budget tokens so far, over all its
+    /// turns (a dispatch_agent retry is a second turn on the same budget).
+    sub_requests: u32,
+    sub_spent: u64,
 }
 
 fn open_session(dir: Option<&std::path::Path>, id: &str) -> anyhow::Result<SessionLog> {
@@ -553,7 +557,11 @@ fn system_prompt(
         tools.push(tools::skill_tool());
     }
     if sub.is_none() && agent.config.tools {
-        tools.push(crate::agents::task_tool(&crate::agents::list_agents(&agent.paths.project_dir).0));
+        let (agents, problems) = crate::agents::list_agents(&agent.paths.project_dir);
+        for p in problems {
+            let _ = events.send(AgentEvent::Notice { message: format!("[Syl] {p}") });
+        }
+        tools.push(crate::agents::task_tool(&agents));
     }
     if session.history().tools.as_ref().map_or(!tools.is_empty(), |t| *t != tools) {
         record(agent, session, ctx, events, EntryKind::ToolSet { tools: tools.clone() });
@@ -792,8 +800,6 @@ async fn turn_body(
     // request it may make is sent with tool_choice none, after a note, so
     // it answers with what it has.
     let budget = agent.config.subagent.clone();
-    let mut requests = 0u32;
-    let mut spent = 0u64;
     let mut wrapping_up = false;
 
     let mut overflow_retries = 0;
@@ -802,7 +808,7 @@ async fn turn_body(
     let mut overflow: Option<String> = None;
     loop {
         if let Some(def) = &budget {
-            if !wrapping_up && (requests + 1 >= def.max_requests || spent >= def.token_budget) {
+            if !wrapping_up && (ctx.sub_requests + 1 >= def.max_requests || ctx.sub_spent >= def.token_budget) {
                 wrapping_up = true;
                 record(agent, session, ctx, events, EntryKind::Note {
                     text: "[Budget reached: no more tool calls. Reply now with what you found and what is left undone.]"
@@ -908,16 +914,20 @@ async fn turn_body(
             tok.clone()
         };
         emit(AgentEvent::Usage { request: turn.usage.clone(), session: session_usage });
-        requests += 1;
-        spent += turn.usage.input_tokens + turn.usage.cache_read_tokens + turn.usage.cache_write_tokens + turn.usage.output_tokens;
+        // Cache reads aren't counted: each request reads the whole context
+        // back, at a tenth of the price.
+        ctx.sub_requests += 1;
+        ctx.sub_spent += turn.usage.input_tokens + turn.usage.cache_write_tokens + turn.usage.output_tokens;
 
         // A tool_use the model did not finish (stop_reason max_tokens etc.)
         // gets no tool_result, and a tool_use without one makes every later
         // request fail with a 400, so only a tool_use turn keeps them.
         record(agent, session, ctx, events, EntryKind::Message {
+            // A wrap-up reply's tool calls won't run (tool_choice was none),
+            // so they go too.
             message: Message::assistant_blocks(compaction::drop_unanswered_tool_uses(
                 &turn.content,
-                &turn.stop_reason,
+                if wrapping_up { &StopReason::EndTurn } else { &turn.stop_reason },
             )),
         });
         let u = &turn.usage;
@@ -1034,7 +1044,10 @@ async fn turn_body(
             }
             let runnable: Vec<usize> = (0..group.len()).filter(|&k| results[k].is_none()).collect();
             let slots = tokio::sync::Semaphore::new(crate::agents::MAX_PARALLEL);
-            let call = CallCtx { parent, model: &config.model, session_id: session.id(), slots: &slots };
+            let user_prompt = config.user_task.clone().unwrap_or_else(|| {
+                crate::session::user_prompts(session.entries()).last().map(|p| p.text.clone()).unwrap_or_default()
+            });
+            let call = CallCtx { parent, model: &config.model, session_id: session.id(), slots: &slots, user_prompt: &user_prompt };
             let outputs = futures_util::future::join_all(runnable.iter().map(|&k| {
                 let (id, name, input) = &group[k];
                 execute_call(agent, &tool_ctx, mode, &call, id, name, input, cancel.clone())
@@ -1265,15 +1278,21 @@ struct CallCtx<'a> {
     session_id: &'a str,
     /// Subagents running at once.
     slots: &'a tokio::sync::Semaphore,
+    /// The user's latest request, for a subagent's reviewer.
+    user_prompt: &'a str,
 }
 
 /// Whether a `task` call's agent can change the workspace.
 fn subagent_may_write(agent: &Agent, name: &str, input: &serde_json::Value) -> bool {
+    use crate::hooks::HookEvent;
+    // Tool hooks can write whatever the tool.
+    let hooks = agent.config.hooks.iter().any(|h| matches!(h.event, HookEvent::PreTool | HookEvent::PostTool));
     name == "task"
-        && input["agent"]
-            .as_str()
-            .and_then(|a| crate::agents::find(&agent.paths.project_dir, a))
-            .is_some_and(|d| d.can_write())
+        && (hooks
+            || input["agent"]
+                .as_str()
+                .and_then(|a| crate::agents::find(&agent.paths.project_dir, a))
+                .is_some_and(|d| d.can_write()))
 }
 
 /// Run a `task` or `dispatch_agent` call.
@@ -1291,15 +1310,28 @@ async fn start_subagent(
             Ok(d) => d,
             Err(e) => return e,
         };
-        let Some(mut def) = crate::agents::find(&agent.paths.project_dir, "fetch") else {
+        // Always the built-in fetch agent: a project's `fetch.md` (it comes
+        // with the project) mustn't decide what dispatch_agent can do.
+        let Some(mut def) = crate::agents::builtins().into_iter().find(|a| a.name == "fetch") else {
             return ("[Tool error: no fetch agent]".to_string(), true);
         };
         def.max_requests = def.max_requests.min(8);
         let max_tokens = d.max_tokens.max(1024);
-        let check = |reply: &str| (!d.accepts(reply)).then(|| crate::tools::dispatch::Dispatch::RETRY_JSON.to_string());
-        return match run_subagent(agent, call, mode, id, def, &d.prompt(), Some(max_tokens), Some(&check), cancel).await {
+        let err = |error: &str, reason: &str| {
+            (serde_json::json!({ "error": error, "reason": reason, "source_url": d.source }).to_string(), true)
+        };
+        return match run_subagent(agent, call, mode, id, def, &d.prompt(), Some(max_tokens), Some(&|r: &str| {
+            (!d.accepts(r)).then(|| crate::tools::dispatch::Dispatch::RETRY_JSON.to_string())
+        }), cancel)
+        .await
+        {
+            // Nothing was fetched: the page couldn't be had, whatever the reply says.
+            Ok(r) if r.fetched == 0 && r.fetch_error.is_some() => {
+                err("Content retrieval failed", r.fetch_error.as_deref().unwrap_or_default())
+            }
             Ok(r) => d.finish(&r.reply, r.truncated),
-            Err(e) => (serde_json::json!({ "error": "Sub-agent call failed", "reason": e, "source_url": d.source }).to_string(), true),
+            Err(e) if e == CANCELLED => err("Cancelled", "request cancelled by user"),
+            Err(e) => err("Sub-agent call failed", &e),
         };
     }
     let Some(agent_name) = input["agent"].as_str() else {
@@ -1321,9 +1353,13 @@ async fn start_subagent(
             }
             (out, false)
         }
+        Err(e) if e == CANCELLED => ("[Tool error: cancelled by user]".to_string(), true),
         Err(e) => (format!("[Tool error: {agent_name} failed: {e}]"), true),
     }
 }
+
+/// `run_subagent`'s error when it was cancelled.
+const CANCELLED: &str = "cancelled by user";
 
 /// Looks at a subagent's reply: Some is what to tell it to try again.
 type ReplyCheck<'a> = dyn Fn(&str) -> Option<String> + Sync + 'a;
@@ -1333,6 +1369,10 @@ struct SubagentReply {
     reply: String,
     /// Cut off at max_tokens.
     truncated: bool,
+    /// Its `fetch` calls that succeeded, and the last one's error if any
+    /// failed.
+    fetched: usize,
+    fetch_error: Option<String>,
 }
 
 /// Run `def` on `prompt` in a child session (logged under
@@ -1356,12 +1396,22 @@ async fn run_subagent(
     let parent = call.parent;
     let model = def.model.clone().unwrap_or_else(|| call.model.to_string());
     let name = def.name.clone();
+    if cancel.is_cancelled() {
+        return Err(CANCELLED.to_string());
+    }
     let mut config = agent.config.clone();
+    if model != call.model {
+        // Set for the main model; another model has its own window, and
+        // --thinking's budget would only add cost to a cheap one.
+        config.thinking_budget = None;
+        config.context_window = None;
+    }
     config.model = model.clone();
     if let Some(m) = max_tokens {
         config.max_tokens = m;
     }
     config.subagent = Some(Arc::new(def));
+    config.user_task = Some(call.user_prompt.to_string());
     let state = SharedState::new();
     *state.current_model.lock().unwrap() = model.clone();
     // Snapshots stay on: plan mode needs them to put changes back. The
@@ -1391,13 +1441,33 @@ async fn run_subagent(
         event: Box::new(event),
     };
     let mut error: Option<String> = None;
-    let forward = |e: AgentEvent, error: &mut Option<String>| {
+    let mut fetched = 0usize;
+    let mut fetch_error: Option<String> = None;
+    let mut forward = |e: AgentEvent, error: &mut Option<String>| {
         let send = |e: AgentEvent| {
             let _ = parent.events.send(e);
         };
+        if let AgentEvent::ToolCallFinished { name: tool, output, is_error, .. } = &e {
+            if tool == "fetch" {
+                if *is_error {
+                    fetch_error = Some(output.clone());
+                } else {
+                    fetched += 1;
+                }
+            }
+        }
         match e {
-            // Answered by the user through the parent's client and pending map.
-            AgentEvent::PermissionRequested { .. } | AgentEvent::PermissionDecided { .. } => send(e),
+            // Answered by the user through the parent's client and pending
+            // map; the note says which subagent is asking.
+            AgentEvent::PermissionRequested { id, name: tool, input, subject, note } => {
+                let by = format!("Asked by the {name} subagent.");
+                let note = Some(match note {
+                    Some(n) => format!("{by} {n}"),
+                    None => by,
+                });
+                send(AgentEvent::PermissionRequested { id, name: tool, input, subject, note })
+            }
+            AgentEvent::PermissionDecided { .. } => send(e),
             AgentEvent::Usage { ref request, .. } => {
                 *agent.state.subagent_cost_usd.lock().unwrap() += crate::pricing::compute_cost_usd(request, &model);
                 send(wrap(e));
@@ -1427,7 +1497,8 @@ async fn run_subagent(
         while let Ok(e) = rx.try_recv() {
             forward(e, &mut error);
         }
-        if let (TurnEnd::Completed(_), Some(check), false) = (&last, check, retried) {
+        // A reply cut off at max_tokens would be cut off again.
+        if let (TurnEnd::Completed(StopReason::EndTurn), Some(check), false) = (&last, check, retried) {
             if let Some(again) = check(&final_reply(&session)) {
                 retried = true;
                 next = Some(Message::user_text(again));
@@ -1435,8 +1506,13 @@ async fn run_subagent(
         }
     }
     match last {
-        TurnEnd::Completed(reason) => Ok(SubagentReply { reply: final_reply(&session), truncated: reason == StopReason::MaxTokens }),
-        TurnEnd::Cancelled => Err("cancelled by user".to_string()),
+        TurnEnd::Completed(reason) => Ok(SubagentReply {
+            reply: final_reply(&session),
+            truncated: reason == StopReason::MaxTokens,
+            fetched,
+            fetch_error,
+        }),
+        TurnEnd::Cancelled => Err(CANCELLED.to_string()),
         TurnEnd::Failed => Err(error.unwrap_or_else(|| "the request failed".to_string())),
     }
 }
@@ -1483,8 +1559,12 @@ async fn execute_call(
 ) -> (String, bool, Option<(String, String)>) {
     if crate::agents::STARTS_SUBAGENTS.contains(&name) {
         // A subagent takes the project lock and snapshots for its own calls
-        // as they run: holding them here would deadlock it.
-        let _slot = call.slots.acquire().await;
+        // as they run: holding them here would deadlock it. Its hooks get
+        // them in run_hooked instead.
+        let _slot = tokio::select! {
+            s = call.slots.acquire() => s,
+            _ = cancel.cancelled() => return ("[Tool error: cancelled by user]".to_string(), true, None),
+        };
         let (o, e) = run_hooked(agent, tool_ctx, Some((call, mode)), id, name, input, &cancel).await;
         return (o, e, None);
     }
@@ -1666,7 +1746,8 @@ async fn run_hooked(
         let payload = serde_json::json!({
             "event": "pre_tool", "session_id": session_id, "tool": name, "tool_use_id": id, "input": input,
         });
-        if let HookOutcome::Failed(why) = run_all(&agent.container, hooks, HookEvent::PreTool, Some(name), &payload, cancel).await {
+        let run = run_all(&agent.container, hooks, HookEvent::PreTool, Some(name), &payload, cancel);
+        if let HookOutcome::Failed(why) = guarded_hook(agent, call, name, run).await {
             if cancel.is_cancelled() {
                 return ("[Cancelled]".to_string(), true);
             }
@@ -1684,11 +1765,40 @@ async fn run_hooked(
             "event": "post_tool", "session_id": session_id, "tool": name, "tool_use_id": id, "input": input,
             "output": output, "is_error": is_error,
         });
-        if let HookOutcome::Failed(why) = run_all(&agent.container, hooks, HookEvent::PostTool, Some(name), &payload, cancel).await {
+        let run = run_all(&agent.container, hooks, HookEvent::PostTool, Some(name), &payload, cancel);
+        if let HookOutcome::Failed(why) = guarded_hook(agent, call, name, run).await {
             return (format!("{output}\n\n[post_tool hook: {why}]"), is_error);
         }
     }
     (output, is_error)
+}
+
+/// A hook of a subagent call, run as a writing tool's would be: under the
+/// project lock, and in plan mode between snapshots so what it changes is
+/// put back. (`execute_call` doesn't hold them around the whole subagent
+/// call, which takes them for its own calls.) Other calls' hooks already
+/// run inside `execute_call`'s.
+async fn guarded_hook<F: std::future::Future<Output = crate::hooks::HookOutcome>>(
+    agent: &Agent,
+    call: Option<(&CallCtx<'_>, Mode)>,
+    name: &str,
+    run: F,
+) -> crate::hooks::HookOutcome {
+    let Some((_, mode)) = call.filter(|_| crate::agents::STARTS_SUBAGENTS.contains(&name)) else {
+        return run.await;
+    };
+    if mode == Mode::Plan {
+        match in_snapshot(agent, run).await {
+            Ok((outcome, _put_back)) => outcome,
+            Err(why) => crate::hooks::HookOutcome::Failed(format!(
+                "plan mode can't run it: the workspace can't be snapshotted ({why}), so its changes couldn't be put back"
+            )),
+        }
+    } else {
+        let lock = project_lock(&agent.paths.project_dir);
+        let _shared = lock.read().await;
+        run.await
+    }
 }
 
 /// Decides whether a tool call may run.
@@ -1757,7 +1867,11 @@ impl Gate<'_> {
             Action::Ask => {
                 let mut note = None;
                 if let Some(reviewer) = &self.config.reviewer {
-                    let task = crate::session::user_prompts(session.entries()).last().map(|p| p.text.clone()).unwrap_or_default();
+                    // A subagent's prompt was written by the model: the reviewer
+                    // judges against what the user asked for.
+                    let task = self.config.user_task.clone().unwrap_or_else(|| {
+                        crate::session::user_prompts(session.entries()).last().map(|p| p.text.clone()).unwrap_or_default()
+                    });
                     match crate::control::review(
                         self.agent.model.as_ref(),
                         self.config,
@@ -1793,6 +1907,21 @@ impl Gate<'_> {
                     g = self.ask_lock.lock() => g,
                     _ = self.cancel.cancelled() => return Err("[Tool error: cancelled by user]".to_string()),
                 };
+                // A subagent running alongside may have just been told
+                // "always" for this: take the saved answers again.
+                if let Some(Ok(fresh)) = self.agent.paths.approvals.as_deref().map(crate::permissions::load_approvals) {
+                    if fresh.len() != approvals.len() {
+                        *approvals = fresh;
+                        let again = Policy::new(self.config.permissions.clone())
+                            .with_approvals(approvals.clone())
+                            .with_mode(self.mode)
+                            .deny_tools(self.plan_denied)
+                            .decide(name, input);
+                        if again.action == Action::Allow {
+                            return Ok(());
+                        }
+                    }
+                }
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 self.pending.lock().unwrap().insert(id.to_string(), tx);
                 let _ = events.send(AgentEvent::PermissionRequested {

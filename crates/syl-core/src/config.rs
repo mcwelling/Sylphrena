@@ -125,6 +125,10 @@ pub struct AppConfig {
     /// Send this request with `tool_choice: none`: a subagent at the end
     /// of its budget must answer with what it has.
     pub tool_choice_none: bool,
+    /// For a subagent: the user's latest request in the parent's session,
+    /// which its reviewer judges calls against (its own prompt was written
+    /// by the model).
+    pub user_task: Option<String>,
 }
 
 /// Tools only subagents are offered.
@@ -206,6 +210,7 @@ impl Default for AppConfig {
             extra_tools: Default::default(),
             subagent: None,
             tool_choice_none: false,
+            user_task: None,
         }
     }
 }

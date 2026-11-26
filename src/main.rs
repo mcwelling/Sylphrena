@@ -1100,14 +1100,9 @@ impl Repl<'_> {
                         let line = format!(" \x1b[2m↳ {agent} ›\x1b[0m {}", tool_brief(&name, &input));
                         terminal::draw_ticker(&self.tui.stdout, self.rows, &clip_visible(&line, self.cols));
                     }
-                    AgentEvent::ToolCallFinished { name, output, is_error, .. } => {
-                        let mark = if is_error { "\x1b[31m✗\x1b[0m" } else { "\x1b[32m✓\x1b[0m" };
-                        let line = format!(
-                            " \x1b[2m↳ {agent}\x1b[0m {mark} {name}  \x1b[2m{}\x1b[0m",
-                            one_line(&sanitize(&tool_outcome(&name, &output, is_error)), 60)
-                        );
-                        terminal::draw_ticker(&self.tui.stdout, self.rows, &clip_visible(&line, self.cols));
-                    }
+                    // Back to the spinner for the task call, so a subagent
+                    // waiting on the model doesn't look stuck.
+                    AgentEvent::ToolCallFinished { .. } if !active.is_empty() => self.show_running(&active),
                     AgentEvent::Notice { message } => {
                         self.print(&format!("\x1b[2m[{agent}] {}\x1b[0m\r\n", sanitize(&message)))
                     }

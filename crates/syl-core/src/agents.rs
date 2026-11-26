@@ -12,10 +12,10 @@
 //! ```markdown
 //! ---
 //! description: Reviews a diff for error handling.
-//! model: claude-haiku-5-5        # optional; default: the parent's model
-//! tools: read_file, grep, glob   # optional; default: every tool but task
-//! max_requests: 20               # optional; default 25
-//! max_tokens: 200000             # optional token budget; default 400000
+//! model: claude-haiku-5-5   # optional; default: the parent's model
+//! tools: read_file, grep     # optional; default: every tool but task
+//! max_requests: 20           # optional; default 25
+//! token_budget: 200000       # optional; default 400000
 //! ---
 //! You review diffs. ...
 //! ```
@@ -30,9 +30,19 @@ use crate::commands::{contained, field, first_line, front_matter, home, is_link}
 
 /// Model requests a subagent may make, by default.
 pub const DEFAULT_MAX_REQUESTS: u32 = 25;
-/// Tokens (input, cache reads and writes, and output, over all its
-/// requests) a subagent may use, by default.
+/// Tokens a subagent may use over all its requests, by default: input,
+/// cache writes and output. Cache reads aren't counted: every request
+/// reads the whole context back, and they cost a tenth as much.
 pub const DEFAULT_TOKEN_BUDGET: u64 = 400_000;
+/// The most a definition may set.
+const MAX_REQUESTS_CAP: u64 = 200;
+const TOKEN_BUDGET_CAP: u64 = 5_000_000;
+
+/// The tools there are, besides MCP tools (`server__tool`).
+const KNOWN_TOOLS: &[&str] = &[
+    "run_bash", "read_file", "edit_file", "write_file", "grep", "glob", "ls", "memory_read", "memory_write",
+    "workflow_write", "workflow_delete", "show_image", "fetch", "skill",
+];
 /// Subagents that run at once when one response starts several.
 pub const MAX_PARALLEL: usize = 4;
 
@@ -149,32 +159,77 @@ fn tool_list(v: &str) -> Vec<String> {
         .collect()
 }
 
+/// A field's value without a trailing ` # comment`.
+fn uncomment(v: &str) -> String {
+    match v.find(" #") {
+        Some(i) => v[..i].trim().to_string(),
+        None => v.trim().to_string(),
+    }
+}
+
+/// `key:` followed by `- item` lines in the front matter (a YAML block
+/// list), which `front_matter` leaves out.
+fn block_list(text: &str, key: &str) -> Option<Vec<String>> {
+    let header = text.strip_prefix("---")?.split("\n---").next()?;
+    let mut lines = header.lines().skip_while(|l| l.trim_end() != format!("{key}:"));
+    lines.next()?;
+    let items: Vec<String> = lines
+        .map_while(|l| l.trim_start().strip_prefix("- ").filter(|_| l.starts_with([' ', '\t', '-'])))
+        .map(|i| uncomment(i).trim_matches(|c| c == '"' || c == '\'').to_string())
+        .filter(|i| !i.is_empty())
+        .collect();
+    (!items.is_empty()).then_some(items)
+}
+
 /// A definition from a file's text; `problems` gets what was ignored.
 pub fn parse(name: &str, text: &str, path: Option<PathBuf>, problems: &mut Vec<String>) -> AgentDef {
     let (fields, body) = front_matter(text);
-    let num = |key: &str, default: u64, problems: &mut Vec<String>| match field(&fields, key) {
+    let has = |key: &str| fields.iter().any(|(k, _)| k == key);
+    let num = |key: &str, default: u64, cap: u64, problems: &mut Vec<String>| match field(&fields, key).map(|v| uncomment(&v)) {
         None => default,
-        Some(v) => v.parse::<u64>().ok().filter(|n| *n > 0).unwrap_or_else(|| {
-            problems.push(format!("agent {name}: `{key}: {v}` isn't a positive number; using {default}"));
-            default
-        }),
+        Some(v) => match v.parse::<u64>().ok().filter(|n| *n > 0) {
+            Some(n) if n > cap => {
+                problems.push(format!("agent {name}: `{key}: {n}` is over {cap}; using {cap}"));
+                cap
+            }
+            Some(n) => n,
+            None => {
+                problems.push(format!("agent {name}: `{key}: {v}` isn't a positive number; using {default}"));
+                default
+            }
+        },
     };
-    let tools = field(&fields, "tools").map(|v| {
-        let mut t = tool_list(&v);
-        if t.iter().any(|x| x == "task") {
-            problems.push(format!("agent {name}: subagents can't start subagents, so `task` was left out"));
-            t.retain(|x| x != "task");
+    // A `tools` line that is there but empty or unreadable gives no tools,
+    // never every tool: a reviewer meant to read mustn't get run_bash.
+    let tools = if has("tools") {
+        let mut t = block_list(text, "tools").unwrap_or_else(|| tool_list(&uncomment(&field(&fields, "tools").unwrap_or_default())));
+        if t.is_empty() {
+            problems.push(format!("agent {name}: `tools` lists nothing it can read, so it has no tools"));
         }
-        t
-    });
-    let model = field(&fields, "model").filter(|m| m != "inherit");
+        if t.iter().any(|x| STARTS_SUBAGENTS.contains(&x.as_str())) {
+            problems.push(format!("agent {name}: subagents can't start subagents, so task and dispatch_agent were left out"));
+            t.retain(|x| !STARTS_SUBAGENTS.contains(&x.as_str()));
+        }
+        let unknown: Vec<&String> = t.iter().filter(|x| !KNOWN_TOOLS.contains(&x.as_str()) && !x.contains("__")).collect();
+        if !unknown.is_empty() {
+            let list: Vec<&str> = unknown.iter().map(|s| s.as_str()).collect();
+            problems.push(format!("agent {name}: no tool called {}", list.join(", ")));
+        }
+        Some(t)
+    } else {
+        None
+    };
+    if has("max_tokens") {
+        problems.push(format!("agent {name}: `max_tokens` isn't read; the budget over all its requests is `token_budget`"));
+    }
+    let model = field(&fields, "model").map(|m| uncomment(&m)).filter(|m| !m.is_empty() && m != "inherit");
     AgentDef {
         name: name.to_string(),
         description: field(&fields, "description").unwrap_or_else(|| first_line(&body)),
         model,
         tools,
-        max_requests: num("max_requests", DEFAULT_MAX_REQUESTS as u64, problems).min(u32::MAX as u64) as u32,
-        token_budget: num("max_tokens", DEFAULT_TOKEN_BUDGET, problems),
+        max_requests: num("max_requests", DEFAULT_MAX_REQUESTS as u64, MAX_REQUESTS_CAP, problems) as u32,
+        token_budget: num("token_budget", DEFAULT_TOKEN_BUDGET, TOKEN_BUDGET_CAP, problems),
         prompt: body.trim().to_string(),
         path,
     }
@@ -269,7 +324,7 @@ mod tests {
         let mut problems = Vec::new();
         let d = parse(
             "review",
-            "---\ndescription: Reviews diffs.\nmodel: claude-haiku-5-5\ntools: [read_file, grep, task]\nmax_requests: 5\nmax_tokens: nope\n---\nYou review.\n",
+            "---\ndescription: Reviews diffs.\nmodel: claude-haiku-5-5   # cheap\ntools: [read_file, grep, task]  # read-only\nmax_requests: 5 # few\ntoken_budget: nope\n---\nYou review.\n",
             None,
             &mut problems,
         );
@@ -282,6 +337,29 @@ mod tests {
         assert_eq!(problems.len(), 2, "{problems:?}");
         assert!(!d.allows("task") && !d.allows("run_bash") && d.allows("grep"));
         assert!(!d.can_write());
+    }
+
+    #[test]
+    fn a_block_list_or_empty_tools_never_means_every_tool() {
+        let mut problems = Vec::new();
+        let d = parse("r", "---\ntools:\n  - read_file\n  - grep   # search\nmax_requests: 3\n---\nP", None, &mut problems);
+        assert_eq!(d.tools.as_deref(), Some(&["read_file".to_string(), "grep".to_string()][..]));
+        assert_eq!(d.max_requests, 3);
+        assert!(problems.is_empty(), "{problems:?}");
+        let d = parse("r", "---\ntools: \"\"\n---\nP", None, &mut problems);
+        assert_eq!(d.tools, Some(vec![]));
+        assert!(!d.allows("run_bash") && !d.can_write());
+        assert!(problems.iter().any(|p| p.contains("no tools")));
+    }
+
+    #[test]
+    fn unknown_tools_old_fields_and_huge_budgets_are_reported() {
+        let mut problems = Vec::new();
+        let d = parse("r", "---\ntools: Read, Grep, gh__search\nmax_tokens: 4096\nmax_requests: 100000\n---\nP", None, &mut problems);
+        assert_eq!(d.max_requests, 200);
+        assert!(problems.iter().any(|p| p.contains("no tool called Read, Grep")), "{problems:?}");
+        assert!(problems.iter().any(|p| p.contains("token_budget")), "{problems:?}");
+        assert!(problems.iter().any(|p| p.contains("over 200")), "{problems:?}");
     }
 
     #[test]

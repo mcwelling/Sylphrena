@@ -169,6 +169,7 @@ description: Reviews a diff for error handling.
 model: claude-haiku-5-5        # optional; default: the current model
 tools: read_file, grep, glob   # optional; default: every tool
 max_requests: 20               # optional; default 25
+token_budget: 200000           # optional; default 400000 (cache reads not counted)
 ---
 You review diffs for error handling. Report each problem with path:line.
 ```

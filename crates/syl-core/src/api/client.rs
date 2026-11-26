@@ -736,7 +736,7 @@ pub fn syl_tools() -> serde_json::Value {
         },
         {
             "name": "fetch",
-            "description": "Fetch a web page (or PDF) and return it as text, at most 32,000 characters at a time. Long pages say where to continue: call again with that start.",
+            "description": "Fetch a web page (or PDF) over http or https and return it as text, at most 32,000 bytes at a time. Long pages say where to continue: call again with that start.",
             "input_schema": {
                 "type": "object",
                 "properties": {

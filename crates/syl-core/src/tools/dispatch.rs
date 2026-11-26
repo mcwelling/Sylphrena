@@ -36,6 +36,9 @@ pub fn parse_dispatch(input: &serde_json::Value) -> Result<Dispatch, (String, bo
     let Some(source) = input["source"].as_str().filter(|s| !s.is_empty()) else {
         return Err(err_json("Invalid parameter", "missing or empty 'source' field", ""));
     };
+    if !is_web_url(source) {
+        return Err(err_json("Invalid parameter", "source must be an http:// or https:// URL", source));
+    }
     let Some(focus) = input["focus"].as_str().filter(|s| !s.is_empty()) else {
         return Err(err_json("Invalid parameter", "missing or empty 'focus' field", source));
     };
@@ -101,12 +104,23 @@ impl Dispatch {
     }
 }
 
+/// An `http://` or `https://` URL.
+pub fn is_web_url(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    (lower.starts_with("http://") || lower.starts_with("https://")) && !url.chars().any(char::is_whitespace)
+}
+
 /// The `fetch` tool: the page at `url`, as text, from `start` (a byte
 /// offset), at most [`MAX_FETCH_CHARS`] of it, saying where to go on.
 pub async fn fetch(input: &serde_json::Value, config: &AppConfig, container: &Container, cancel: CancellationToken) -> (String, bool) {
-    let Some(url) = input["url"].as_str().filter(|u| !u.trim().is_empty()) else {
+    let Some(url) = input["url"].as_str().map(str::trim).filter(|u| !u.is_empty()) else {
         return ("[Tool error: fetch requires a 'url']".to_string(), true);
     };
+    // Web pages only: curl would read file:// (the workspace, past the
+    // file tools' rules) and take a leading `-` as an option.
+    if !is_web_url(url) {
+        return (format!("[Tool error: fetch takes http:// or https:// URLs, not `{}`]", crate::session::one_line(url, 80)), true);
+    }
     let raw = match fetch_source(url, config, container, cancel).await {
         Ok(r) => r,
         Err(e) => return (format!("[Tool error: could not fetch {url}: {e}]"), true),
@@ -117,7 +131,8 @@ pub async fn fetch(input: &serde_json::Value, config: &AppConfig, container: &Co
 
 /// `content` from `start`, cut to [`MAX_FETCH_CHARS`] on character
 /// boundaries, with a note on what was left out.
-pub fn window(content: &str, start: usize) -> String {
+pub fn window(content: &str, asked: usize) -> String {
+    let start = asked.min(content.len());
     let mut from = start.min(content.len());
     while !content.is_char_boundary(from) {
         from -= 1;
@@ -125,6 +140,9 @@ pub fn window(content: &str, start: usize) -> String {
     let mut to = (from + MAX_FETCH_CHARS).min(content.len());
     while !content.is_char_boundary(to) {
         to -= 1;
+    }
+    if from == content.len() && from > 0 {
+        return format!("[Nothing at start={asked}: the page is {} bytes]", content.len());
     }
     let mut out = content[from..to].to_string();
     if from > 0 || to < content.len() {
@@ -151,12 +169,12 @@ async fn fetch_source(
     let cmd = if is_pdf {
         format!(
             "ts=$(date +%s%N); f=/tmp/syl_dp_$ts.pdf; \
-             curl -sL -A 'Mozilla/5.0' --max-time 30 {} -o \"$f\" \
+             curl -sL -A 'Mozilla/5.0' --max-time 30 -o \"$f\" -- {} \
              && pdftotext \"$f\" - && rm -f \"$f\"",
             crate::util::shell_quote(source)
         )
     } else {
-        format!("curl -sL -A 'Mozilla/5.0' --max-time 30 {}", crate::util::shell_quote(source))
+        format!("curl -sL -A 'Mozilla/5.0' --max-time 30 -- {}", crate::util::shell_quote(source))
     };
 
     // Run curl directly rather than through run_bash: run_bash shapes its
@@ -287,6 +305,9 @@ mod tests {
         let last = window(&page, page.len() - 10);
         assert!(!last.contains("call fetch again"));
         assert_eq!(window("short", 0), "short");
+        assert!(window("short", 99).contains("Nothing at start=99"));
+        assert!(is_web_url("https://x.com/a") && is_web_url("HTTP://x"));
+        assert!(!is_web_url("file:///workspace/.env") && !is_web_url("-K/etc/x") && !is_web_url("http://a b"));
     }
 
     #[test]
