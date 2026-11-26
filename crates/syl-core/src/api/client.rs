@@ -270,7 +270,8 @@ pub async fn stream_turn(
     stream_turn_observed(client, config, messages, system, cancel, on_delta, None).await
 }
 
-/// `stream_turn`, also storing the response's rate-limit headers in `limits`.
+/// `stream_turn`, also storing the response's rate-limit headers in
+/// `state`, under the request's model.
 async fn stream_turn_observed(
     client:   &reqwest::Client,
     config:   &AppConfig,
@@ -278,7 +279,7 @@ async fn stream_turn_observed(
     system:   &[SystemBlock],
     cancel:   CancellationToken,
     on_delta: &impl Fn(BlockDeltaEvent),
-    limits:   Option<&std::sync::Mutex<Option<crate::api::rate_limit::ApiLimits>>>,
+    state:    Option<&crate::shared::SharedState>,
 ) -> anyhow::Result<TurnResult> {
     let messages = crate::api::cache::attach_cache_breakpoints(messages.to_vec());
 
@@ -296,8 +297,8 @@ async fn stream_turn_observed(
     };
 
     let status = resp.status();
-    if let (Some(slot), Some(l)) = (limits, crate::api::rate_limit::ApiLimits::from_headers(resp.headers(), crate::api::rate_limit::now_ms())) {
-        *slot.lock().unwrap() = Some(l);
+    if let (Some(state), Some(l)) = (state, crate::api::rate_limit::ApiLimits::from_headers(resp.headers(), crate::api::rate_limit::now_ms())) {
+        state.model_limits.lock().unwrap().entry(config.model.clone()).or_default().api = Some(l);
     }
     if status == 429 || status.as_u16() == 529 {
         // A typed error, so the retry loop can retry and honour retry-after.
@@ -372,26 +373,35 @@ fn backoff_delay(attempt: u32) -> std::time::Duration {
 }
 
 /// How long to wait before a retry: what the API asked for, else backoff.
-fn retry_delay(e: &anyhow::Error, attempt: u32) -> std::time::Duration {
+/// How long to wait before retrying `e`: what `retry-after` says, else the
+/// backoff, or longer if the limits the error's response just reported
+/// (`api_wait`) say so.
+fn retry_delay(e: &anyhow::Error, attempt: u32, api_wait: std::time::Duration) -> std::time::Duration {
     e.downcast_ref::<RateLimited>()
         .and_then(|r| r.retry_after)
         .map(|d| d.min(MAX_WAIT))
-        .unwrap_or_else(|| backoff_delay(attempt))
+        .unwrap_or_else(|| backoff_delay(attempt).max(api_wait.min(MAX_WAIT)))
 }
 
 /// Output tokens a request is assumed to need from the output bucket.
 const OUTPUT_NEED: u64 = 4096;
 
-/// How long to wait before the next request: until the API's buckets (as
-/// the last response left them, refilled since) can hold about what the
-/// last request used, and, with a `rate_limit` cap, until the window is
-/// under 80% of it.
-fn wait_before_request(config: &AppConfig, state: &crate::shared::SharedState) -> std::time::Duration {
+/// How long until `config.model`'s buckets (as its last response left
+/// them, refilled since) can hold about what its last request used.
+fn api_wait(config: &AppConfig, state: &crate::shared::SharedState) -> std::time::Duration {
+    let limits = state.model_limits.lock().unwrap().get(&config.model).copied().unwrap_or_default();
+    let need_in = limits.last_input.max(1000);
+    let need_out = OUTPUT_NEED.min(config.max_tokens as u64);
+    limits.api.map_or(std::time::Duration::ZERO, |l| l.wait_for(need_in, need_out, crate::api::rate_limit::now_ms()))
+}
+
+/// How long to wait before the next request, and whether Syl's own cap
+/// (not the API's limits) is the reason: the API's wait (see `api_wait`)
+/// and, with a `rate_limit` cap, until the window is under 80% of it.
+fn wait_before_request(config: &AppConfig, state: &crate::shared::SharedState) -> (std::time::Duration, bool) {
     use crate::api::rate_limit as rl;
     let now = rl::now_ms();
-    let need_in = (*state.last_request_input.lock().unwrap()).max(1000);
-    let need_out = OUTPUT_NEED.min(config.max_tokens as u64);
-    let api = state.api_limits.lock().unwrap().map_or(std::time::Duration::ZERO, |l| l.wait_for(need_in, need_out, now));
+    let api = api_wait(config, state).min(MAX_WAIT);
     let own = if config.rate_limit == 0 {
         std::time::Duration::ZERO
     } else {
@@ -405,7 +415,7 @@ fn wait_before_request(config: &AppConfig, state: &crate::shared::SharedState) -
             std::time::Duration::ZERO
         }
     };
-    api.min(MAX_WAIT).max(own)
+    (api.max(own), own > api)
 }
 
 // ---------------------------------------------------------------------------
@@ -428,9 +438,9 @@ pub async fn call_with_retry_shared(
     on_delta:  impl Fn(BlockDeltaEvent),
 ) -> anyhow::Result<TurnResult> {
     // Locks are taken and released inside; none is held across an await.
-    let wait = wait_before_request(config, state);
+    let (wait, own_cap) = wait_before_request(config, state);
     if wait >= std::time::Duration::from_millis(500) {
-        let why = if config.rate_limit > 0 && state.api_limits.lock().unwrap().is_none() {
+        let why = if own_cap {
             "Syl's own rate_limit cap"
         } else {
             "the API's per-minute token limit"
@@ -445,10 +455,10 @@ pub async fn call_with_retry_shared(
 
     let mut attempts = 0u32;
     loop {
-        match stream_turn_observed(client, config, messages, system, cancel.clone(), &on_delta, Some(&state.api_limits)).await {
+        match stream_turn_observed(client, config, messages, system, cancel.clone(), &on_delta, Some(state)).await {
             Ok(result) => {
                 let uncached = result.usage.input_tokens + result.usage.cache_write_tokens;
-                *state.last_request_input.lock().unwrap() = uncached;
+                state.model_limits.lock().unwrap().entry(config.model.clone()).or_default().last_input = uncached;
                 {
                     let mut calls = state.recent_calls.lock().unwrap();
                     crate::api::rate_limit::record_rate_call(&mut calls, uncached);
@@ -461,7 +471,7 @@ pub async fn call_with_retry_shared(
                 return Ok(result);
             }
             Err(e) if is_rate_limit_error(&e) && attempts < MAX_RETRIES => {
-                let delay = retry_delay(&e, attempts);
+                let delay = retry_delay(&e, attempts, api_wait(config, state));
                 tracing::warn!(attempt = attempts, delay_ms = delay.as_millis(), error = %e, "rate limited, retrying");
                 if delay >= std::time::Duration::from_secs(2) {
                     let what = if e.to_string().starts_with("rate_limit:529") { "The API is overloaded" } else { "The API's rate limit was reached" };

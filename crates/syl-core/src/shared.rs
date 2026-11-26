@@ -2,11 +2,12 @@
 //!
 //! Every field uses `std::sync::Mutex` because no lock is held across an
 //! `.await`: lock, read or modify, unlock.
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crate::api::client::SystemBlock;
 use crate::api::models::DiscoveredModel;
-use crate::api::rate_limit::RateCall;
+use crate::api::rate_limit::{ApiLimits, RateCall};
 use crate::api::types::{Message, Usage};
 
 pub struct SharedState {
@@ -19,12 +20,10 @@ pub struct SharedState {
     /// Sliding window of API calls, for the optional `rate_limit` cap.
     pub recent_calls: Mutex<Vec<RateCall>>,
 
-    /// The API's rate limits, from the last response's headers.
-    pub api_limits: Mutex<Option<crate::api::rate_limit::ApiLimits>>,
-
-    /// Uncached input tokens (input plus cache writes) of the last request:
-    /// about what the next one will need from the input bucket.
-    pub last_request_input: Mutex<u64>,
+    /// Rate limits by model. The API limits each model separately, so a
+    /// sub-agent's calls (`dispatch_agent` on Haiku, the reviewer) must not
+    /// pace the main model's.
+    pub model_limits: Mutex<HashMap<String, ModelLimits>>,
 
     /// Model for the next turn. Initialised from `AppConfig::model` and
     /// changed with `AgentCommand::SetModel`.
@@ -46,14 +45,28 @@ pub struct SharedState {
     pub extra_tools: Mutex<std::sync::Arc<Vec<serde_json::Value>>>,
 }
 
+/// One model's rate limits, as its requests have seen them.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ModelLimits {
+    /// From the last response's headers.
+    pub api: Option<ApiLimits>,
+    /// Uncached input tokens (input plus cache writes) of the last request:
+    /// about what the next one will need from the input bucket.
+    pub last_input: u64,
+}
+
 impl SharedState {
+    /// `model`'s limits, as its last response left them.
+    pub fn api_limits(&self, model: &str) -> Option<ApiLimits> {
+        self.model_limits.lock().unwrap().get(model).and_then(|l| l.api)
+    }
+
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             messages: Mutex::new(Vec::new()),
             session_tokens: Mutex::new(Usage::default()),
             recent_calls: Mutex::new(Vec::new()),
-            api_limits: Mutex::new(None),
-            last_request_input: Mutex::new(0),
+            model_limits: Mutex::new(HashMap::new()),
             current_model: Mutex::new(String::new()),
             available_models: Mutex::new(crate::api::models::static_fallback()),
             system_prompt: Mutex::new(None),

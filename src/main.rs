@@ -328,7 +328,8 @@ fn draw_bars(tui: &TuiState, state: &SharedState, config: &AppConfig, model: &st
 
     // How full the API's input-token bucket is (from its last response's
     // headers), else Syl's own cap's window; hidden with neither.
-    let api_input = state.api_limits.lock().unwrap().and_then(|l| l.input);
+    let model = state.current_model.lock().unwrap().clone();
+    let api_input = state.api_limits(&model).and_then(|l| l.input);
     let (tokens_per_min, tpm_limit) = match api_input {
         Some(b) => {
             let now = syl_core::api::rate_limit::now_ms();
@@ -879,7 +880,7 @@ impl Repl<'_> {
                     model: &self.model,
                     timeout_ms: self.config.timeout_ms,
                     rate_limit: self.config.rate_limit,
-                    api_limits: *self.state.api_limits.lock().unwrap(),
+                    api_limits: self.state.api_limits(&self.state.current_model.lock().unwrap()),
                     input_tokens,
                     output_tokens,
                     message_count,

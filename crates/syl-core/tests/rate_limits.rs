@@ -3,7 +3,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use tokio_util::sync::CancellationToken;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use syl_core::api::client::{call_with_retry_shared, SystemBlock};
@@ -34,7 +34,16 @@ fn rfc3339_in(ms: u64) -> String {
 }
 
 async fn call(server: &MockServer, state: &std::sync::Arc<syl_core::shared::SharedState>, notices: &Mutex<Vec<String>>) {
-    let cfg = config(server);
+    call_as(server, state, notices, &config(server).model).await
+}
+
+async fn call_as(
+    server: &MockServer,
+    state: &std::sync::Arc<syl_core::shared::SharedState>,
+    notices: &Mutex<Vec<String>>,
+    model: &str,
+) {
+    let cfg = AppConfig { model: model.to_string(), ..config(server) };
     call_with_retry_shared(
         &reqwest::Client::new(),
         &cfg,
@@ -93,7 +102,7 @@ async fn a_nearly_empty_bucket_is_waited_for_and_only_as_long_as_it_needs() {
     let state = syl_core::shared::SharedState::new();
     let notices = Mutex::new(Vec::new());
     call(&server, &state, &notices).await;
-    let limits = state.api_limits.lock().unwrap().expect("headers were read");
+    let limits = state.api_limits(&config(&server).model).expect("headers were read");
     assert_eq!(limits.input.unwrap().limit, 60_000);
     let started = Instant::now();
     call(&server, &state, &notices).await;
@@ -127,4 +136,134 @@ async fn without_a_cap_or_low_headers_nothing_waits() {
     }
     assert!(started.elapsed() < Duration::from_secs(2));
     assert!(notices.into_inner().unwrap().is_empty());
+}
+
+const HAIKU: &str = "claude-haiku-4-5";
+
+#[tokio::test]
+async fn a_sub_agents_limits_do_not_pace_the_main_model() {
+    let server = MockServer::start().await;
+    // Haiku's bucket is empty; the main model's is nearly full.
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .and(body_partial_json(serde_json::json!({ "model": HAIKU })))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(SSE, "text/event-stream")
+                .insert_header("anthropic-ratelimit-input-tokens-limit", "60000")
+                .insert_header("anthropic-ratelimit-input-tokens-remaining", "0")
+                .insert_header("anthropic-ratelimit-input-tokens-reset", rfc3339_in(60_000).as_str()),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(SSE, "text/event-stream")
+                .insert_header("anthropic-ratelimit-input-tokens-limit", "400000")
+                .insert_header("anthropic-ratelimit-input-tokens-remaining", "390000")
+                .insert_header("anthropic-ratelimit-input-tokens-reset", rfc3339_in(2_000).as_str()),
+        )
+        .mount(&server)
+        .await;
+    let state = syl_core::shared::SharedState::new();
+    let notices = Mutex::new(Vec::new());
+    let main = config(&server).model;
+    assert_ne!(main, HAIKU);
+
+    call(&server, &state, &notices).await;
+    // A dispatch_agent call on Haiku, then the main model again: no wait.
+    call_as(&server, &state, &notices, HAIKU).await;
+    let started = Instant::now();
+    call(&server, &state, &notices).await;
+    assert!(started.elapsed() < Duration::from_millis(500), "{:?}", started.elapsed());
+    assert!(notices.lock().unwrap().is_empty(), "{:?}", notices.lock().unwrap());
+
+    // Each model keeps its own figures, for the status bar and /status.
+    assert_eq!(state.api_limits(&main).unwrap().input.unwrap().limit, 400_000);
+    assert_eq!(state.api_limits(HAIKU).unwrap().input.unwrap().limit, 60_000);
+
+    // Haiku itself is still paced on its own bucket.
+    let started = Instant::now();
+    call_as(&server, &state, &notices, HAIKU).await;
+    assert!(started.elapsed() >= Duration::from_millis(800), "{:?}", started.elapsed());
+}
+
+#[tokio::test]
+async fn a_429_without_retry_after_waits_for_the_bucket_it_reports() {
+    let server = MockServer::start().await;
+    // 60k a minute is 1 token a ms; the bucket is empty and the request is
+    // about 3,000 tokens, so 3s, where the plain backoff would be 1s.
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("anthropic-ratelimit-input-tokens-limit", "60000")
+                .insert_header("anthropic-ratelimit-input-tokens-remaining", "0")
+                .insert_header("anthropic-ratelimit-input-tokens-reset", rfc3339_in(60_000).as_str())
+                .set_body_string(r#"{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}"#),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(SSE, "text/event-stream"))
+        .mount(&server)
+        .await;
+    let state = syl_core::shared::SharedState::new();
+    let model = config(&server).model;
+    state.model_limits.lock().unwrap().entry(model).or_default().last_input = 3_000;
+    let notices = Mutex::new(Vec::new());
+    let started = Instant::now();
+    call(&server, &state, &notices).await;
+    let took = started.elapsed();
+    assert!(took >= Duration::from_millis(2800) && took < Duration::from_secs(6), "{took:?}");
+    let notices = notices.into_inner().unwrap();
+    assert!(notices.iter().any(|n| n.contains("retrying in 3s") || n.contains("retrying in 2s")), "{notices:?}");
+}
+
+#[tokio::test]
+async fn a_wait_set_by_the_own_cap_says_so() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(SSE, "text/event-stream")
+                .insert_header("anthropic-ratelimit-input-tokens-limit", "400000")
+                .insert_header("anthropic-ratelimit-input-tokens-remaining", "400000")
+                .insert_header("anthropic-ratelimit-input-tokens-reset", rfc3339_in(1_000).as_str()),
+        )
+        .mount(&server)
+        .await;
+    let state = syl_core::shared::SharedState::new();
+    let notices = Mutex::new(Vec::new());
+    call(&server, &state, &notices).await;
+    // The API has plenty left, but the window is over 80% of a 10k cap.
+    // The oldest call is backdated so the wait is short.
+    {
+        let mut calls = state.recent_calls.lock().unwrap();
+        syl_core::api::rate_limit::record_rate_call(&mut calls, 9_000);
+        let now = syl_core::api::rate_limit::now_ms();
+        for c in calls.iter_mut() {
+            c.ts = now - (syl_core::api::rate_limit::RATE_WINDOW_MS - 1_000);
+        }
+    }
+    let cfg = AppConfig { rate_limit: 10_000, ..config(&server) };
+    call_with_retry_shared(
+        &reqwest::Client::new(),
+        &cfg,
+        &state,
+        &[Message::user_text("hi")],
+        &[SystemBlock::text("sys")],
+        CancellationToken::new(),
+        |n| notices.lock().unwrap().push(n.to_string()),
+        |_| {},
+    )
+    .await
+    .unwrap();
+    let notices = notices.into_inner().unwrap();
+    assert!(notices.iter().any(|n| n.contains("Syl's own rate_limit cap")), "{notices:?}");
 }
