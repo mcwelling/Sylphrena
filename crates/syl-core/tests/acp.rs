@@ -160,6 +160,28 @@ fn updates(msgs: &[Value]) -> Vec<Value> {
 }
 
 #[tokio::test]
+async fn a_reply_cut_off_by_an_api_error_is_marked_before_it_starts_again() {
+    let cut_off = sse(&[
+        json!({"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":0}}}),
+        json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+        json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}),
+        json!({"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}),
+    ]);
+    let server = model_server(vec![ok(cut_off), ok(text_stream("whole"))]).await;
+    let mut c = start(&server, vec![]);
+    let sid = c.new_session().await;
+    let p = c.request("session/prompt", json!({"sessionId": sid, "prompt": [{"type": "text", "text": "go"}]})).await;
+    let (msgs, r) = c.until_response(p).await;
+    assert_eq!(r["result"]["stopReason"], "end_turn");
+    let chunks: Vec<String> = updates(&msgs)
+        .iter()
+        .filter(|u| u["sessionUpdate"] == "agent_message_chunk")
+        .filter_map(|u| u["content"]["text"].as_str().map(str::to_string))
+        .collect();
+    assert_eq!(chunks, ["partial", syl_core::acp::REPLY_RESTARTED_MARK, "whole"]);
+}
+
+#[tokio::test]
 async fn initialize_comes_first_and_says_what_syl_supports() {
     let server = model_server(vec![ok(text_stream("hi"))]).await;
     let mut c = start(&server, vec![]);

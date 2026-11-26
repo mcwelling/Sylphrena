@@ -384,7 +384,6 @@ fn backoff_delay(attempt: u32) -> std::time::Duration {
     std::time::Duration::from_millis(ms)
 }
 
-/// How long to wait before a retry: what the API asked for, else backoff.
 /// How long to wait before retrying `e`: what `retry-after` says, else the
 /// backoff, or longer if the limits the error's response just reported
 /// (`api_wait`) say so.
@@ -403,20 +402,40 @@ const OUTPUT_NEED: u64 = 4096;
 /// guess).
 const CACHE_TTL_MS: u64 = 270_000;
 
+/// A fingerprint of what a request sends before and including `messages`:
+/// the tools, the system prompt, the thinking settings and the messages.
+/// The prompt cache is a prefix match, so if the part the last request sent
+/// fingerprints differently now, its cache can't be read.
+pub fn prefix_fingerprint(config: &AppConfig, system: &[SystemBlock], messages: &[Message]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let tools = if config.tools { serde_json::to_string(config.extra_tools.as_slice()).unwrap_or_default() } else { String::new() };
+    let system = serde_json::to_string(system).unwrap_or_default();
+    let thinking = thinking_param(config).map(|t| t.to_string()).unwrap_or_default();
+    let messages = serde_json::to_string(messages).unwrap_or_default();
+    (config.tools, tools, system, thinking, messages).hash(&mut h);
+    h.finish()
+}
+
 /// About how many input tokens of `messages` the input bucket will be
 /// charged for: cache reads aren't, so while the last request's cache is
 /// warm only the messages added since then count. Once it has expired,
-/// everything is sent uncached again. The first request, or one whose
-/// conversation was cut short (compaction, `/clear`), is estimated whole.
+/// everything is sent uncached again. The first request is estimated
+/// whole, and so is one whose earlier part changed since the last request
+/// (`prefix` is the fingerprint, by `prefix_fingerprint`, of the
+/// `limits.last_count` messages it sent, as they are now): compaction,
+/// `/clear`, a message rewritten in place (images dropped, thinking
+/// stripped), or a new system prompt or tool list.
 pub fn input_need(
     limits: &crate::shared::ModelLimits,
     messages: &[Message],
     system: &[SystemBlock],
     now: u64,
+    prefix: Option<u64>,
 ) -> u64 {
     use crate::api::compaction::{estimate_text_tokens, estimate_tokens};
     let est = |ms: &[Message]| ms.iter().map(estimate_tokens).sum::<u64>();
-    let seen = limits.last_ms > 0 && messages.len() >= limits.last_count;
+    let seen = limits.last_ms > 0 && messages.len() >= limits.last_count && prefix == Some(limits.last_prefix);
     let need = if !seen {
         est(messages) + system.iter().map(|b| estimate_text_tokens(&b.text)).sum::<u64>()
     } else if now.saturating_sub(limits.last_ms) < CACHE_TTL_MS {
@@ -438,7 +457,8 @@ fn api_wait(
     let limits = state.model_limits.lock().unwrap().get(&config.model).copied().unwrap_or_default();
     let Some(api) = limits.api else { return std::time::Duration::ZERO };
     let now = crate::api::rate_limit::now_ms();
-    let need_in = input_need(&limits, messages, system, now);
+    let prefix = messages.get(..limits.last_count).map(|sent| prefix_fingerprint(config, system, sent));
+    let need_in = input_need(&limits, messages, system, now, prefix);
     let need_out = OUTPUT_NEED.min(config.max_tokens as u64);
     api.wait_for(need_in, need_out, now)
 }
@@ -526,6 +546,7 @@ pub async fn call_with_retry_shared(
                     l.last_total = uncached + result.usage.cache_read_tokens;
                     l.last_ms = crate::api::rate_limit::now_ms();
                     l.last_count = messages.len();
+                    l.last_prefix = prefix_fingerprint(config, system, messages);
                 }
                 {
                     let mut calls = state.recent_calls.lock().unwrap();

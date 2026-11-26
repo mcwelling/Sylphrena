@@ -57,6 +57,8 @@ pub struct ModelLimits {
     pub last_total: u64,
     pub last_ms: u64,
     pub last_count: usize,
+    /// `client::prefix_fingerprint` of everything it sent.
+    pub last_prefix: u64,
 }
 
 impl SharedState {

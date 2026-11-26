@@ -25,6 +25,10 @@ use crate::model::AnthropicAdapter;
 use crate::session::EntryKind;
 use crate::shared::SharedState;
 
+/// Sent as a message chunk when a reply is cut off by an API error and
+/// starts again (`AgentEvent::ReplyRestarted`).
+pub const REPLY_RESTARTED_MARK: &str = "\n\n[cut off by an API error; the reply starts again below]\n\n";
+
 pub const PROTOCOL_VERSION: u64 = 1;
 
 /// JSON-RPC error codes used here.
@@ -844,6 +848,16 @@ async fn pump(
             AgentEvent::ModeChanged { mode } => {
                 server.update(&id, json!({ "sessionUpdate": "current_mode_update", "currentModeId": mode.name() }))
             }
+            // Chunks already sent can't be taken back: mark where the
+            // discarded part ends, as the TUI and `-p` do. A notice alone
+            // reaches only clients that take them.
+            AgentEvent::ReplyRestarted => server.update(
+                &id,
+                json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": REPLY_RESTARTED_MARK },
+                }),
+            ),
             AgentEvent::Error { message } => {
                 tracing::warn!(session = %id, "agent error: {message}");
                 last_error = Some(message);
