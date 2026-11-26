@@ -115,7 +115,7 @@ fn build_payload(
         "max_tokens": max_tokens,
         "stream": true,
         "system": system,
-        "messages": messages,
+        "messages": crate::api::cache::messages_with_cache_points(messages),
     });
     if config.tools {
         let mut tools = syl_tools();
@@ -295,9 +295,7 @@ async fn stream_turn_observed(
     on_delta: &impl Fn(BlockDeltaEvent),
     state:    Option<&crate::shared::SharedState>,
 ) -> anyhow::Result<TurnResult> {
-    let messages = crate::api::cache::attach_cache_breakpoints(messages.to_vec());
-
-    let payload = build_payload(&messages, system, config);
+    let payload = build_payload(messages, system, config);
 
     let request = client
         .post(&config.api_url)

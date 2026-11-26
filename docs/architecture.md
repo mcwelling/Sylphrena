@@ -118,7 +118,7 @@ Syl follows the limits the API reports rather than guessing them (`api/rate_limi
 
 3. **An optional cap of your own.** `rate_limit` (tokens a minute, default 0 = none) keeps Syl below what the API allows, for example to leave room for other tools sharing the key: a sliding 60-second window of uncached input tokens, and past 80% of the cap the next request waits for the window.
 
-3. **Prompt caching** — `cache_control: {type: ephemeral}` breakpoints go on the system prompt and on the last text block of each of the two most recent assistant turns (at most three of the API's four), reducing input tokens on repeat calls via Anthropic's server-side prompt cache.
+3. **Prompt caching** (`api/cache.rs`) — `cache_control: {type: ephemeral}` breakpoints go on the system prompt (which caches the tools too) and on the last block of each of the two most recent user messages, three of the API's four. The last message's breakpoint means each request writes everything it sends, its final tool results included, so the next request reads all of it back and pays only for what it adds. The one before is the previous request's write point, always within the API's 20-position lookback. A tool result, image or text block can carry one; thinking blocks and empty text can't, so the nearest earlier block is used. A message whose content is a plain string is always sent as one text block, so its bytes don't change when its breakpoint moves on.
 
 The status bar's TPM gauge shows how full the API's input bucket is (green < 50%, yellow 50–80%, red ≥ 80%), or the cap's window before any headers have been seen; with neither it is hidden. `/status` lists the API's limits and what is left of each.
 
@@ -516,7 +516,7 @@ crates/syl-core/src/
 │   ├── models.rs          # dynamic model discovery
 │   ├── sse.rs             # StreamHandler (SSE event → TurnResult)
 │   ├── compaction.rs      # context compaction via Haiku summarisation
-│   ├── cache.rs           # cache_control breakpoint injection
+│   ├── cache.rs           # cache_control breakpoints on the last two user messages
 │   ├── rate_limit.rs      # the API's rate-limit headers, retry-after, optional own cap
 │   └── types.rs           # ContentBlock, Message, TurnResult, Usage
 └── tools/

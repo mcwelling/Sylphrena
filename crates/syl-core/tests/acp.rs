@@ -410,7 +410,7 @@ async fn pipelined_prompts_run_in_order_and_answer_their_own_requests() {
         assert_eq!(rb["result"]["stopReason"], "end_turn");
         let bodies = server.received_requests().await.unwrap();
         let first_prompt: Value = serde_json::from_slice(&bodies[0].body).unwrap();
-        assert_eq!(first_prompt["messages"][0]["content"], "AAAA");
+        assert_eq!(first_prompt["messages"][0]["content"][0]["text"], "AAAA");
     }
 }
 
