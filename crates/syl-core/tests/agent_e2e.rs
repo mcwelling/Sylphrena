@@ -273,7 +273,7 @@ async fn full_tool_using_turn_runs_headless() {
     let kinds: Vec<&str> = log.iter().map(kind_name).collect();
     assert_eq!(
         kinds,
-        ["session", "message", "model_change", "system_prompt", "message", "checkpoint", "tool_result", "message"]
+        ["session", "message", "model_change", "tool_set", "system_prompt", "message", "checkpoint", "tool_result", "message"]
     );
     // The last request was exactly what the log says the model saw.
     assert_eq!(serde_json::to_value(&messages[..3]).unwrap(), bodies[1]["messages"]);
@@ -303,6 +303,7 @@ fn kind_name(e: &Entry) -> &'static str {
         EntryKind::Restored { .. } => "restored",
         EntryKind::Note { .. } => "note",
         EntryKind::ToolSet { .. } => "tool_set",
+        EntryKind::Subagent { .. } => "subagent",
     }
 }
 
@@ -937,13 +938,15 @@ async fn dispatch_agent_gets_the_full_page_cut_on_a_character_boundary() {
     let site = MockServer::start().await;
     Mock::given(method("GET")).respond_with(ResponseTemplate::new(200).set_body_string(page.clone())).mount(&site).await;
 
+    let url = format!("{}/doc.txt", site.uri());
     let server = model_server(vec![
         ok(tool_calls_stream(&[(
             "d1",
             "dispatch_agent",
-            json!({"task": "fetch", "source": format!("{}/doc.txt", site.uri()), "focus": "line numbers",
-                   "output_format": "text", "max_length": 300}),
+            json!({"task": "fetch", "source": url, "focus": "line numbers", "output_format": "text", "max_length": 300}),
         )])),
+        // The fetch agent fetches the page, then answers.
+        ok(tool_calls_stream(&[("f1", "fetch", json!({"url": url}))])),
         ok(text_stream("sub-agent answer")),
         ok(text_stream("done")),
     ])
@@ -951,22 +954,21 @@ async fn dispatch_agent_gets_the_full_page_cut_on_a_character_boundary() {
     let mut h = start(&server).await;
     h.send(AgentCommand::Prompt("fetch it".into()));
     let events = until_turn_ended(&mut h).await;
-    let out = events
-        .iter()
-        .find_map(|e| match e {
-            AgentEvent::ToolCallFinished { output, .. } => Some(output.clone()),
-            _ => None,
-        })
-        .unwrap();
-    assert!(out.contains("sub-agent answer"), "{out}");
+    let (out, is_error) = result_of(&events, "d1");
+    assert!(!is_error && out.contains("sub-agent answer") && out.contains("source_url"), "{out}");
 
     let bodies = request_bodies(&server).await;
-    let sub = &bodies[1];
-    assert!(sub.get("tools").is_none(), "the sub-agent is offered no tools");
-    let prompt = sub["messages"][0]["content"].as_str().unwrap();
-    assert!(prompt.contains("日本語の行です 0000") && prompt.contains("日本語の行です 1100"), "the page is not cut to 100 lines");
-    assert!(!prompt.contains("read_file") && !prompt.contains("    1: "), "no run_bash preview formatting");
-    assert!(prompt.contains("of 54000 bytes shown"), "the cut is reported");
+    assert_eq!(bodies[1]["model"], syl_core::agents::FETCH_MODEL);
+    assert_eq!(tool_names(&bodies[1]), ["fetch"], "the fetch agent has only fetch");
+    assert!(bodies[1]["messages"][0]["content"].as_str().unwrap().contains(&url));
+    // The page reaches it as the fetch tool's result, whole lines, cut on a
+    // character boundary, with where to go on.
+    let page_result = bodies[2]["messages"][2]["content"][0]["content"].as_str().unwrap();
+    assert!(page_result.contains("日本語の行です 0000") && page_result.contains("日本語の行です 1100"), "not cut to 100 lines");
+    assert!(!page_result.contains("    1: "), "no run_bash preview formatting");
+    assert!(page_result.contains("of 54000 bytes shown") && page_result.contains("start="), "the cut is reported");
+    // The main agent isn't offered fetch itself.
+    assert!(!tool_names(&bodies[0]).contains(&"fetch".to_string()));
 }
 
 // ---------------------------------------------------------------------------
@@ -996,6 +998,173 @@ fn result_of(events: &[AgentEvent], id: &str) -> (String, bool) {
             _ => None,
         })
         .expect("the call finished")
+}
+
+/// The names of the tools a request offered.
+fn tool_names(body: &Value) -> Vec<String> {
+    body["tools"].as_array().into_iter().flatten().filter_map(|t| t["name"].as_str().map(str::to_string)).collect()
+}
+
+fn task_call(id: &str, agent: &str, prompt: &str) -> (String, String, Value) {
+    (id.to_string(), "task".to_string(), json!({"agent": agent, "description": "look around", "prompt": prompt}))
+}
+
+fn calls_stream(calls: &[(String, String, Value)]) -> String {
+    let c: Vec<(&str, &str, Value)> = calls.iter().map(|(a, b, c)| (a.as_str(), b.as_str(), c.clone())).collect();
+    tool_calls_stream(&c)
+}
+
+#[tokio::test]
+async fn a_task_runs_a_subagent_in_a_child_session_with_only_its_tools() {
+    let server = model_server(vec![
+        ok(calls_stream(&[task_call("t1", "explore", "Where is main?")])),
+        ok(tool_calls_stream(&[("c1", "ls", json!({"path": "."}))])),
+        ok(text_stream("main is in src/main.rs:1")),
+        ok(text_stream("done")),
+    ])
+    .await;
+    let mut h = start(&server).await;
+    h.send(AgentCommand::Prompt("find main".into()));
+    let events = until_turn_ended(&mut h).await;
+    let (out, is_error) = result_of(&events, "t1");
+    assert!(!is_error);
+    assert_eq!(out, "main is in src/main.rs:1", "only the subagent's reply comes back");
+
+    let bodies = request_bodies(&server).await;
+    // The main agent has task, listing the agents.
+    let task = bodies[0]["tools"].as_array().unwrap().iter().find(|t| t["name"] == "task").expect("task is offered");
+    assert!(task["description"].as_str().unwrap().contains("- explore:"));
+    // The subagent: fresh context (just the prompt), explore's tools only,
+    // no task (depth one), and its own system prompt.
+    let sub = &bodies[1];
+    assert_eq!(sub["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(sub["messages"][0]["content"], "Where is main?");
+    let mut names = tool_names(sub);
+    names.sort();
+    assert_eq!(names, ["glob", "grep", "ls", "memory_read", "read_file"]);
+    assert!(sub["system"][0]["text"].as_str().unwrap().contains("You are a subagent of Syl"));
+    // The parent's next request sees only the reply.
+    let last = bodies[3]["messages"].as_array().unwrap().last().unwrap().clone();
+    assert_eq!(last["content"][0]["content"], "main is in src/main.rs:1");
+
+    // Its calls were passed on, tagged with the task call.
+    assert!(events.iter().any(|e| matches!(e,
+        AgentEvent::Subagent { call_id, agent, event, .. }
+            if call_id == "t1" && agent == "explore" && matches!(**event, AgentEvent::ToolCallStarted { ref name, .. } if name == "ls"))));
+    // The parent's log links the child session, which is under agents/.
+    let log = h.log(&h.session.id);
+    let child = log
+        .iter()
+        .find_map(|e| match &e.kind {
+            EntryKind::Subagent { tool_use_id, agent, session } if tool_use_id == "t1" && agent == "explore" => Some(session.clone()),
+            _ => None,
+        })
+        .expect("a subagent entry");
+    let child_dir = h.sessions_dir().join("agents").join(&h.session.id);
+    let child_log = session::load_entries(&child_dir, &child).unwrap();
+    assert!(child_log.iter().any(|e| matches!(&e.kind, EntryKind::ToolResult { tool_use_id, .. } if tool_use_id == "c1")));
+    // And it isn't listed as a session of its own.
+    assert!(session::list_sessions(&h.sessions_dir()).iter().all(|s| s.id != child));
+}
+
+/// A response that records when its request arrived.
+struct Stamped(ResponseTemplate, Arc<std::sync::Mutex<Vec<std::time::Instant>>>);
+
+impl wiremock::Respond for Stamped {
+    fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+        self.1.lock().unwrap().push(std::time::Instant::now());
+        self.0.clone()
+    }
+}
+
+#[tokio::test]
+async fn tasks_in_one_response_run_at_the_same_time() {
+    let arrived = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let server = MockServer::start().await;
+    let delay = Duration::from_millis(1500);
+    let responses = vec![
+        ok(calls_stream(&[task_call("a", "explore", "one"), task_call("b", "explore", "two")])),
+        ok(text_stream("first")).set_delay(delay),
+        ok(text_stream("second")).set_delay(delay),
+        ok(text_stream("done")),
+    ];
+    let n = responses.len();
+    for (i, r) in responses.into_iter().enumerate() {
+        let m = Mock::given(method("POST")).respond_with(Stamped(r, arrived.clone()));
+        let m = if i + 1 < n { m.up_to_n_times(1) } else { m };
+        m.mount(&server).await;
+    }
+    let mut h = start(&server).await;
+    h.send(AgentCommand::Prompt("two things".into()));
+    let events = until_turn_ended(&mut h).await;
+    let t = arrived.lock().unwrap().clone();
+    // The second subagent's request came while the first was still waiting
+    // for its (delayed) reply.
+    assert!(t[2] - t[1] < delay, "the two subagents ran one after the other: {:?} apart", t[2] - t[1]);
+    let mut both = [result_of(&events, "a").0, result_of(&events, "b").0];
+    both.sort();
+    assert_eq!(both, ["first", "second"]);
+}
+
+#[tokio::test]
+async fn a_subagent_at_the_end_of_its_budget_must_answer() {
+    let server = model_server(vec![
+        ok(calls_stream(&[task_call("t1", "brief", "look")])),
+        ok(tool_calls_stream(&[("c1", "ls", json!({"path": "."}))])),
+        ok(text_stream("what I found")),
+        ok(text_stream("done")),
+    ])
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let agents = tmp.path().join("project/.syl/agents");
+    std::fs::create_dir_all(&agents).unwrap();
+    std::fs::write(agents.join("brief.md"), "---\ndescription: Short.\ntools: ls\nmax_requests: 2\n---\nBe brief.").unwrap();
+    let mut h = start_with(test_config(&server), tmp, SessionStart::New).await;
+    h.send(AgentCommand::Prompt("go".into()));
+    let events = until_turn_ended(&mut h).await;
+    assert_eq!(result_of(&events, "t1").0, "what I found");
+    let bodies = request_bodies(&server).await;
+    assert!(bodies[1].get("tool_choice").is_none());
+    // The second and last request: tools can't be called, after a note.
+    assert_eq!(bodies[2]["tool_choice"]["type"], "none");
+    let last = bodies[2]["messages"].as_array().unwrap().last().unwrap().clone();
+    assert!(last.to_string().contains("Budget reached"), "{last}");
+}
+
+#[tokio::test]
+async fn a_subagents_question_reaches_the_user_and_its_answer_comes_back() {
+    let server = model_server(vec![
+        ok(calls_stream(&[task_call("t1", "general", "say hi")])),
+        ok(tool_use_stream("c1", "echo hi-from-child")),
+        ok(text_stream("said hi")),
+        ok(text_stream("done")),
+    ])
+    .await;
+    let config = AppConfig { permissions: vec![ask_rule("echo *")], ..test_config(&server) };
+    let mut h = start_with(config, tempfile::tempdir().unwrap(), SessionStart::New).await;
+    h.send(AgentCommand::Prompt("go".into()));
+    let (id, subject) = until_asked(&mut h).await;
+    assert_eq!((id.as_str(), subject.as_str()), ("c1", "echo hi-from-child"));
+    h.send(AgentCommand::ApprovePermission { id, answer: PermissionAnswer::Once });
+    let events = until_turn_ended(&mut h).await;
+    assert_eq!(result_of(&events, "t1").0, "said hi");
+    // The child's request carried the command's output.
+    let bodies = request_bodies(&server).await;
+    assert!(bodies[2].to_string().contains("hi-from-child"));
+    // general has everything but the tools that start subagents.
+    let names = tool_names(&bodies[1]);
+    assert!(names.contains(&"run_bash".to_string()));
+    assert!(!names.iter().any(|n| n == "task" || n == "dispatch_agent"), "{names:?}");
+}
+
+#[tokio::test]
+async fn an_unknown_agent_is_an_error_naming_the_ones_there_are() {
+    let server = model_server(vec![ok(calls_stream(&[task_call("t1", "wizard", "x")])), ok(text_stream("done"))]).await;
+    let mut h = start(&server).await;
+    h.send(AgentCommand::Prompt("go".into()));
+    let events = until_turn_ended(&mut h).await;
+    let (out, is_error) = result_of(&events, "t1");
+    assert!(is_error && out.contains("no agent `wizard`") && out.contains("explore"), "{out}");
 }
 
 #[tokio::test]
@@ -1363,4 +1532,101 @@ async fn in_plan_mode_a_turn_end_hooks_writes_are_put_back() {
         "{events:?}"
     );
     assert!(!h.project().join("end.txt").exists());
+}
+
+#[tokio::test]
+async fn in_plan_mode_a_subagent_is_held_to_it_too() {
+    // A general subagent in plan mode: its edit is refused, its command's
+    // changes are put back, and nothing deadlocks on the project lock.
+    let server = model_server(vec![
+        ok(calls_stream(&[task_call("t1", "general", "change things")])),
+        ok(tool_calls_stream(&[
+            ("e", "write_file", json!({"path": "plan.md", "content": "x"})),
+            ("b", "run_bash", json!({"command": "echo made > made.txt; echo looked"})),
+        ])),
+        ok(text_stream("tried")),
+        ok(text_stream("done")),
+    ])
+    .await;
+    let mut h = start(&server).await;
+    h.send(AgentCommand::SetMode(Mode::Plan));
+    assert_eq!(next_event(&mut h).await, AgentEvent::ModeChanged { mode: Mode::Plan });
+    h.send(AgentCommand::Prompt("go".into()));
+    let events = until_turn_ended(&mut h).await;
+    assert_eq!(result_of(&events, "t1").0, "tried");
+    let child: Vec<(String, bool)> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Subagent { event, .. } => match &**event {
+                AgentEvent::ToolCallFinished { output, is_error, .. } => Some((output.clone(), *is_error)),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    assert!(child.iter().any(|(o, e)| *e && o.contains("Plan mode")), "{child:?}");
+    assert!(child.iter().any(|(o, _)| o.contains("looked") && o.contains("put back")), "{child:?}");
+    assert!(!h.project().join("plan.md").exists() && !h.project().join("made.txt").exists());
+}
+
+#[tokio::test]
+async fn dispatch_agent_asks_again_when_its_json_does_not_parse() {
+    let site = MockServer::start().await;
+    Mock::given(method("GET")).respond_with(ResponseTemplate::new(200).set_body_string("price: 4")).mount(&site).await;
+    let url = format!("{}/p", site.uri());
+    let server = model_server(vec![
+        ok(tool_calls_stream(&[(
+            "d1",
+            "dispatch_agent",
+            json!({"task": "extract", "source": url, "focus": "the price", "output_format": "json", "max_length": 200}),
+        )])),
+        ok(tool_calls_stream(&[("f1", "fetch", json!({"url": url}))])),
+        ok(text_stream("The price is 4.")),
+        ok(text_stream("{\"price\": 4}")),
+        ok(text_stream("done")),
+    ])
+    .await;
+    let mut h = start(&server).await;
+    h.send(AgentCommand::Prompt("price?".into()));
+    let events = until_turn_ended(&mut h).await;
+    let (out, is_error) = result_of(&events, "d1");
+    assert!(!is_error, "{out}");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["data"]["price"], 4);
+    let bodies = request_bodies(&server).await;
+    assert!(bodies[3].to_string().contains("not valid JSON"));
+}
+
+#[tokio::test]
+async fn a_subagent_that_can_write_is_checkpointed_in_the_parents_turn() {
+    let server = model_server(vec![
+        ok(calls_stream(&[task_call("t1", "general", "make a file")])),
+        ok(tool_use_stream("c1", "echo made > made.txt")),
+        ok(text_stream("made it")),
+        ok(text_stream("done")),
+    ])
+    .await;
+    let mut h = start(&server).await;
+    h.send(AgentCommand::Prompt("go".into()));
+    until_turn_ended(&mut h).await;
+    assert!(h.project().join("made.txt").exists());
+    let log = h.log(&h.session.id);
+    let kinds: Vec<&str> = log.iter().map(kind_name).collect();
+    let checkpoint = kinds.iter().position(|k| *k == "checkpoint").expect("the parent's turn was checkpointed");
+    let subagent = kinds.iter().position(|k| *k == "subagent").unwrap();
+    assert!(checkpoint < subagent, "{kinds:?}");
+}
+
+#[tokio::test]
+async fn an_explore_task_does_not_checkpoint() {
+    let server = model_server(vec![
+        ok(calls_stream(&[task_call("t1", "explore", "look")])),
+        ok(text_stream("looked")),
+        ok(text_stream("done")),
+    ])
+    .await;
+    let mut h = start(&server).await;
+    h.send(AgentCommand::Prompt("go".into()));
+    until_turn_ended(&mut h).await;
+    assert!(!h.log(&h.session.id).iter().any(|e| kind_name(e) == "checkpoint"));
 }

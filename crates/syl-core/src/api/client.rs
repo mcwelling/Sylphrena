@@ -118,11 +118,20 @@ fn build_payload(
         "messages": crate::api::cache::messages_with_cache_points(messages),
     });
     if config.tools {
-        let mut tools = syl_tools();
-        if let Some(list) = tools.as_array_mut() {
-            list.extend(config.extra_tools.iter().cloned());
+        let tools: Vec<serde_json::Value> = syl_tools()
+            .as_array()
+            .into_iter()
+            .flatten()
+            .chain(config.extra_tools.iter())
+            .filter(|t| t["name"].as_str().is_some_and(|n| config.tool_allowed(n)))
+            .cloned()
+            .collect();
+        if !tools.is_empty() {
+            body["tools"] = serde_json::Value::Array(tools);
+            if config.tool_choice_none {
+                body["tool_choice"] = serde_json::json!({ "type": "none" });
+            }
         }
-        body["tools"] = tools;
     }
 
     if let Some(thinking) = thinking_param(config) {
@@ -723,6 +732,18 @@ pub fn syl_tools() -> serde_json::Value {
                     "path": {"type": "string", "description": "Directory to list. Default: the workspace."}
                 },
                 "required": []
+            }
+        },
+        {
+            "name": "fetch",
+            "description": "Fetch a web page (or PDF) and return it as text, at most 32,000 characters at a time. Long pages say where to continue: call again with that start.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "url":   {"type": "string", "description": "The URL."},
+                    "start": {"type": "integer", "description": "Byte offset to continue from. Default 0."}
+                },
+                "required": ["url"]
             }
         },
         {

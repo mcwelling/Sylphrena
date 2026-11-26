@@ -148,7 +148,8 @@ Claude has these built-in tools, all running inside the container:
 | `ls` | List a directory |
 | `memory_read` / `memory_write` | Persistent key-value notes in `.syl/memory/*.md` |
 | `workflow_write` / `workflow_delete` | Create or remove named workflow pipelines |
-| `dispatch_agent` | Fetch a URL and process it with a fast Haiku sub-agent |
+| `task` | Start a subagent in a fresh context: `explore` (read-only search), `general`, `fetch`, or your own. Several run in parallel |
+| `dispatch_agent` | Fetch a URL and process it with the `fetch` subagent (Haiku) |
 | `show_image` | Render an image in the terminal |
 
 Read-only calls (`read_file`, `grep`, `glob`, `ls`, `memory_read`) made together run in parallel.
@@ -160,6 +161,18 @@ In the terminal, your messages sit on the right and Syl's replies on the left, a
 **Images:** name an image in a prompt (`@screenshot.png`, or drag a file into the terminal) and it is sent with the prompt. PNG, JPEG, GIF and WebP, up to 3.75 MB each and 15 MB per prompt.
 
 **Skills and commands:** `SKILL.md` skills in `.syl/skills/`, `.agents/skills/` or `~/.syl/skills/` are listed to Syl, who loads one when a task calls for it (`/skill:name` loads one yourself). Markdown files in `.syl/commands/` (or `~/.syl/commands/`) become slash commands: `/review error handling` sends `review.md` with `$ARGUMENTS` filled in.
+
+**Subagents:** `task` runs a subagent in a child session: it sees only the prompt Syl writes for it, works in the same container under the same permission rules, and only its reply comes back, which keeps long searches out of the main context. Define your own in `.syl/agents/` (or `~/.syl/agents/`):
+```markdown
+---
+description: Reviews a diff for error handling.
+model: claude-haiku-5-5        # optional; default: the current model
+tools: read_file, grep, glob   # optional; default: every tool
+max_requests: 20               # optional; default 25
+---
+You review diffs for error handling. Report each problem with path:line.
+```
+Subagents can't start subagents. Their tool calls show on the ticker as `↳ name › ...`, and their questions to you come up like any other.
 
 **Recipes:** workflows can take parameters (`params: version` front matter, `{{version}}` in steps), retry a command (`(retry 2)`), and hand a step to Syl (`- Changelog: ask: update CHANGELOG.md for {{version}}`). Run one with `/workflow release 1.4.0` (quote a value with spaces: `message="fix the build"`). Ctrl+C stops a running step.
 

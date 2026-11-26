@@ -182,6 +182,38 @@ async fn a_reply_cut_off_by_an_api_error_is_marked_before_it_starts_again() {
 }
 
 #[tokio::test]
+async fn a_subagents_tool_calls_say_which_call_started_them() {
+    let task = sse(&[
+        json!({"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":0}}}),
+        json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t1","name":"task"}}),
+        json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta",
+               "partial_json": json!({"agent":"explore","description":"find main","prompt":"where is main?"}).to_string()}}),
+        json!({"type":"content_block_stop","index":0}),
+        json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":5}}),
+    ]);
+    let ls = sse(&[
+        json!({"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":0}}}),
+        json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"c1","name":"ls"}}),
+        json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\".\"}"}}),
+        json!({"type":"content_block_stop","index":0}),
+        json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":5}}),
+    ]);
+    let server = model_server(vec![ok(task), ok(ls), ok(text_stream("in src")), ok(text_stream("done"))]).await;
+    let mut c = start(&server, vec![]);
+    let sid = c.new_session().await;
+    let p = c.request("session/prompt", json!({"sessionId": sid, "prompt": [{"type": "text", "text": "go"}]})).await;
+    let (msgs, _) = c.until_response(p).await;
+    let ups = updates(&msgs);
+    let task_call = ups.iter().find(|u| u["sessionUpdate"] == "tool_call" && u["toolCallId"] == "t1").unwrap();
+    assert_eq!(task_call["kind"], "think");
+    assert_eq!(task_call["title"], "task: explore — find main");
+    let child = ups.iter().find(|u| u["sessionUpdate"] == "tool_call" && u["toolCallId"] == "c1").expect("the child's call");
+    assert_eq!(child["_meta"]["syl"]["parentToolCallId"], "t1");
+    assert_eq!(child["_meta"]["syl"]["agent"], "explore");
+    assert!(child["_meta"]["syl"]["session"].as_str().is_some_and(|s| !s.is_empty()));
+}
+
+#[tokio::test]
 async fn initialize_comes_first_and_says_what_syl_supports() {
     let server = model_server(vec![ok(text_stream("hi"))]).await;
     let mut c = start(&server, vec![]);

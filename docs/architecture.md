@@ -21,6 +21,7 @@ This document covers the implementation details behind Syl's main subsystems.
 - [Control and Safety](#control-and-safety)
 - [Headless and ACP](#headless-and-acp)
 - [Extensibility](#extensibility)
+- [Subagents](#subagents)
 - [Output Handling](#output-handling)
 - [Status Bar](#status-bar)
 - [Thinking Animation](#thinking-animation)
@@ -63,7 +64,7 @@ Session commands (`NewSession`, `LoadSession(id)`, `Fork { at }`, `SetSessionNam
 
 The TUI is the first client. It renders events and never calls into the loop. Slash commands still read and edit `SharedState` directly, but only between turns. `show_image` is split in two: the core tool checks that the file exists, and the TUI draws it when it sees the successful `ToolCallFinished`.
 
-Model calls go through the `ModelAdapter` trait (`crates/syl-core/src/model.rs`). `AnthropicAdapter` wraps `call_with_retry_shared` and is the only implementation. The loop, compaction and `dispatch_agent` all use the adapter.
+Model calls go through the `ModelAdapter` trait (`crates/syl-core/src/model.rs`). `AnthropicAdapter` wraps `call_with_retry_shared` and is the only implementation. The loop, compaction and subagents all use the adapter.
 
 `crates/syl-core/tests/agent_e2e.rs` drives the core with a wiremock model and a stand-in `podman` script (`Container::with_podman`), with no TTY, and asserts on the event stream.
 
@@ -406,6 +407,23 @@ Front matter is `key: value` lines between two `---` lines; `key: >` and `key: |
 
 ---
 
+## Subagents
+
+The `task` tool (`agents.rs`, `agent::run_subagent`) starts a subagent: a separate turn of the agent loop in a **child session**, with fresh context (only the prompt it was given), and only its final reply goes back as the tool result. It runs with the parent's container, model adapter (so the same rate limits), MCP servers, permission rules, hooks and mode, but with a restricted toolset and its own budgets.
+
+- **Agents.** Three are built in: `explore` (read-only: `read_file`, `grep`, `glob`, `ls`, `memory_read`), `general` (every tool) and `fetch` (only `fetch`, on Haiku). Markdown files with front matter in `.syl/agents/` or `~/.syl/agents/` add or replace them, the shape opencode and Claude Code use: `description`, `model` (default the parent's; `inherit` means the same), `tools` (a list; default every tool), `max_requests` (default 25) and `max_tokens` (a token budget over all its requests, default 400 000), then the instructions as the body. The file name is the name. Symbolic links aren't followed. A project's definitions come with the project, like its custom commands; they only shape prompts and narrow tools, and every call still goes through the permission rules. The `task` tool's description lists the agents, and is fixed with the system prompt.
+- **Depth one.** A subagent is never offered `task` or `dispatch_agent`, and is refused them if it calls them anyway (`AppConfig::tool_allowed`, checked when the request is built and again before a call runs). `fetch` is offered only to subagents.
+- **Its system prompt** is `agents::system_text` (it's a subagent, the user can't be asked, its budget), its instructions, the workspace context and the project's AGENTS.md: not Syl's own prompt, skills or memories.
+- **Budgets.** Before each request it checks its request count and the tokens it has used. At the limit it gets a note (`Budget reached: no more tool calls...`) and that request goes out with `tool_choice: none`, so it answers with what it has.
+- **Parallel.** Consecutive `task` calls in one response run at the same time, at most four (`agents::MAX_PARALLEL`). Each takes the project lock and plan mode's snapshots for its own calls as they run, so the parent holds neither while it waits (holding them would deadlock a plan-mode subagent).
+- **Permissions.** A subagent's `ask` goes to the parent's client as an ordinary `PermissionRequested` with the subagent's own call id, and the answer comes back through the parent's pending map. With several subagents running, they ask one at a time (`TurnShared::ask_lock`).
+- **Checkpoints.** Before a `task` whose agent can change files (it has `run_bash`, an edit tool, a memory or workflow tool, an MCP tool, or no tool list at all), the parent's turn is checkpointed as for its own writing calls, so `/undo` covers what the subagent did. A subagent's own turn isn't checkpointed; plan mode's per-call snapshots still apply inside it.
+- **The log.** A child session is logged under `.syl/sessions/agents/<parent session id>/`, so it isn't listed in `/sessions` or picked by `--continue`. The parent's log gets a `subagent` entry (`tool_use_id`, `agent`, `session`) linking the two.
+- **Events and cost.** A subagent's tool calls, notices and usage come out as `AgentEvent::Subagent { call_id, agent, session, event }`. The TUI shows its calls on the ticker (`↳ explore › grep …`). ACP sends them as tool calls of the parent session with `_meta.syl.parentToolCallId`, `agent` and `session`, since ACP has no nested sessions. Its spend is priced at its own model and added to the status bar's cost (`SharedState::subagent_cost_usd`).
+- **`dispatch_agent`** is the `fetch` subagent now, not a special case: its fields become the prompt, the subagent calls `fetch` (the page as text, 32 000 characters at a time with a `start` offset to read on), and its reply is wrapped in `dispatch_agent`'s JSON result. For `output_format: json` a reply that doesn't parse gets one more turn asking for valid JSON. It runs at most 8 requests.
+
+---
+
 ## Output Handling
 
 Tool output is processed before it reaches the model (`process_tool_output` in `crates/syl-core/src/util.rs`):
@@ -418,7 +436,7 @@ Tool output is processed before it reaches the model (`process_tool_output` in `
 
 Separately, `/tools` in the TUI shows `run_bash` output capped at 40 lines with a `... (N more lines)` trailer; this is display-only.
 
-For remote content, Claude can call `dispatch_agent`, which fetches a URL and has a `claude-haiku` sub-agent extract only what the task needs. That is an explicit tool call, not an automatic step applied to `run_bash` output.
+For remote content, Claude can call `dispatch_agent`, which runs the `fetch` subagent (see [Subagents](#subagents)) to fetch a URL and extract only what the task needs. That is an explicit tool call, not an automatic step applied to `run_bash` output.
 
 ---
 
@@ -495,7 +513,8 @@ crates/syl-container/src/
 └── lib.rs                 # Container: lifecycle, exec, exec_argv (stdin), stats
 
 crates/syl-core/src/
-├── agent.rs               # AgentEvent, AgentCommand, spawn, the loop
+├── agent.rs               # AgentEvent, AgentCommand, spawn, the loop, subagents
+├── agents.rs              # subagent definitions and the task tool
 ├── acp.rs                 # Agent Client Protocol agent (syl acp)
 ├── model.rs               # ModelAdapter trait, AnthropicAdapter
 ├── config.rs              # AppConfig, CLI parser, CLAUDE_MODELS fallback
@@ -526,7 +545,7 @@ crates/syl-core/src/
     ├── bash.rs            # run_bash
     ├── fs.rs              # read_file, edit_file, write_file, grep, glob, ls
     ├── image.rs           # show_image (existence check)
-    ├── dispatch.rs        # dispatch_agent (URL fetch + Haiku sub-agent)
+    ├── dispatch.rs        # fetch, and dispatch_agent's prompt and result
     ├── memory.rs          # memory_read / memory_write
     └── workflow.rs        # workflow_write / workflow_delete / parser
 ```

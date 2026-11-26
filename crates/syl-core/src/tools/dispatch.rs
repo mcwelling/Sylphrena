@@ -1,164 +1,140 @@
-/// `dispatch_agent` tool — fetches a URL and processes it via a Haiku sub-agent.
-///
-/// See the "Output Handling" section of `docs/architecture.md`.
+//! `dispatch_agent` and `fetch`.
+//!
+//! `dispatch_agent` runs the built-in `fetch` subagent (see `agents.rs`):
+//! this module turns its fields into the subagent's prompt, and its reply
+//! into `dispatch_agent`'s JSON result. `fetch` is that subagent's tool: it
+//! gets a page in the container and returns it a window at a time. See the
+//! "Output Handling" section of `docs/architecture.md`.
 
 use tokio_util::sync::CancellationToken;
 
 use syl_container::Container;
 
-use crate::api::client::{CancelledError, SystemBlock};
-use crate::api::types::{Message, StopReason};
 use crate::config::AppConfig;
-use crate::model::{ModelAdapter, ModelRequest};
 use crate::util::{is_html, strip_html};
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
+/// Most characters of a page one `fetch` call returns.
+pub const MAX_FETCH_CHARS: usize = 32_000;
 
-/// Versioned model ID for the dispatch sub-agent.
-/// Update here when Haiku is upgraded.
-const HAIKU_MODEL: &str = "claude-haiku-4-5-20251001";
+/// `dispatch_agent`'s fields, checked.
+pub struct Dispatch {
+    pub task: String,
+    pub source: String,
+    pub focus: String,
+    pub fmt: String,
+    /// Tokens the reply may use.
+    pub max_tokens: u32,
+}
 
-/// Maximum characters of fetched content passed to the sub-agent.
-/// Chosen to keep sub-agent calls fast and cheap — not a context limit
-/// (Haiku 4.5 has a 200K-token context window).
-const MAX_FETCH_CHARS: usize = 32_000;
-
-const HAIKU_SYSTEM: &str = "\
-You are a research assistant. Return only what the user asks for — no \
-preamble, no commentary, no apology. Output must match the requested \
-format exactly.";
-
-// ---------------------------------------------------------------------------
-// Public entry point
-// ---------------------------------------------------------------------------
-
-/// Run the `dispatch_agent` tool. Returns `(output_json, is_error)`.
-pub async fn dispatch_agent(
-    input:  &serde_json::Value,
-    config:    &AppConfig,
-    model:     &dyn ModelAdapter,
-    container: &Container,
-    cancel:    CancellationToken,
-) -> (String, bool) {
-    // --- Input validation ---
+/// Check `dispatch_agent`'s input; Err is the tool result to return.
+pub fn parse_dispatch(input: &serde_json::Value) -> Result<Dispatch, (String, bool)> {
     let task = match input["task"].as_str() {
         Some(t @ ("fetch" | "summarize" | "extract")) => t,
-        Some(other) => return err_json("Invalid parameter", &format!("unknown task: {other}"), ""),
-        None        => return err_json("Invalid parameter", "missing 'task' field", ""),
+        Some(other) => return Err(err_json("Invalid parameter", &format!("unknown task: {other}"), "")),
+        None => return Err(err_json("Invalid parameter", "missing 'task' field", "")),
     };
-    let source = match input["source"].as_str().filter(|s| !s.is_empty()) {
-        Some(s) => s,
-        None    => return err_json("Invalid parameter", "missing or empty 'source' field", ""),
+    let Some(source) = input["source"].as_str().filter(|s| !s.is_empty()) else {
+        return Err(err_json("Invalid parameter", "missing or empty 'source' field", ""));
     };
-    let focus = match input["focus"].as_str().filter(|s| !s.is_empty()) {
-        Some(f) => f,
-        None    => return err_json("Invalid parameter", "missing or empty 'focus' field", source),
+    let Some(focus) = input["focus"].as_str().filter(|s| !s.is_empty()) else {
+        return Err(err_json("Invalid parameter", "missing or empty 'focus' field", source));
     };
     let fmt = match input["output_format"].as_str() {
         Some(f @ ("text" | "json" | "list")) => f,
-        Some(other) => return err_json("Invalid parameter", &format!("unknown output_format: {other}"), source),
-        None        => return err_json("Invalid parameter", "missing 'output_format' field", source),
+        Some(other) => return Err(err_json("Invalid parameter", &format!("unknown output_format: {other}"), source)),
+        None => return Err(err_json("Invalid parameter", "missing 'output_format' field", source)),
     };
-    let max_tokens: u32 = input["max_length"]
-        .as_u64()
-        .map(|v| v.clamp(100, 4096) as u32)
-        .unwrap_or(800);
+    let max_tokens = input["max_length"].as_u64().map(|v| v.clamp(100, 4096) as u32).unwrap_or(800);
+    Ok(Dispatch {
+        task: task.to_string(),
+        source: source.to_string(),
+        focus: focus.to_string(),
+        fmt: fmt.to_string(),
+        max_tokens,
+    })
+}
 
-    // --- Fetch ---
-    let raw = match fetch_source(source, config, container, cancel.clone()).await {
-        Ok(r)  => r,
-        Err(e) => return err_json("Content retrieval failed", &e, source),
+impl Dispatch {
+    /// The `fetch` subagent's prompt.
+    pub fn prompt(&self) -> String {
+        let format_instruction = match self.fmt.as_str() {
+            "json" => "Respond with valid JSON only. No markdown fences. No surrounding text.",
+            "list" => "Respond with a plain text bullet list. One item per line. No preamble.",
+            _ => "Respond in plain text. Be concise.",
+        };
+        let what = match self.task.as_str() {
+            "summarize" => "Summarise it: a summary and its key points.",
+            "extract" => "Extract the data asked for, as a list of items.",
+            _ => "Return the relevant excerpt.",
+        };
+        format!(
+            "Fetch {} and answer from it.\nTask: {} ({what})\nFocus: {}\nOutput format: {}\n{format_instruction}\n\
+             Keep the answer under about {} tokens.",
+            self.source, self.task, self.focus, self.fmt, self.max_tokens
+        )
+    }
+
+    /// Told to the subagent when its JSON didn't parse.
+    pub const RETRY_JSON: &'static str =
+        "That reply was not valid JSON. Reply again with valid JSON only: no markdown fences, no surrounding text.";
+
+    /// Whether `reply` is the format asked for: for json, it must parse.
+    pub fn accepts(&self, reply: &str) -> bool {
+        self.fmt != "json" || serde_json::from_str::<serde_json::Value>(reply).is_ok()
+    }
+
+    /// The tool result for the subagent's final reply. `truncated` is a
+    /// reply cut off at max_tokens.
+    pub fn finish(&self, reply: &str, truncated: bool) -> (String, bool) {
+        if reply.trim().is_empty() {
+            return err_json("Sub-agent call failed", "no text in response", &self.source);
+        }
+        if !self.accepts(reply) {
+            let why = if truncated { "max_tokens reached before complete response" } else { "model did not return valid JSON after retry" };
+            let what = if truncated { "Response truncated" } else { "Format validation failed" };
+            return err_json(what, why, &self.source);
+        }
+        if truncated && self.fmt == "list" {
+            return err_json("Response truncated", "max_tokens reached before complete response", &self.source);
+        }
+        build_output(&self.task, &self.source, &self.fmt, reply, truncated.then_some("response truncated at max_tokens"))
+    }
+}
+
+/// The `fetch` tool: the page at `url`, as text, from `start` (a byte
+/// offset), at most [`MAX_FETCH_CHARS`] of it, saying where to go on.
+pub async fn fetch(input: &serde_json::Value, config: &AppConfig, container: &Container, cancel: CancellationToken) -> (String, bool) {
+    let Some(url) = input["url"].as_str().filter(|u| !u.trim().is_empty()) else {
+        return ("[Tool error: fetch requires a 'url']".to_string(), true);
     };
-
-    // Strip HTML; cut to MAX_FETCH_CHARS bytes, backing off to a character
-    // boundary (a fixed byte index can land inside a multi-byte character).
+    let raw = match fetch_source(url, config, container, cancel).await {
+        Ok(r) => r,
+        Err(e) => return (format!("[Tool error: could not fetch {url}: {e}]"), true),
+    };
     let content = if is_html(&raw) { strip_html(&raw) } else { raw };
-    let content = if content.len() > MAX_FETCH_CHARS {
-        let mut cut = MAX_FETCH_CHARS;
-        while !content.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        format!("{}\n[... cut here: {} of {} bytes shown]", &content[..cut], cut, content.len())
-    } else {
-        content
-    };
+    (window(&content, input["start"].as_u64().unwrap_or(0) as usize), false)
+}
 
-    // --- Sub-agent call ---
-    let haiku_cfg  = haiku_config(config, max_tokens);
-    let system     = vec![SystemBlock::text(HAIKU_SYSTEM)];
-    let user_msg   = build_haiku_user_message(&content, task, focus, fmt);
-    let messages   = vec![Message::user_text(user_msg)];
-
-    let result = model.complete(
-        ModelRequest { config: &haiku_cfg, messages: &messages, system: &system },
-        cancel.clone(), &|_| {}, &|_| {},
-    ).await;
-
-    let turn = match result {
-        Ok(t)  => t,
-        Err(e) => {
-            if e.downcast_ref::<CancelledError>().is_some() {
-                return err_json("Cancelled", "request cancelled by user", source);
-            }
-            let reason = e.to_string();
-            return err_json("Sub-agent call failed", &reason, source);
-        }
-    };
-
-    let text = match turn.content.iter().find_map(|b| {
-        if let crate::api::types::ContentBlock::Text { text, .. } = b { Some(text.as_str()) } else { None }
-    }) {
-        Some(t) => t.to_string(),
-        None    => return err_json("Sub-agent call failed", "no text in response", source),
-    };
-
-    // MaxTokens: for json/list this is always fatal; for text we return the
-    // partial content with a warning field.
-    if turn.stop_reason == StopReason::MaxTokens {
-        if fmt == "json" || fmt == "list" {
-            return err_json("Response truncated", "max_tokens reached before complete response", source);
-        }
-        // text: return partial with warning
-        return build_output(task, source, fmt, &text, Some("response truncated at max_tokens"));
+/// `content` from `start`, cut to [`MAX_FETCH_CHARS`] on character
+/// boundaries, with a note on what was left out.
+pub fn window(content: &str, start: usize) -> String {
+    let mut from = start.min(content.len());
+    while !content.is_char_boundary(from) {
+        from -= 1;
     }
-
-    // --- Format validation (json only) ---
-    if fmt == "json" {
-        if serde_json::from_str::<serde_json::Value>(&text).is_err() {
-            // Retry once with stricter prompt — fresh call, no prior response in context
-            let retry_msg  = build_haiku_retry_message(&content, task, focus);
-            let retry_msgs = vec![Message::user_text(retry_msg)];
-
-            let retry_result = model.complete(
-        ModelRequest { config: &haiku_cfg, messages: &retry_msgs, system: &system },
-        cancel.clone(), &|_| {}, &|_| {},
-    ).await;
-
-            let retry_text = match retry_result {
-                Ok(t) => t.content.iter().find_map(|b| {
-                    if let crate::api::types::ContentBlock::Text { text, .. } = b {
-                        Some(text.clone())
-                    } else {
-                        None
-                    }
-                }).unwrap_or_default(),
-                Err(e) => return err_json("Sub-agent call failed", &e.to_string(), source),
-            };
-
-            if serde_json::from_str::<serde_json::Value>(&retry_text).is_err() {
-                return err_json(
-                    "Format validation failed",
-                    "model did not return valid JSON after retry",
-                    source,
-                );
-            }
-            return build_output(task, source, fmt, &retry_text, None);
-        }
+    let mut to = (from + MAX_FETCH_CHARS).min(content.len());
+    while !content.is_char_boundary(to) {
+        to -= 1;
     }
-
-    build_output(task, source, fmt, &text, None)
+    let mut out = content[from..to].to_string();
+    if from > 0 || to < content.len() {
+        out.push_str(&format!("\n[... cut here: bytes {from}-{to} of {} bytes shown", content.len()));
+        if to < content.len() {
+            out.push_str(&format!("; call fetch again with start={to} for more"));
+        }
+        out.push(']');
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -200,67 +176,6 @@ async fn fetch_source(
         return Err("empty response from source".to_string());
     }
     Ok(output)
-}
-
-// ---------------------------------------------------------------------------
-// Haiku config (explicit fields — no silent propagation via ..base.clone())
-// ---------------------------------------------------------------------------
-
-fn haiku_config(base: &AppConfig, max_tokens: u32) -> AppConfig {
-    AppConfig {
-        model:           HAIKU_MODEL.to_string(),
-        max_tokens,
-        thinking_budget: None,
-        // The sub-agent answers from the page; it has no tools to call.
-        tools:           false,
-        // Flags that must never be set for a sub-agent call
-        resume:   false,
-        fresh:    false,
-        no_banner: false,
-        // All other fields (auth, rate-limit, UI, etc.)
-        // pass through from base. New AppConfig fields are automatically included.
-        ..base.clone()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Prompt builders (pure functions — independently testable)
-// ---------------------------------------------------------------------------
-
-/// Build the user message for the Haiku sub-agent.
-pub fn build_haiku_user_message(content: &str, task: &str, focus: &str, fmt: &str) -> String {
-    let format_instruction = match fmt {
-        "json" => "Respond with valid JSON only. No markdown fences. No surrounding text.",
-        "list" => "Respond with a plain text bullet list. One item per line. No preamble.",
-        _      => "Respond in plain text. Be concise.",
-    };
-
-    format!(
-        "Task: {task}\n\
-         Focus: {focus}\n\
-         Output format: {fmt}\n\
-         {format_instruction}\n\n\
-         Content:\n\
-         ---\n\
-         {content}\n\
-         ---"
-    )
-}
-
-/// Build the retry message when the first JSON response was malformed.
-/// Fresh call — deliberately excludes the prior bad response.
-fn build_haiku_retry_message(content: &str, task: &str, focus: &str) -> String {
-    format!(
-        "Task: {task}\n\
-         Focus: {focus}\n\
-         Output format: json\n\
-         IMPORTANT: The previous attempt did not return valid JSON. \
-         Respond with valid JSON only. No markdown fences. No surrounding text.\n\n\
-         Content:\n\
-         ---\n\
-         {content}\n\
-         ---"
-    )
 }
 
 // ---------------------------------------------------------------------------
@@ -326,47 +241,52 @@ fn err_json(error: &str, reason: &str, source_url: &str) -> (String, bool) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn haiku_config_overrides_model_and_tokens() {
-        let base = AppConfig::default();
-        let cfg  = haiku_config(&base, 400);
-        assert_eq!(cfg.model, HAIKU_MODEL);
-        assert_eq!(cfg.max_tokens, 400);
-        assert!(cfg.thinking_budget.is_none());
+    fn dispatch(fmt: &str) -> Dispatch {
+        parse_dispatch(&serde_json::json!({
+            "task": "summarize", "source": "http://x.com", "focus": "key points", "output_format": fmt, "max_length": 99999
+        }))
+        .ok()
+        .unwrap()
     }
 
     #[test]
-    fn haiku_config_clamps_no_tools_fields() {
-        // Verify no tool-enabling fields exist that could leak through.
-        // If AppConfig gains such a field and haiku_config is not updated,
-        // this test will fail to compile (field not initialised).
-        let base = AppConfig::default();
-        let cfg  = haiku_config(&base, 100);
-        assert_eq!(cfg.resume, false);
-        assert_eq!(cfg.fresh, false);
+    fn the_prompt_carries_the_fields() {
+        let d = dispatch("json");
+        assert_eq!(d.max_tokens, 4096);
+        let p = d.prompt();
+        assert!(p.contains("Fetch http://x.com") && p.contains("Task: summarize") && p.contains("Focus: key points"));
+        assert!(p.contains("valid JSON only"));
+        assert!(dispatch("list").prompt().contains("bullet list"));
+        assert!(dispatch("text").prompt().contains("plain text"));
     }
 
     #[test]
-    fn build_haiku_user_message_json_format() {
-        let msg = build_haiku_user_message("some content", "summarize", "key points", "json");
-        assert!(msg.contains("Task: summarize"));
-        assert!(msg.contains("Focus: key points"));
-        assert!(msg.contains("Output format: json"));
-        assert!(msg.contains("valid JSON only"));
-        assert!(msg.contains("some content"));
+    fn bad_input_is_an_error_result() {
+        let (s, is_err) = parse_dispatch(&serde_json::json!({"task": "fly"})).err().unwrap();
+        assert!(is_err && s.contains("unknown task"));
     }
 
     #[test]
-    fn build_haiku_user_message_text_format() {
-        let msg = build_haiku_user_message("c", "fetch", "f", "text");
-        assert!(msg.contains("Output format: text"));
-        assert!(msg.contains("plain text"));
+    fn finish_checks_the_format() {
+        assert!(!dispatch("json").accepts("not json"));
+        let (s, err) = dispatch("json").finish("{\"a\":1}", false);
+        assert!(!err && s.contains("\"summary\":{\"a\":1}"));
+        assert!(dispatch("json").finish("nope", false).1);
+        let (s, err) = dispatch("text").finish("partial", true);
+        assert!(!err && s.contains("truncated"));
+        assert!(dispatch("list").finish("- a", true).1);
+        assert!(dispatch("text").finish("  ", false).1);
     }
 
     #[test]
-    fn build_haiku_user_message_list_format() {
-        let msg = build_haiku_user_message("c", "extract", "f", "list");
-        assert!(msg.contains("bullet list"));
+    fn fetch_windows_on_character_boundaries() {
+        let page = "日本語".repeat(20_000);
+        let first = window(&page, 0);
+        assert!(first.contains("call fetch again with start="), "{}", &first[first.len() - 120..]);
+        assert!(first.contains(&format!("of {} bytes shown", page.len())));
+        let last = window(&page, page.len() - 10);
+        assert!(!last.contains("call fetch again"));
+        assert_eq!(window("short", 0), "short");
     }
 
     #[test]

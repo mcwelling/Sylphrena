@@ -119,6 +119,27 @@ pub struct AppConfig {
     /// Tool definitions sent with the built-in ones: MCP tools and the
     /// `skill` tool, fixed for the conversation.
     pub extra_tools: std::sync::Arc<Vec<serde_json::Value>>,
+    /// Set when this is a subagent's turn: which agent, and so which tools
+    /// it has, its budgets and its instructions.
+    pub subagent: Option<std::sync::Arc<crate::agents::AgentDef>>,
+    /// Send this request with `tool_choice: none`: a subagent at the end
+    /// of its budget must answer with what it has.
+    pub tool_choice_none: bool,
+}
+
+/// Tools only subagents are offered.
+const SUBAGENT_ONLY: &[&str] = &["fetch"];
+
+impl AppConfig {
+    /// Whether this turn may offer and run `name`: a subagent only its
+    /// agent's tools (never `task`), the main agent all but the
+    /// subagent-only ones.
+    pub fn tool_allowed(&self, name: &str) -> bool {
+        match &self.subagent {
+            Some(def) => def.allows(name),
+            None => !SUBAGENT_ONLY.contains(&name),
+        }
+    }
 }
 
 /// `[reviewer]` in config.toml.
@@ -183,6 +204,8 @@ impl Default for AppConfig {
             mcp: Vec::new(),
             untrusted: None,
             extra_tools: Default::default(),
+            subagent: None,
+            tool_choice_none: false,
         }
     }
 }
