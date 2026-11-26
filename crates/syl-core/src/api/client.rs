@@ -386,22 +386,63 @@ fn retry_delay(e: &anyhow::Error, attempt: u32, api_wait: std::time::Duration) -
 /// Output tokens a request is assumed to need from the output bucket.
 const OUTPUT_NEED: u64 = 4096;
 
+/// How long a prompt-cache entry is trusted to live: a little under the
+/// API's 5 minutes, so a borderline request counts as uncached (the safer
+/// guess).
+const CACHE_TTL_MS: u64 = 270_000;
+
+/// About how many input tokens of `messages` the input bucket will be
+/// charged for: cache reads aren't, so while the last request's cache is
+/// warm only the messages added since then count. Once it has expired,
+/// everything is sent uncached again. The first request, or one whose
+/// conversation was cut short (compaction, `/clear`), is estimated whole.
+pub fn input_need(
+    limits: &crate::shared::ModelLimits,
+    messages: &[Message],
+    system: &[SystemBlock],
+    now: u64,
+) -> u64 {
+    use crate::api::compaction::{estimate_text_tokens, estimate_tokens};
+    let est = |ms: &[Message]| ms.iter().map(estimate_tokens).sum::<u64>();
+    let seen = limits.last_ms > 0 && messages.len() >= limits.last_count;
+    let need = if !seen {
+        est(messages) + system.iter().map(|b| estimate_text_tokens(&b.text)).sum::<u64>()
+    } else if now.saturating_sub(limits.last_ms) < CACHE_TTL_MS {
+        est(&messages[limits.last_count..])
+    } else {
+        limits.last_total + est(&messages[limits.last_count..])
+    };
+    need.max(1000)
+}
+
 /// How long until `config.model`'s buckets (as its last response left
-/// them, refilled since) can hold about what its last request used.
-fn api_wait(config: &AppConfig, state: &crate::shared::SharedState) -> std::time::Duration {
+/// them, refilled since) can hold about what this request needs.
+fn api_wait(
+    config: &AppConfig,
+    state: &crate::shared::SharedState,
+    messages: &[Message],
+    system: &[SystemBlock],
+) -> std::time::Duration {
     let limits = state.model_limits.lock().unwrap().get(&config.model).copied().unwrap_or_default();
-    let need_in = limits.last_input.max(1000);
+    let Some(api) = limits.api else { return std::time::Duration::ZERO };
+    let now = crate::api::rate_limit::now_ms();
+    let need_in = input_need(&limits, messages, system, now);
     let need_out = OUTPUT_NEED.min(config.max_tokens as u64);
-    limits.api.map_or(std::time::Duration::ZERO, |l| l.wait_for(need_in, need_out, crate::api::rate_limit::now_ms()))
+    api.wait_for(need_in, need_out, now)
 }
 
 /// How long to wait before the next request, and whether Syl's own cap
 /// (not the API's limits) is the reason: the API's wait (see `api_wait`)
 /// and, with a `rate_limit` cap, until the window is under 80% of it.
-fn wait_before_request(config: &AppConfig, state: &crate::shared::SharedState) -> (std::time::Duration, bool) {
+fn wait_before_request(
+    config: &AppConfig,
+    state: &crate::shared::SharedState,
+    messages: &[Message],
+    system: &[SystemBlock],
+) -> (std::time::Duration, bool) {
     use crate::api::rate_limit as rl;
     let now = rl::now_ms();
-    let api = api_wait(config, state).min(MAX_WAIT);
+    let api = api_wait(config, state, messages, system).min(MAX_WAIT);
     let own = if config.rate_limit == 0 {
         std::time::Duration::ZERO
     } else {
@@ -438,7 +479,7 @@ pub async fn call_with_retry_shared(
     on_delta:  impl Fn(BlockDeltaEvent),
 ) -> anyhow::Result<TurnResult> {
     // Locks are taken and released inside; none is held across an await.
-    let (wait, own_cap) = wait_before_request(config, state);
+    let (wait, own_cap) = wait_before_request(config, state, messages, system);
     if wait >= std::time::Duration::from_millis(500) {
         let why = if own_cap {
             "Syl's own rate_limit cap"
@@ -458,7 +499,13 @@ pub async fn call_with_retry_shared(
         match stream_turn_observed(client, config, messages, system, cancel.clone(), &on_delta, Some(state)).await {
             Ok(result) => {
                 let uncached = result.usage.input_tokens + result.usage.cache_write_tokens;
-                state.model_limits.lock().unwrap().entry(config.model.clone()).or_default().last_input = uncached;
+                {
+                    let mut all = state.model_limits.lock().unwrap();
+                    let l = all.entry(config.model.clone()).or_default();
+                    l.last_total = uncached + result.usage.cache_read_tokens;
+                    l.last_ms = crate::api::rate_limit::now_ms();
+                    l.last_count = messages.len();
+                }
                 {
                     let mut calls = state.recent_calls.lock().unwrap();
                     crate::api::rate_limit::record_rate_call(&mut calls, uncached);
@@ -471,7 +518,7 @@ pub async fn call_with_retry_shared(
                 return Ok(result);
             }
             Err(e) if is_rate_limit_error(&e) && attempts < MAX_RETRIES => {
-                let delay = retry_delay(&e, attempts, api_wait(config, state));
+                let delay = retry_delay(&e, attempts, api_wait(config, state, messages, system));
                 tracing::warn!(attempt = attempts, delay_ms = delay.as_millis(), error = %e, "rate limited, retrying");
                 if delay >= std::time::Duration::from_secs(2) {
                     let what = if e.to_string().starts_with("rate_limit:529") { "The API is overloaded" } else { "The API's rate limit was reached" };

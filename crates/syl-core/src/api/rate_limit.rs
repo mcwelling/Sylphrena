@@ -90,7 +90,14 @@ pub struct ApiLimits {
 impl ApiLimits {
     /// Read the `anthropic-ratelimit-*` headers. None when there are none
     /// (a proxy, or a test server).
+    ///
+    /// Reset times are the server's clock. When the response's `Date` says
+    /// the local clock is off by more than [`SKEW_TOLERANCE_MS`], they are
+    /// moved onto the local one, so a fast clock doesn't see buckets full
+    /// too early (and a slow one too late).
     pub fn from_headers(headers: &HeaderMap, now: u64) -> Option<Self> {
+        let skew = clock_skew_ms(headers, now);
+        let to_local = |server_ms: u64| (server_ms as i64 - skew).max(0) as u64;
         let num = |name: &str| headers.get(name)?.to_str().ok()?.trim().parse::<u64>().ok();
         let bucket = |kind: &str| {
             let limit = num(&format!("anthropic-ratelimit-{kind}-limit"))?;
@@ -99,6 +106,7 @@ impl ApiLimits {
                 .get(format!("anthropic-ratelimit-{kind}-reset"))
                 .and_then(|v| v.to_str().ok())
                 .and_then(parse_rfc3339_ms)
+                .map(to_local)
                 .unwrap_or(now + RATE_WINDOW_MS);
             Some(Bucket { limit, remaining, reset_ms, seen_ms: now })
         };
@@ -117,6 +125,37 @@ impl ApiLimits {
         let o = self.output.map_or(Duration::ZERO, |b| b.wait_for(output, now));
         i.max(o)
     }
+}
+
+/// Clock differences up to this are left alone: `Date` has whole seconds,
+/// and the response took some time to arrive.
+pub const SKEW_TOLERANCE_MS: i64 = 2_000;
+
+/// How far the server's clock is ahead of the local one (ms, negative when
+/// behind), from the response's `Date`; 0 when within the tolerance or
+/// unknown.
+pub fn clock_skew_ms(headers: &HeaderMap, now: u64) -> i64 {
+    let Some(server) = headers.get("date").and_then(|v| v.to_str().ok()).and_then(parse_http_date_ms) else {
+        return 0;
+    };
+    // `Date` is truncated to the second: the middle of it is the best guess.
+    let skew = server as i64 + 500 - now as i64;
+    if skew.abs() > SKEW_TOLERANCE_MS { skew } else { 0 }
+}
+
+/// An HTTP date (`Wed, 25 Nov 2026 10:00:00 GMT`) as ms since the epoch.
+pub fn parse_http_date_ms(s: &str) -> Option<u64> {
+    let mut p = s.split_whitespace();
+    let _weekday = p.next()?;
+    let (day, mon, year, time) = (p.next()?, p.next()?, p.next()?, p.next()?);
+    if p.next()? != "GMT" {
+        return None;
+    }
+    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let m = MONTHS.iter().position(|&x| x == mon)? + 1;
+    let day: u32 = day.parse().ok()?;
+    let year: u32 = year.parse().ok()?;
+    parse_rfc3339_ms(&format!("{year:04}-{m:02}-{day:02}T{time}Z"))
 }
 
 /// `retry-after`, in seconds (the API's form) or as an HTTP date (ignored).
@@ -163,6 +202,55 @@ pub fn parse_rfc3339_ms(s: &str) -> Option<u64> {
 mod tests {
     use super::*;
     use reqwest::header::HeaderValue;
+
+    #[test]
+    fn http_dates_parse() {
+        assert_eq!(parse_http_date_ms("Thu, 01 Jan 1970 00:01:00 GMT"), Some(60_000));
+        assert_eq!(parse_http_date_ms("Thu, 29 Feb 2024 12:00:00 GMT"), Some(1_709_208_000_000));
+        assert_eq!(parse_http_date_ms("Thu, 29 Feb 2024 12:00:00 PST"), None);
+        assert_eq!(parse_http_date_ms("yesterday"), None);
+    }
+
+    fn limit_headers(reset: &'static str, date: Option<&'static str>) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("anthropic-ratelimit-input-tokens-limit", HeaderValue::from_static("60000"));
+        h.insert("anthropic-ratelimit-input-tokens-remaining", HeaderValue::from_static("0"));
+        h.insert("anthropic-ratelimit-input-tokens-reset", HeaderValue::from_static(reset));
+        if let Some(d) = date {
+            h.insert("date", HeaderValue::from_static(d));
+        }
+        h
+    }
+
+    #[test]
+    fn reset_times_move_onto_the_local_clock() {
+        // The server says 00:01:00 and the bucket is full at 00:02:00.
+        let reset = "1970-01-01T00:02:00Z";
+        let date = Some("Thu, 01 Jan 1970 00:01:00 GMT");
+        // The local clock is 30s fast: full at local 00:02:30, minus the
+        // half second `Date` may have been truncated by.
+        let fast = ApiLimits::from_headers(&limit_headers(reset, date), 90_000).unwrap();
+        assert_eq!(fast.input.unwrap().reset_ms, 150_000 - 500);
+        // 30s slow.
+        let slow = ApiLimits::from_headers(&limit_headers(reset, date), 30_000).unwrap();
+        assert_eq!(slow.input.unwrap().reset_ms, 90_000 - 500);
+        // Within a second or two: left as the server said.
+        let close = ApiLimits::from_headers(&limit_headers(reset, date), 61_200).unwrap();
+        assert_eq!(close.input.unwrap().reset_ms, 120_000);
+        // No Date: left as the server said.
+        let none = ApiLimits::from_headers(&limit_headers(reset, None), 90_000).unwrap();
+        assert_eq!(none.input.unwrap().reset_ms, 120_000);
+    }
+
+    #[test]
+    fn a_fast_clock_no_longer_sees_the_bucket_full_early() {
+        let reset = "1970-01-01T00:02:00Z";
+        let date = Some("Thu, 01 Jan 1970 00:01:00 GMT");
+        // Local clock 50s fast; seen at local 110s. Twenty seconds later the
+        // server is at 80s: 20k of 60k refilled, not full.
+        let l = ApiLimits::from_headers(&limit_headers(reset, date), 110_000).unwrap();
+        assert_eq!(l.input.unwrap().available(130_000), 20_000);
+    }
 
     #[test]
     fn dates_parse() {

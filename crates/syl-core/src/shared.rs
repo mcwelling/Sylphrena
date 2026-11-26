@@ -50,9 +50,13 @@ pub struct SharedState {
 pub struct ModelLimits {
     /// From the last response's headers.
     pub api: Option<ApiLimits>,
-    /// Uncached input tokens (input plus cache writes) of the last request:
-    /// about what the next one will need from the input bucket.
-    pub last_input: u64,
+    /// The last successful request: its whole input (uncached, cache reads
+    /// and cache writes), when it was sent (ms since epoch, 0 for never)
+    /// and how many messages it had. From these the next request's
+    /// uncached input is estimated (see `client::input_need`).
+    pub last_total: u64,
+    pub last_ms: u64,
+    pub last_count: usize,
 }
 
 impl SharedState {

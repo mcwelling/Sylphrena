@@ -213,11 +213,21 @@ async fn a_429_without_retry_after_waits_for_the_bucket_it_reports() {
         .mount(&server)
         .await;
     let state = syl_core::shared::SharedState::new();
-    let model = config(&server).model;
-    state.model_limits.lock().unwrap().entry(model).or_default().last_input = 3_000;
     let notices = Mutex::new(Vec::new());
     let started = Instant::now();
-    call(&server, &state, &notices).await;
+    // A first request (nothing cached) of about 3,000 tokens.
+    call_with_retry_shared(
+        &reqwest::Client::new(),
+        &config(&server),
+        &state,
+        &[Message::user_text("x".repeat(9_000))],
+        &[SystemBlock::text("sys")],
+        CancellationToken::new(),
+        |n| notices.lock().unwrap().push(n.to_string()),
+        |_| {},
+    )
+    .await
+    .unwrap();
     let took = started.elapsed();
     assert!(took >= Duration::from_millis(2800) && took < Duration::from_secs(6), "{took:?}");
     let notices = notices.into_inner().unwrap();
@@ -266,4 +276,48 @@ async fn a_wait_set_by_the_own_cap_says_so() {
     .unwrap();
     let notices = notices.into_inner().unwrap();
     assert!(notices.iter().any(|n| n.contains("Syl's own rate_limit cap")), "{notices:?}");
+}
+
+mod estimate {
+    use syl_core::api::client::{input_need, SystemBlock};
+    use syl_core::api::types::Message;
+    use syl_core::shared::ModelLimits;
+
+    fn convo(n: usize, chars: usize) -> Vec<Message> {
+        (0..n).map(|_| Message::user_text("x".repeat(chars))).collect()
+    }
+
+    const NOW: u64 = 10_000_000;
+
+    #[test]
+    fn a_warm_cache_charges_only_the_new_messages() {
+        // Last request: 10 messages, 200k tokens in all, 1 minute ago.
+        let l = ModelLimits { api: None, last_total: 200_000, last_ms: NOW - 60_000, last_count: 10 };
+        let mut m = convo(10, 30_000);
+        m.extend(convo(2, 6_000)); // the reply and a tool result: ~4k
+        let need = input_need(&l, &m, &[], NOW);
+        assert!((3_500..5_000).contains(&need), "{need}");
+    }
+
+    #[test]
+    fn an_expired_cache_charges_everything_again() {
+        let l = ModelLimits { api: None, last_total: 200_000, last_ms: NOW - 6 * 60_000, last_count: 10 };
+        let mut m = convo(10, 30_000);
+        m.extend(convo(2, 6_000));
+        let need = input_need(&l, &m, &[], NOW);
+        assert!((203_500..205_000).contains(&need), "{need}");
+    }
+
+    #[test]
+    fn a_first_or_shortened_conversation_is_estimated_whole() {
+        let sys = [SystemBlock::text("s".repeat(3_000))];
+        let m = convo(3, 3_000);
+        let first = input_need(&ModelLimits::default(), &m, &sys, NOW);
+        assert!((3_900..4_200).contains(&first), "{first}");
+        // After compaction the conversation is shorter than last time.
+        let l = ModelLimits { api: None, last_total: 200_000, last_ms: NOW - 1_000, last_count: 40 };
+        assert_eq!(input_need(&l, &m, &sys, NOW), first);
+        // Never under 1,000.
+        assert_eq!(input_need(&ModelLimits::default(), &convo(1, 10), &[], NOW), 1_000);
+    }
 }
