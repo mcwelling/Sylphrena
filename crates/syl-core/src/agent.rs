@@ -43,6 +43,10 @@ pub enum AgentEvent {
     RequestStarted,
     TextDelta { text: String },
     ThinkingDelta { text: String },
+    /// The model request failed after some of its text or thinking was
+    /// streamed, and is being sent again: drop what this request streamed
+    /// so far (since its `RequestStarted`); the reply starts over.
+    ReplyRestarted,
     ToolCallStarted { id: String, name: String, input: serde_json::Value },
     ToolCallFinished { id: String, name: String, output: String, is_error: bool },
     /// A rule says to ask before this tool call (and the reviewer, if any,
@@ -770,6 +774,7 @@ async fn run_turn(
             BlockDeltaEvent::TextDelta { text } => emit(AgentEvent::TextDelta { text }),
             BlockDeltaEvent::ThinkingDelta { text } => emit(AgentEvent::ThinkingDelta { text }),
             BlockDeltaEvent::InputJsonDelta { .. } => {}
+            BlockDeltaEvent::Restart => emit(AgentEvent::ReplyRestarted),
         };
         let req = ModelRequest { config: &config, messages: &messages, system: &system };
         let turn = match agent.model.complete(req, cancel.clone(), &on_notice, &on_delta).await {

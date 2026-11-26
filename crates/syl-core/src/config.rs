@@ -37,7 +37,9 @@ pub const CLAUDE_MODELS: &[ModelInfo] = &[
 // ---------------------------------------------------------------------------
 
 pub const DEFAULT_MODEL: &str = "claude-opus-5-5";
-pub const DEFAULT_RATE_LIMIT: u64 = 60_000;
+/// No cap of Syl's own by default: the API's limits (from its response
+/// headers) are followed instead. `rate_limit` sets a cap below them.
+pub const DEFAULT_RATE_LIMIT: u64 = 0;
 /// Max *output* tokens sent in each API request.  Modern Claude models support
 /// 32K–64K output tokens; 8096 was an overly conservative legacy value that
 /// would silently truncate long code-generation responses.

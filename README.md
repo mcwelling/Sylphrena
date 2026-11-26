@@ -50,7 +50,7 @@ On first run Syl pulls an Ubuntu base image, installs dev tools, and bakes a cac
 | Flag | Default | Description |
 |---|---|---|
 | `--model <name>` | `claude-opus-5-5` | Starting model (switch live with `/model`) |
-| `--rate-limit <n>` | `60000` | Token-per-minute budget |
+| `--rate-limit <n>` | none | A tokens-per-minute cap below the API's own limits (Syl follows those from the API's response headers either way) |
 | `--timeout <secs>` | `120` | Request timeout |
 | `--thinking <n>` | — | Extended thinking token budget. On adaptive-thinking models (Opus 4.7+, all 5.x models, including the default) the budget is ignored and Syl streams summarized thinking instead |
 | `--image <mode>` | `auto` | `kitty` / `iterm2` / `sixel` / `symbols` |
@@ -66,7 +66,6 @@ On first run Syl pulls an Ubuntu base image, installs dev tools, and bakes a cac
 **Per-project config** (lowest priority): `.syl/config.toml`
 ```toml
 model      = "claude-sonnet-4-6"
-rate_limit = 40000
 image      = "kitty"
 
 # Ask before some tool calls (optional; the last matching rule wins)

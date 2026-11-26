@@ -105,15 +105,22 @@ Text deltas are printed immediately via `terminal::write_streaming`. Tool-use JS
 
 ## Rate Limiting
 
-Three layers protect against rate limit errors:
+Syl follows the limits the API reports rather than guessing them (`api/rate_limit.rs`). Anthropic's limits depend on the organisation's usage tier and the model, and every response says what they are.
 
-1. **Proactive budgeting** — A sliding 60-second window tracks input tokens across all API calls. When usage exceeds 80% of `rate_limit` (default 60 000 TPM), the next call sleeps until the window resets.
+1. **The API's buckets.** Each response's `anthropic-ratelimit-{input,output}-tokens-{limit,remaining,reset}` headers are kept in `SharedState::model_limits`, by model, since the API limits each model separately: a `dispatch_agent` call on Haiku or a reviewer call doesn't pace the main model, and the status bar and `/status` show the current model's. A single `tokens` bucket is read as the input one. The buckets refill continuously at `limit` a minute. So before a request Syl works out what each bucket holds by now, and waits only if it can't hold about what the request will need, and 4 096 output tokens (or `max_tokens` if lower). The input estimate (`client::input_need`, at least 1 000) depends on the prompt cache, since cache reads aren't charged:
+   - Within 4.5 minutes of the model's last request (the cache lives 5), only the messages added since then count.
+   - Later, the cache has expired: the last request's whole input counts again, plus the new messages.
+   - A first request, or a conversation shorter than last time (compaction, `/clear`), is estimated whole, system prompt included.
 
-2. **Retry with exponential backoff** — On `429` / `529` responses, retries up to 4 times with base delay 500 ms, doubling each attempt (capped at 32 s). `retry-after` headers are respected.
+   The wait is just long enough for the shortfall to refill, never past the bucket's reset, and at most two minutes. Reset times are in the server's clock. When the response's `Date` header shows the local clock is more than 2 s off, they are moved onto the local one, so a fast clock doesn't see a bucket full too early.
+
+2. **Retries.** A `429` or `529` (before or during the stream) is retried up to 6 times. The wait is the `retry-after` the API sent (at most two minutes). Without one, it is 1 s doubling to at most 30 s, or longer if the headers on the error itself say the bucket needs longer to refill. Waits of 2 s or more are shown as a notice. An error response's body is read only until a cancel, and for at most 10 s. If the request failed after some of the reply was streamed, the agent emits `ReplyRestarted` and a notice before sending it again: the TUI marks where the discarded part ends, `-p` sets the new start apart (and says so on stderr), and `--output json` readers can drop the text streamed since `RequestStarted`.
+
+3. **An optional cap of your own.** `rate_limit` (tokens a minute, default 0 = none) keeps Syl below what the API allows, for example to leave room for other tools sharing the key: a sliding 60-second window of uncached input tokens, and past 80% of the cap the next request waits for the window.
 
 3. **Prompt caching** — `cache_control: {type: ephemeral}` breakpoints go on the system prompt and on the last text block of each of the two most recent assistant turns (at most three of the API's four), reducing input tokens on repeat calls via Anthropic's server-side prompt cache.
 
-The TPM bar in the top status bar is colour-coded: green < 50%, yellow 50–80%, red ≥ 80% (when proactive throttling is active).
+The status bar's TPM gauge shows how full the API's input bucket is (green < 50%, yellow 50–80%, red ≥ 80%), or the cap's window before any headers have been seen; with neither it is hidden. `/status` lists the API's limits and what is left of each.
 
 ---
 
@@ -431,7 +438,7 @@ Your messages are printed into the conversation as you send them, right-aligned 
 | model | The model for the next turn |
 | `↑ N` / `↓ N` | Session input / output tokens |
 | `$N` | Estimated session cost (USD) |
-| `███░ N%` | Tokens per minute against the rate-limit budget (hidden with no limit) |
+| `███░ N%` | How much of the API's per-minute input-token limit is in use (or of `rate_limit`, before the API has reported one) |
 | `cpu N% NM` | Container CPU and memory (polled every 5 s) |
 | `N msgs` | Messages in the conversation history |
 
@@ -503,7 +510,7 @@ crates/syl-core/src/
 │   ├── sse.rs             # StreamHandler (SSE event → TurnResult)
 │   ├── compaction.rs      # context compaction via Haiku summarisation
 │   ├── cache.rs           # cache_control breakpoint injection
-│   ├── rate_limit.rs      # sliding-window TPM tracking
+│   ├── rate_limit.rs      # the API's rate-limit headers, retry-after, optional own cap
 │   └── types.rs           # ContentBlock, Message, TurnResult, Usage
 └── tools/
     ├── mod.rs             # ToolContext, execute, is_read_only

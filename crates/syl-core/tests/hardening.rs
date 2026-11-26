@@ -273,6 +273,107 @@ async fn overloaded_error_mid_stream_is_retried_not_returned_as_partial_turn() {
 }
 
 #[tokio::test]
+async fn a_reply_cut_off_mid_stream_is_marked_as_restarted() {
+    use syl_core::api::client::{call_with_retry_shared, BlockDeltaEvent, SystemBlock};
+    let server = mock_server_with(vec![OVERLOADED_MID_STREAM, OK_STREAM]).await;
+    let state = syl_core::shared::SharedState::new();
+    let deltas = std::sync::Mutex::new(Vec::new());
+    let notices = std::sync::Mutex::new(Vec::new());
+    call_with_retry_shared(
+        &reqwest::Client::new(),
+        &mock_config(&server),
+        &state,
+        &[Message::user_text("hi")],
+        &[SystemBlock::text("sys")],
+        tokio_util::sync::CancellationToken::new(),
+        |n| notices.lock().unwrap().push(n.to_string()),
+        |d| deltas.lock().unwrap().push(match d {
+            BlockDeltaEvent::TextDelta { text } => text,
+            BlockDeltaEvent::Restart => "<restart>".to_string(),
+            _ => String::new(),
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(deltas.into_inner().unwrap(), ["partial", "<restart>", "complete"]);
+    let notices = notices.into_inner().unwrap();
+    // Said even though the backoff is short.
+    assert!(notices.iter().any(|n| n.contains("partway through the reply; it is discarded")), "{notices:?}");
+}
+
+#[tokio::test]
+async fn a_retry_before_anything_was_shown_is_not_a_restart() {
+    use syl_core::api::client::{call_with_retry_shared, BlockDeltaEvent, SystemBlock};
+    use wiremock::matchers::method;
+    use wiremock::{Mock, ResponseTemplate};
+    let server = wiremock::MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(529).set_body_string("{}"))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(OK_STREAM, "text/event-stream"))
+        .mount(&server)
+        .await;
+    let state = syl_core::shared::SharedState::new();
+    let restarts = std::sync::atomic::AtomicUsize::new(0);
+    call_with_retry_shared(
+        &reqwest::Client::new(),
+        &mock_config(&server),
+        &state,
+        &[Message::user_text("hi")],
+        &[SystemBlock::text("sys")],
+        tokio_util::sync::CancellationToken::new(),
+        |_| {},
+        |d| {
+            if matches!(d, BlockDeltaEvent::Restart) {
+                restarts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(restarts.into_inner(), 0);
+}
+
+#[tokio::test]
+async fn cancel_while_an_error_body_stalls_returns_promptly() {
+    use syl_core::api::client::{stream_turn, CancelledError, SystemBlock};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // A 429 whose headers arrive but whose body never does.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = sock.read(&mut buf).await;
+        let _ = sock
+            .write_all(b"HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\ncontent-length: 100\r\n\r\n{")
+            .await;
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        drop(sock);
+    });
+    let config = syl_core::config::AppConfig {
+        api_url: format!("http://{addr}/v1/messages"),
+        api_key: "test-key".into(),
+        ..Default::default()
+    };
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let stop = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        stop.cancel();
+    });
+    let started = std::time::Instant::now();
+    let err = stream_turn(&reqwest::Client::new(), &config, &[Message::user_text("hi")], &[SystemBlock::text("sys")], cancel, &|_| {})
+        .await
+        .unwrap_err();
+    assert!(err.downcast_ref::<CancelledError>().is_some(), "{err}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(3), "{:?}", started.elapsed());
+}
+
+#[tokio::test]
 async fn other_error_mid_stream_is_surfaced() {
     use syl_core::api::client::{stream_turn, SystemBlock};
     const API_ERROR: &str = concat!(
@@ -323,7 +424,7 @@ async fn cancel_during_retry_backoff_returns_promptly() {
     .await
     .unwrap_err();
     assert!(err.to_string().contains("cancelled"), "{err}");
-    // Full backoff would be 0.5 + 1 + 2 + 4 s.
+    // Full backoff would be 1 + 2 + 4 + 8 + 16 + 30 s.
     assert!(started.elapsed().as_secs() < 2, "took {:?}", started.elapsed());
 }
 

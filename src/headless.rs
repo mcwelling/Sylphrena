@@ -159,6 +159,14 @@ pub async fn run_print(cli: &CliArgs) -> anyhow::Result<i32> {
                 ended_with_text = true;
                 wrote_text = false;
             }
+            // stdout can't be taken back: set the new start apart, and
+            // say so on stderr. (JSON readers get the event itself.)
+            AgentEvent::ReplyRestarted if !json && wrote_text => {
+                write("\n\n");
+                ended_with_text = true;
+                wrote_text = false;
+                eprintln!("[syl] the reply above was cut off by an API error; it starts again below");
+            }
             AgentEvent::TextDelta { text } if !json => {
                 write(text);
                 ended_with_text = text.ends_with('\n');
