@@ -7,4 +7,5 @@ pub mod picker;
 pub mod spinner;
 pub mod state;
 pub mod steer;
+pub mod stream;
 pub mod terminal;
