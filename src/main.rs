@@ -952,6 +952,7 @@ impl Repl<'_> {
         resize_rx: &mut tokio::sync::watch::Receiver<(u16, u16)>,
     ) -> bool {
         let mut streaming = false;
+        let mut tidy = syl_rs::tui::stream::StreamTidy::default();
         let mut inputs: HashMap<String, serde_json::Value> = HashMap::new();
         // Tool calls running now, in the order they started, for the ticker.
         let mut active: Vec<(String, String, serde_json::Value)> = Vec::new();
@@ -1003,6 +1004,7 @@ impl Repl<'_> {
                     match steer.handle_event(key) {
                         SteerKey::Edited => steer.draw(&self.tui.stdout, self.rows, self.cols),
                         SteerKey::Send(text) => {
+                            tidy.reset();
                             if streaming {
                                 let _ = terminal::end_streaming(&self.tui.stdout, self.rows);
                                 streaming = false;
@@ -1055,9 +1057,12 @@ impl Repl<'_> {
             };
 
             let is_delta = matches!(event, AgentEvent::TextDelta { .. } | AgentEvent::ThinkingDelta { .. });
-            if streaming && !is_delta {
-                let _ = terminal::end_streaming(&self.tui.stdout, self.rows);
-                streaming = false;
+            if !is_delta {
+                tidy.reset();
+                if streaming {
+                    let _ = terminal::end_streaming(&self.tui.stdout, self.rows);
+                    streaming = false;
+                }
             }
 
             match event {
@@ -1073,6 +1078,8 @@ impl Repl<'_> {
                     }
                 }
                 AgentEvent::TextDelta { text } | AgentEvent::ThinkingDelta { text } => {
+                    // Blank lines alone (common before a tool call) show nothing.
+                    let Some(text) = tidy.feed(&text) else { continue };
                     if !streaming {
                         streaming = true;
                         self.tui.stop_anim();

@@ -99,6 +99,8 @@ SseParser (byte-chunk line buffer)
    └──────────────────────→ TurnResult
 ```
 
+In the TUI, streamed text goes through `tui::stream::StreamTidy` before it reaches the scrollback. A new output line opens only once something visible arrives. Leading blank lines are dropped, and trailing ones are written only if more text follows. A request that leads into a tool call often streams nothing but blank lines, and without this each one left empty lines between the prompt and the answer.
+
 Text deltas are printed immediately via `terminal::write_streaming`. Tool-use JSON accumulates in `StreamHandler` and is parsed at block completion. Thinking deltas are printed in dim text.
 
 ---
