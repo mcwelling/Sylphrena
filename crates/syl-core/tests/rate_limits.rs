@@ -279,8 +279,9 @@ async fn a_wait_set_by_the_own_cap_says_so() {
 }
 
 mod estimate {
-    use syl_core::api::client::{input_need, SystemBlock};
+    use syl_core::api::client::{input_need, prefix_fingerprint, SystemBlock};
     use syl_core::api::types::Message;
+    use syl_core::config::AppConfig;
     use syl_core::shared::ModelLimits;
 
     fn convo(n: usize, chars: usize) -> Vec<Message> {
@@ -289,35 +290,86 @@ mod estimate {
 
     const NOW: u64 = 10_000_000;
 
+    /// What the last request left: `sent` sent `ago` ms ago, 200k in all.
+    fn after(config: &AppConfig, system: &[SystemBlock], sent: &[Message], ago: u64) -> ModelLimits {
+        ModelLimits {
+            api: None,
+            last_total: 200_000,
+            last_ms: NOW - ago,
+            last_count: sent.len(),
+            last_prefix: prefix_fingerprint(config, system, sent),
+        }
+    }
+
+    /// `input_need` as `client::api_wait` calls it.
+    fn need(config: &AppConfig, l: &ModelLimits, m: &[Message], system: &[SystemBlock]) -> u64 {
+        let prefix = m.get(..l.last_count).map(|sent| prefix_fingerprint(config, system, sent));
+        input_need(l, m, system, NOW, prefix)
+    }
+
+    /// Ten messages sent, then a reply and a tool result (~4k) added.
+    fn grown(sent: &[Message]) -> Vec<Message> {
+        let mut m = sent.to_vec();
+        m.extend(convo(2, 6_000));
+        m
+    }
+
     #[test]
     fn a_warm_cache_charges_only_the_new_messages() {
-        // Last request: 10 messages, 200k tokens in all, 1 minute ago.
-        let l = ModelLimits { api: None, last_total: 200_000, last_ms: NOW - 60_000, last_count: 10 };
-        let mut m = convo(10, 30_000);
-        m.extend(convo(2, 6_000)); // the reply and a tool result: ~4k
-        let need = input_need(&l, &m, &[], NOW);
-        assert!((3_500..5_000).contains(&need), "{need}");
+        let c = AppConfig::default();
+        let sent = convo(10, 30_000);
+        let n = need(&c, &after(&c, &[], &sent, 60_000), &grown(&sent), &[]);
+        assert!((3_500..5_000).contains(&n), "{n}");
     }
 
     #[test]
     fn an_expired_cache_charges_everything_again() {
-        let l = ModelLimits { api: None, last_total: 200_000, last_ms: NOW - 6 * 60_000, last_count: 10 };
-        let mut m = convo(10, 30_000);
-        m.extend(convo(2, 6_000));
-        let need = input_need(&l, &m, &[], NOW);
-        assert!((203_500..205_000).contains(&need), "{need}");
+        let c = AppConfig::default();
+        let sent = convo(10, 30_000);
+        let n = need(&c, &after(&c, &[], &sent, 6 * 60_000), &grown(&sent), &[]);
+        assert!((203_500..205_000).contains(&n), "{n}");
     }
 
     #[test]
     fn a_first_or_shortened_conversation_is_estimated_whole() {
+        let c = AppConfig::default();
         let sys = [SystemBlock::text("s".repeat(3_000))];
         let m = convo(3, 3_000);
-        let first = input_need(&ModelLimits::default(), &m, &sys, NOW);
+        let first = need(&c, &ModelLimits::default(), &m, &sys);
         assert!((3_900..4_200).contains(&first), "{first}");
         // After compaction the conversation is shorter than last time.
-        let l = ModelLimits { api: None, last_total: 200_000, last_ms: NOW - 1_000, last_count: 40 };
-        assert_eq!(input_need(&l, &m, &sys, NOW), first);
+        let l = ModelLimits { last_count: 40, ..after(&c, &sys, &convo(40, 10), 1_000) };
+        assert_eq!(need(&c, &l, &m, &sys), first);
         // Never under 1,000.
-        assert_eq!(input_need(&ModelLimits::default(), &convo(1, 10), &[], NOW), 1_000);
+        assert_eq!(need(&c, &ModelLimits::default(), &convo(1, 10), &[]), 1_000);
+    }
+
+    #[test]
+    fn a_message_rewritten_in_place_is_estimated_whole() {
+        // Same number of messages, but an old one changed (images dropped,
+        // thinking stripped): the cache from there on is gone.
+        let c = AppConfig::default();
+        let sent = convo(10, 30_000);
+        let l = after(&c, &[], &sent, 60_000);
+        let mut now = grown(&sent);
+        now[3] = Message::user_text("y".repeat(30_000));
+        let n = need(&c, &l, &now, &[]);
+        assert!(n > 100_000, "{n}");
+    }
+
+    #[test]
+    fn a_new_system_prompt_or_tool_list_is_estimated_whole() {
+        let c = AppConfig::default();
+        let sys = [SystemBlock::text("plan mode")];
+        let sent = convo(10, 30_000);
+        let l = after(&c, &sys, &sent, 60_000);
+        let n = need(&c, &l, &grown(&sent), &[SystemBlock::text("build mode")]);
+        assert!(n > 100_000, "{n}");
+        let tools = AppConfig { extra_tools: std::sync::Arc::new(vec![serde_json::json!({"name": "mcp__x"})]), ..AppConfig::default() };
+        let n = need(&tools, &l, &grown(&sent), &sys);
+        assert!(n > 100_000, "{n}");
+        // Unchanged, it is warm.
+        let n = need(&c, &l, &grown(&sent), &sys);
+        assert!(n < 5_000, "{n}");
     }
 }

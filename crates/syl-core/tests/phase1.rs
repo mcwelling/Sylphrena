@@ -4,7 +4,7 @@
 /// workflow CRUD, system prompt, stream handler, cache
 /// breakpoints, fmt_num, workspace context. CLI/config, slash commands, rate
 /// limiting have their own test files.
-use syl_core::api::cache::attach_cache_breakpoints;
+use syl_core::api::cache::messages_with_cache_points;
 use syl_core::api::compaction::build_compacted_messages;
 use syl_core::api::sse::StreamHandler;
 use syl_core::api::types::{ContentBlock, Message, MessageContent, StopReason};
@@ -358,117 +358,94 @@ fn stream_handler_records_error_event() {
 // 9. Cache Breakpoints
 // ============================================================
 
-#[test]
-fn test_attach_cache_breakpoints_no_eligible() {
-    let messages = vec![
-        user_text("hello"),
-        Message {
-            role: "assistant".to_string(),
-            content: MessageContent::Text("world".to_string()),
-        },
-    ];
-    let result = attach_cache_breakpoints(messages.clone());
-    assert_eq!(result, messages);
-}
-
-#[test]
-fn test_attach_cache_breakpoints_one_turn() {
-    let messages = vec![user_text("hi"), asst_text("hello")];
-    let result = attach_cache_breakpoints(messages);
-    if let MessageContent::Blocks(ref blocks) = result[1].content {
-        if let ContentBlock::Text { cache_control, .. } = &blocks[0] {
-            assert_eq!(cache_control.as_ref().unwrap().kind, "ephemeral");
-        } else {
-            panic!("expected Text block");
-        }
-    } else {
-        panic!("expected Blocks");
-    }
-}
-
-#[test]
-fn test_attach_cache_breakpoints_two_turns() {
-    let messages = vec![
-        user_text("first"),
-        asst_text("reply 1"),
-        user_text("second"),
-        asst_text("reply 2"),
-    ];
-    let result = attach_cache_breakpoints(messages);
-    for idx in [1usize, 3] {
-        if let MessageContent::Blocks(ref blocks) = result[idx].content {
-            if let ContentBlock::Text { cache_control, .. } = &blocks[0] {
-                assert_eq!(cache_control.as_ref().unwrap().kind, "ephemeral");
-            } else {
-                panic!("expected Text block at idx {}", idx);
-            }
-        } else {
-            panic!("expected Blocks at idx {}", idx);
-        }
-    }
-}
-
-#[test]
-fn test_attach_cache_breakpoints_only_last_two() {
-    let messages = vec![
-        user_text("a"),
-        asst_text("1"),
-        user_text("b"),
-        asst_text("2"),
-        user_text("c"),
-        asst_text("3"),
-    ];
-    let result = attach_cache_breakpoints(messages);
-    // First assistant turn (idx 1) should NOT have cache_control
-    if let MessageContent::Blocks(ref blocks) = result[1].content {
-        if let ContentBlock::Text { cache_control, .. } = &blocks[0] {
-            assert!(
-                cache_control.is_none(),
-                "idx 1 should not have cache_control"
-            );
-        }
-    }
-    // Last two (idx 3 and 5) should have it
-    for idx in [3usize, 5] {
-        if let MessageContent::Blocks(ref blocks) = result[idx].content {
-            if let ContentBlock::Text { cache_control, .. } = &blocks[0] {
-                assert_eq!(
-                    cache_control.as_ref().unwrap().kind,
-                    "ephemeral",
-                    "idx {} missing cache_control",
-                    idx
-                );
+/// The indexes of `(message, block)` that carry a breakpoint.
+fn tagged(messages: &[Message]) -> Vec<(usize, usize)> {
+    let v = messages_with_cache_points(messages);
+    let mut out = Vec::new();
+    for (i, m) in v.as_array().unwrap().iter().enumerate() {
+        for (j, b) in m["content"].as_array().unwrap().iter().enumerate() {
+            if b.get("cache_control").is_some() {
+                assert_eq!(b["cache_control"]["type"], "ephemeral");
+                out.push((i, j));
             }
         }
     }
+    out
+}
+
+fn tool_result(id: &str, content: &str) -> ContentBlock {
+    ContentBlock::ToolResult { tool_use_id: id.to_string(), content: content.to_string(), is_error: None }
+}
+
+fn user_blocks(blocks: Vec<ContentBlock>) -> Message {
+    Message { role: "user".to_string(), content: MessageContent::Blocks(blocks) }
+}
+
+fn tool_use(id: &str) -> ContentBlock {
+    ContentBlock::ToolUse { id: id.to_string(), name: "run_bash".to_string(), input: serde_json::json!({}) }
 }
 
 #[test]
-fn test_attach_cache_breakpoints_one_per_turn_on_last_text() {
-    // text, tool_use, text: only the final text block is tagged, so a turn
-    // never spends more than one of the API's four breakpoints.
-    let text = |t: &str| ContentBlock::Text { text: t.to_string(), cache_control: None };
+fn cache_points_go_on_the_last_two_user_messages() {
+    let messages = vec![user_text("a"), asst_text("1"), user_text("b"), asst_text("2"), user_text("c")];
+    assert_eq!(tagged(&messages), [(2, 0), (4, 0)]);
+}
+
+#[test]
+fn the_final_tool_results_are_cached() {
+    // A run of tool calls with no text between them: each request still
+    // caches up to its last tool result.
     let messages = vec![
-        user_text("run it"),
-        Message::assistant_blocks(vec![
-            text("checking"),
-            ContentBlock::ToolUse {
-                id: "x".to_string(),
-                name: "run_bash".to_string(),
-                input: serde_json::json!({}),
-            },
-            text("done"),
+        user_text("fix it"),
+        Message::assistant_blocks(vec![tool_use("a"), tool_use("b")]),
+        user_blocks(vec![tool_result("a", "out a"), tool_result("b", "out b")]),
+        Message::assistant_blocks(vec![tool_use("c")]),
+        user_blocks(vec![tool_result("c", "out c")]),
+    ];
+    assert_eq!(tagged(&messages), [(2, 1), (4, 0)]);
+}
+
+#[test]
+fn thinking_and_empty_text_are_skipped() {
+    let messages = vec![
+        user_blocks(vec![
+            tool_result("a", "out"),
+            ContentBlock::Text { text: String::new(), cache_control: None },
         ]),
+        Message::assistant_blocks(vec![ContentBlock::Thinking { thinking: "hm".into(), signature: None }, tool_use("b")]),
     ];
-    let result = attach_cache_breakpoints(messages);
-    let MessageContent::Blocks(ref blocks) = result[1].content else { panic!("expected Blocks") };
-    let tagged: Vec<usize> = blocks
-        .iter()
-        .enumerate()
-        .filter(|(_, b)| matches!(b, ContentBlock::Text { cache_control: Some(_), .. }))
-        .map(|(i, _)| i)
-        .collect();
-    assert_eq!(tagged, vec![2]);
+    // The only user message: its tool result, not the empty text after it;
+    // the assistant's thinking never.
+    assert_eq!(tagged(&messages), [(0, 0)]);
+}
+
+#[test]
+fn plain_string_content_is_always_sent_as_a_text_block() {
+    let messages = vec![user_text("a"), asst_text("1"), user_text("b"), asst_text("2"), user_text("c")];
+    let v = messages_with_cache_points(&messages);
+    // Tagged or not, the same shape: the prefix is byte-identical next time.
+    assert_eq!(v[0]["content"], serde_json::json!([{ "type": "text", "text": "a" }]));
+    assert_eq!(v[2]["content"][0]["text"], "b");
+    // At most three breakpoints with the system prompt's.
+    assert!(tagged(&messages).len() <= 2);
+}
+
+#[test]
+fn an_earlier_request_is_a_prefix_of_the_next_once_markers_are_removed() {
+    let mut messages = vec![user_text("a"), asst_text("1"), user_text("b")];
+    let strip = |mut v: serde_json::Value| {
+        for m in v.as_array_mut().unwrap() {
+            for b in m["content"].as_array_mut().unwrap() {
+                b.as_object_mut().unwrap().remove("cache_control");
+            }
+        }
+        v
+    };
+    let first = strip(messages_with_cache_points(&messages));
+    messages.push(asst_text("2"));
+    messages.push(user_text("c"));
+    let second = strip(messages_with_cache_points(&messages));
+    assert_eq!(first.as_array().unwrap()[..], second.as_array().unwrap()[..3]);
 }
 
 // ============================================================

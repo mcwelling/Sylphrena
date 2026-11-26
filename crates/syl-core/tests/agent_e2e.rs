@@ -172,7 +172,8 @@ async fn until_turn_ended(h: &mut Harness) -> Vec<AgentEvent> {
     }
 }
 
-async fn request_bodies(server: &MockServer) -> Vec<Value> {
+/// The requests as sent, cache breakpoints included.
+async fn raw_request_bodies(server: &MockServer) -> Vec<Value> {
     server
         .received_requests()
         .await
@@ -180,6 +181,28 @@ async fn request_bodies(server: &MockServer) -> Vec<Value> {
         .iter()
         .map(|r| serde_json::from_slice(&r.body).unwrap())
         .collect()
+}
+
+/// The requests with their messages as the session holds them: no
+/// `cache_control`, and a user message of one text block (how a plain
+/// string is sent) back to the string.
+async fn request_bodies(server: &MockServer) -> Vec<Value> {
+    let mut bodies = raw_request_bodies(server).await;
+    for body in &mut bodies {
+        for m in body["messages"].as_array_mut().into_iter().flatten() {
+            for b in m["content"].as_array_mut().into_iter().flatten() {
+                if let Some(o) = b.as_object_mut() {
+                    o.remove("cache_control");
+                }
+            }
+            let one_text = m["role"] == "user"
+                && m["content"].as_array().is_some_and(|c| c.len() == 1 && c[0]["type"] == "text");
+            if one_text {
+                m["content"] = m["content"][0]["text"].clone();
+            }
+        }
+    }
+    bodies
 }
 
 #[tokio::test]
@@ -254,6 +277,13 @@ async fn full_tool_using_turn_runs_headless() {
     );
     // The last request was exactly what the log says the model saw.
     assert_eq!(serde_json::to_value(&messages[..3]).unwrap(), bodies[1]["messages"]);
+    // As sent, it caches up to its last block, the tool result, and keeps
+    // the previous request's read point on the prompt.
+    let raw = raw_request_bodies(&server).await;
+    let sent = raw[1]["messages"].as_array().unwrap();
+    assert_eq!(sent[0]["content"][0]["cache_control"]["type"], "ephemeral");
+    assert_eq!(sent[2]["content"][0]["type"], "tool_result");
+    assert_eq!(sent[2]["content"][0]["cache_control"]["type"], "ephemeral");
 }
 
 fn kind_name(e: &Entry) -> &'static str {
