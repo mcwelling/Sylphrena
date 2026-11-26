@@ -25,7 +25,7 @@ Syl is a lightweight AI agent written in Rust. She spins up a sandboxed Ubuntu c
 | | macOS | Linux |
 |---|---|---|
 | **Rust + Cargo** | [rustup.rs](https://rustup.rs) | [rustup.rs](https://rustup.rs) |
-| **Podman** | `brew install podman && podman machine init && podman machine start` | `sudo apt install podman` |
+| **Podman** | `brew install podman && podman machine init --memory 8192 --cpus 8 && podman machine start` | `sudo apt install podman` |
 | **Git** | pre-installed | pre-installed |
 
 Set `ANTHROPIC_API_KEY`.
@@ -78,7 +78,8 @@ action = "ask"          # allow | ask | deny
 [reviewer]
 model = "claude-haiku-4-5"
 
-# Container limits (optional)
+# Container limits (optional). The default memory, "auto", is three quarters
+# of podman's (its VM's, on macOS); builds get as many parallel jobs as fit
 [container]
 memory = "4g"
 cpus = "2"

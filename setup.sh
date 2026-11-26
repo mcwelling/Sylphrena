@@ -55,9 +55,15 @@ if command -v podman &>/dev/null; then
         info "Start with: podman machine start"
         errors=$((errors + 1))
       fi
+      # Every container runs inside this VM; Syl's gets three quarters of it.
+      machine_mem=$(podman machine inspect --format '{{.Resources.Memory}}' 2>/dev/null || echo "")
+      if [ -n "$machine_mem" ] && [ "$machine_mem" -lt 6144 ] 2>/dev/null; then
+        warn "Podman machine has ${machine_mem} MiB of memory; builds and tests may run out"
+        info "Resize with: podman machine stop && podman machine set --memory 8192 --cpus 8 && podman machine start"
+      fi
     else
       fail "No Podman machine found (required on macOS)"
-      info "Initialize with: podman machine init && podman machine start"
+      info "Initialize with: podman machine init --memory 8192 --cpus 8 && podman machine start"
       errors=$((errors + 1))
     fi
   fi
@@ -65,7 +71,7 @@ else
   fail "Podman not found"
   if [ "$OS" = "macos" ]; then
     info "Install with: brew install podman"
-    info "Then run: podman machine init && podman machine start"
+    info "Then run: podman machine init --memory 8192 --cpus 8 && podman machine start"
   else
     info "Install with: sudo apt-get install -y podman"
   fi
