@@ -233,9 +233,18 @@ impl Resources {
         ]
     }
 
-    /// `2.8 GB`.
+    /// `2.8 GB`, or `512 MB` under a GB.
     pub fn memory_text(&self) -> String {
-        format!("{:.1} GB", self.memory_mb as f64 / 1024.0)
+        if self.memory_mb < 1024 {
+            format!("{} MB", self.memory_mb)
+        } else {
+            format!("{:.1} GB", self.memory_mb as f64 / 1024.0)
+        }
+    }
+
+    /// `1 build job`, `3 build jobs`.
+    pub fn jobs_text(&self) -> String {
+        if self.jobs == 1 { "1 build job".into() } else { format!("{} build jobs", self.jobs) }
     }
 }
 
@@ -1032,6 +1041,9 @@ mod tests {
         let r = Resources { memory_mb: 3072, cpus: 5, jobs: 3 };
         assert_eq!(r.job_env(), ["CARGO_BUILD_JOBS=3", "MAKEFLAGS=-j3", "CMAKE_BUILD_PARALLEL_LEVEL=3"]);
         assert_eq!(r.memory_text(), "3.0 GB");
+        assert_eq!(r.jobs_text(), "3 build jobs");
+        let small = Resources { memory_mb: 256, cpus: 1, jobs: 1 };
+        assert_eq!((small.memory_text().as_str(), small.jobs_text().as_str()), ("256 MB", "1 build job"));
     }
 
     #[test]

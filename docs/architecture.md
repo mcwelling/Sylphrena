@@ -294,6 +294,7 @@ Nothing prompts by default: the container limits the damage, and checkpoints and
 - **Build jobs** (`Resources` in `syl-container`). Build tools start one job per CPU they see, whatever the memory limit, and linking many binaries at once is what runs a container out of memory. So every command gets `CARGO_BUILD_JOBS`, `MAKEFLAGS=-jN` and `CMAKE_BUILD_PARALLEL_LEVEL` set to N: one job per CPU, but no more than one per GB of the limit, and at least one. The system prompt states the memory, the CPUs and N.
 - **Out-of-memory kills.** When a `run_bash` command fails, Syl reads `oom_kill` from the container's cgroup (`memory.events`, or `memory.oom_control` on cgroup v1). If it went up since the last read (or since the container started), the result says how many processes the limit killed and suggests fewer jobs. Otherwise the failure looks like any other: cargo reports `signal: 9, SIGKILL`.
 - The worked-out memory, the `cpus` setting and the network are recorded as a label on the container. A container started with other values is recreated, so resizing podman's VM resizes an `auto` container at the next start.
+- `tests/real_podman.rs` in `syl-core` checks all of this against real podman, in throwaway containers it removes: `SYL_REAL_PODMAN=1 cargo test -p syl-core --test real_podman -- --ignored --test-threads=1`.
 - The VM caps everything. On a Mac, `podman machine stop`, `podman machine set --memory 8192 --cpus 8` and `podman machine start` give it 8 GB and 8 CPUs.
 
 ---

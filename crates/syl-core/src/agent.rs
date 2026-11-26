@@ -530,10 +530,10 @@ fn system_prompt(
     let res = agent.container.resources();
     workspace.push_str(&format!(
         "Container: {} memory, {} CPUs. CARGO_BUILD_JOBS, MAKEFLAGS and CMAKE_BUILD_PARALLEL_LEVEL \
-         are set to {} jobs, which fit the memory; going above that can get processes killed.\n",
+         are set to {}, which fit the memory; going above that can get processes killed.\n",
         res.memory_text(),
         res.cpus,
-        res.jobs
+        res.jobs_text()
     ));
     workspace.push_str(&crate::commands::skills_prompt(&skills).unwrap_or_default());
     workspace.push_str(&crate::mcp::instructions_prompt(mcp).unwrap_or_default());

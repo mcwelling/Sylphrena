@@ -54,9 +54,9 @@ pub fn oom_note(killed: u64, res: &syl_container::Resources) -> String {
     let what = if killed == 1 { "1 process was".to_string() } else { format!("{killed} processes were") };
     format!(
         "\n[Syl: the container ran out of memory during this command and {what} killed \
-         (limit {}, {} build jobs at once by default). Run fewer at once, e.g. `cargo build -j1`, \
+         (limit {}, {} at once by default). Run fewer at once, e.g. `cargo build -j1`, \
          `cargo test -j1 -- --test-threads=2` or `make -j1`, or the user can raise [container] memory.]",
         res.memory_text(),
-        res.jobs
+        res.jobs_text()
     )
 }
