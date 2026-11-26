@@ -185,7 +185,7 @@ syl starts
 
 Before every batch of tool calls `Container::ensure` runs `podman inspect`. If the container has died (OOM, sleep/wake, manual removal), it is automatically resummons before the tool runs.
 
-**Container constraints:** `--memory=2g`, `/workspace` bind-mounted read-write, `/workspace/.syl` re-mounted **read-only** (so code in the container can't rewrite Syl's memory, workflows, session or log), `~/.ssh` bind-mounted read-only. Host paths are shell-quoted, so project paths with spaces work.
+**Container constraints:** a memory limit (three quarters of podman's memory by default; see Container limits), `/workspace` bind-mounted read-write, `/workspace/.syl` re-mounted **read-only** (so code in the container can't rewrite Syl's memory, workflows, session or log), `~/.ssh` bind-mounted read-only. Host paths are shell-quoted, so project paths with spaces work.
 
 **Host-side tools:** `memory_*` and `workflow_*` run on the host, not in the container. Their keys are validated (`[A-Za-z0-9._-]`, no `..`, no leading `.`, ≤128 chars) so a key can never resolve outside `.syl/memory/` or `.syl/workflows/`.
 
@@ -260,7 +260,7 @@ Run with `/workflow <name>`. List all with `/workflow`. Claude can create and de
 
 - `edit_file` reads the file, requires `old_string` to occur exactly once (or `replace_all`), writes the result, and returns a unified diff (`similar`, computed off the async runtime with a deadline). On a CRLF file, `\n` line breaks in `old_string` match `\r\n`. `write_file` creates parent directories and returns a diff against the old contents. In the TUI the ticker shows each edit's size, and `/tools` shows the diffs in colour, with control characters made visible.
 - Writes go to a temp file beside the target, are checked for length, take the old file's mode, and are renamed over it, so a cancel, timeout or full disk leaves the old file whole. A symlink is written through to its target.
-- Every command in the container runs under `timeout -s KILL`, because killing the host-side `podman exec` doesn't stop the process inside.
+- Killing the host-side `podman exec` doesn't stop the process inside, so each command carries `SYL_EXEC=<tag>` in its environment. On a timeout or cancel, Syl kills every process in the container whose `/proc/<pid>/environ` has that tag. That includes ones that left the command's process group or session (`setsid`, a test harness, a backgrounded server), which a group kill misses. A command that finishes is left alone, so a server it started on purpose keeps running. Each command also runs under `timeout -s KILL`, a little past the host's limit, in case the kill fails.
 - `grep` uses ripgrep (installed in new images) and falls back to `grep -rnE` in older ones, which skips `.git`, `.syl`, `target`, `node_modules` and similar by name and matches `glob` against base names. `glob` uses bash `globstar`, expands `{a,b}` itself, and lists only paths that exist. Paths in results are relative to `/workspace`.
 - `tools::is_read_only` names the tools with no side effects. The agent loop runs a consecutive run of them with `join_all` and everything else one at a time, in the order the model asked; results always go back in call order, in one user message.
 
@@ -288,7 +288,13 @@ Nothing prompts by default: the container limits the damage, and checkpoints and
 
 **Modes.** `AgentCommand::SetMode(Plan | Build)` applies from the next turn and is told to the model as a `note`. Plan mode adds rules that deny `edit_file`, `write_file`, `workflow_write`, `workflow_delete`, and the git commands that change the user's repository: commit, push, pull, fetch, reset, checkout, switch, restore, stash, rebase, merge, clean, config, tag and branch deletion, among others. Snapshots don't cover `.git`. Each `run_bash` call then runs between two snapshots. Anything it changed in the workspace is put back and reported to the model as an error, and the state before the put-back is kept as a checkpoint. Ignored paths it removed can't be put back, so they are reported. If no snapshot can be taken (no git on the host, or checkpoints off), `run_bash` is refused in plan mode. Plan-mode turns don't take a turn checkpoint, so `/undo` finds the last build turn. What plan mode can't stop: a background process that outlives the command, and changes outside the workspace. The TUI shows the mode in the bar; Shift+Tab toggles it, as do `/plan` and `/build`.
 
-**Container limits.** `[container]` in config.toml sets `memory` (default `2g`), `cpus` and `network` (`"none"` for no network; `dispatch_agent`, package installs and git over the network then fail). The options are recorded as a label on the container, and a container started with other options is recreated.
+**Container limits.** `[container]` in config.toml sets `memory`, `cpus` and `network` (`"none"` for no network; `dispatch_agent`, package installs and git over the network then fail).
+
+- `memory = "auto"`, the default, is three quarters of what `podman info` reports: the VM's memory on macOS and Windows, the host's on Linux. It falls back to 2 GB if podman can't say. An explicit size (`"4g"`) wins. With no `cpus`, the container can use all of podman's CPUs.
+- **Build jobs** (`Resources` in `syl-container`). Build tools start one job per CPU they see, whatever the memory limit, and linking many binaries at once is what runs a container out of memory. So every command gets `CARGO_BUILD_JOBS`, `MAKEFLAGS=-jN` and `CMAKE_BUILD_PARALLEL_LEVEL` set to N: one job per CPU, but no more than one per GB of the limit, and at least one. The system prompt states the memory, the CPUs and N.
+- **Out-of-memory kills.** When a `run_bash` command fails, Syl reads `oom_kill` from the container's cgroup (`memory.events`, or `memory.oom_control` on cgroup v1). If it went up since the last read (or since the container started), the result says how many processes the limit killed and suggests fewer jobs. Otherwise the failure looks like any other: cargo reports `signal: 9, SIGKILL`.
+- The worked-out memory, the `cpus` setting and the network are recorded as a label on the container. A container started with other values is recreated, so resizing podman's VM resizes an `auto` container at the next start.
+- The VM caps everything. On a Mac, `podman machine stop`, `podman machine set --memory 8192 --cpus 8` and `podman machine start` give it 8 GB and 8 CPUs.
 
 ---
 

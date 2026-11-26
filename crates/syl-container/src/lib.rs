@@ -116,6 +116,48 @@ pub struct Container {
     /// Held while starting or recovering the container, so two sessions
     /// sharing it don't both recreate it (one `rm -f`-ing the other's).
     lifecycle: std::sync::Arc<std::sync::Mutex<()>>,
+    /// Worked out from `options` and podman on first use.
+    resources: std::sync::Arc<std::sync::OnceLock<Resources>>,
+    /// Out-of-memory kills counted so far (`u64::MAX` before the first
+    /// count), to tell when a command lost processes to the memory limit.
+    oom_seen: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// Counter in each exec's environment, so the processes a command started
+/// can be found and stopped.
+static EXEC_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The variable that marks an exec's processes.
+const EXEC_TAG: &str = "SYL_EXEC";
+
+fn new_exec_tag() -> String {
+    let n = EXEC_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    format!("{}-{n}-{nanos}", std::process::id())
+}
+
+/// Kills every process whose environment has `SYL_EXEC=<tag>`: all a command
+/// started, including ones that left its process group or session (a test
+/// harness, `setsid`, a backgrounded server), which `timeout` and killing
+/// the podman client both miss.
+fn kill_tagged_script(tag: &str) -> String {
+    format!(
+        "for f in /proc/[0-9]*/environ; do \
+           if tr '\\0' '\\n' < \"$f\" 2>/dev/null | grep -qxF '{EXEC_TAG}={tag}'; then \
+             p=${{f#/proc/}}; kill -KILL \"${{p%/environ}}\" 2>/dev/null; \
+           fi; \
+         done; true"
+    )
+}
+
+/// `oom_kill N` from cgroup v2's `memory.events` (or v1's `oom_control`).
+fn parse_oom_kills(text: &str) -> Option<u64> {
+    text.lines()
+        .find_map(|l| l.strip_prefix("oom_kill "))
+        .and_then(|n| n.trim().parse().ok())
 }
 
 /// Resource limits and network for the container (`[container]` in
@@ -124,7 +166,8 @@ pub struct Container {
 pub struct ContainerOptions {
     /// `--network`: `Some("none")` for no network at all.
     pub network: Option<String>,
-    /// `--memory`.
+    /// `--memory`, as podman takes it (`"4g"`), or `"auto"`: a share of the
+    /// memory podman has (the VM's, on macOS and Windows).
     pub memory: String,
     /// `--cpus`, when limited.
     pub cpus: Option<String>,
@@ -132,17 +175,94 @@ pub struct ContainerOptions {
 
 impl Default for ContainerOptions {
     fn default() -> Self {
-        ContainerOptions { network: None, memory: "2g".to_string(), cpus: None }
+        ContainerOptions { network: None, memory: "auto".to_string(), cpus: None }
     }
+}
+
+/// Share of podman's memory an `"auto"` container gets; the rest is left to
+/// podman itself and other containers.
+const AUTO_MEMORY_SHARE: f64 = 0.75;
+/// Memory used when `"auto"` can't ask podman.
+const FALLBACK_MEMORY_MB: u64 = 2048;
+/// Memory a build job is given room for: about what compiling and linking
+/// one crate or test binary takes at its peak.
+const MB_PER_JOB: u64 = 1024;
+
+/// What the container gets, worked out from the options and podman's own
+/// memory and CPUs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Resources {
+    /// The `--memory` limit, in MB.
+    pub memory_mb: u64,
+    /// CPUs the container can use.
+    pub cpus: u32,
+    /// Parallel build jobs that fit: one per CPU, as many as the memory
+    /// allows, at least one.
+    pub jobs: u32,
+}
+
+impl Resources {
+    /// From the options and podman's `(memory in bytes, CPUs)`, when known.
+    pub fn plan(options: &ContainerOptions, podman: Option<(u64, u32)>) -> Resources {
+        let podman_mb = podman.map(|(bytes, _)| bytes / (1024 * 1024)).filter(|&mb| mb > 0);
+        let memory_mb = match parse_size_mb(&options.memory) {
+            Some(mb) => mb,
+            None => podman_mb
+                .map(|mb| ((mb as f64 * AUTO_MEMORY_SHARE) as u64).max(512))
+                .unwrap_or(FALLBACK_MEMORY_MB),
+        };
+        let podman_cpus = podman.map(|(_, c)| c).filter(|&c| c > 0).unwrap_or(2);
+        let cpus = options
+            .cpus
+            .as_deref()
+            .and_then(|c| c.trim().parse::<f64>().ok())
+            .map(|c| (c.ceil() as u32).clamp(1, podman_cpus))
+            .unwrap_or(podman_cpus);
+        let jobs = ((memory_mb / MB_PER_JOB) as u32).clamp(1, cpus);
+        Resources { memory_mb, cpus, jobs }
+    }
+
+    /// Environment variables that keep builds to `jobs` at once. Tools
+    /// otherwise start one job per CPU they see, whatever the memory limit.
+    pub fn job_env(&self) -> Vec<String> {
+        let n = self.jobs;
+        vec![
+            format!("CARGO_BUILD_JOBS={n}"),
+            format!("MAKEFLAGS=-j{n}"),
+            format!("CMAKE_BUILD_PARALLEL_LEVEL={n}"),
+        ]
+    }
+
+    /// `2.8 GB`.
+    pub fn memory_text(&self) -> String {
+        format!("{:.1} GB", self.memory_mb as f64 / 1024.0)
+    }
+}
+
+/// `"4g"`, `"512m"`, `"2048"` (bytes, as podman reads a bare number) to MB.
+/// None for `"auto"` or anything else.
+fn parse_size_mb(s: &str) -> Option<u64> {
+    let s = s.trim().to_ascii_lowercase();
+    let s = s.strip_suffix('b').filter(|r| r.ends_with(['k', 'm', 'g'])).unwrap_or(&s);
+    let (num, scale) = match s.chars().last()? {
+        'g' => (&s[..s.len() - 1], 1024.0),
+        'm' => (&s[..s.len() - 1], 1.0),
+        'k' => (&s[..s.len() - 1], 1.0 / 1024.0),
+        c if c.is_ascii_digit() => (s, 1.0 / (1024.0 * 1024.0)),
+        _ => return None,
+    };
+    let n: f64 = num.trim().parse().ok().filter(|n: &f64| *n > 0.0)?;
+    Some(((n * scale) as u64).max(1))
 }
 
 impl ContainerOptions {
     /// Recorded as a label on the container, to tell when it must be
-    /// recreated.
-    fn label(&self) -> String {
+    /// recreated. It holds the memory worked out, so resizing podman's VM
+    /// resizes an `"auto"` container too.
+    fn label(&self, res: &Resources) -> String {
         format!(
-            "memory={};cpus={};network={}",
-            self.memory,
+            "memory={}m;cpus={};network={}",
+            res.memory_mb,
             self.cpus.as_deref().unwrap_or(""),
             self.network.as_deref().unwrap_or("")
         )
@@ -182,13 +302,40 @@ impl Container {
             workdir: WORKDIR.to_string(),
             options: ContainerOptions::default(),
             lifecycle: Default::default(),
+            resources: Default::default(),
+            oom_seen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
         }
     }
 
     /// Start the container with these limits and network.
     pub fn with_options(mut self, options: ContainerOptions) -> Self {
         self.options = options;
+        self.resources = Default::default();
         self
+    }
+
+    /// The memory, CPUs and build jobs the container gets. Asks podman for
+    /// its memory and CPUs the first time.
+    pub fn resources(&self) -> Resources {
+        *self.resources.get_or_init(|| Resources::plan(&self.options, self.podman_capacity()))
+    }
+
+    /// podman's memory in bytes and CPUs: the VM's on macOS and Windows,
+    /// the host's on Linux.
+    fn podman_capacity(&self) -> Option<(u64, u32)> {
+        let out = self
+            .podman()
+            .args(["info", "--format", "{{.Host.MemTotal}} {{.Host.CPUs}}"])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut parts = text.split_whitespace();
+        let mem = parts.next()?.parse().ok()?;
+        let cpus = parts.next()?.parse().ok()?;
+        Some((mem, cpus))
     }
 
     pub fn options(&self) -> &ContainerOptions {
@@ -209,12 +356,13 @@ impl Container {
             return false;
         }
         let label = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        // One from before options were recorded had a 2g limit.
         let label = if label.is_empty() || label == "<no value>" {
-            ContainerOptions::default().label()
+            "memory=2048m;cpus=;network=".to_string()
         } else {
             label
         };
-        label != self.options.label()
+        label != self.options.label(&self.resources())
     }
 
     /// Treat `dir` as the in-container project path. Tests pair this with a
@@ -379,6 +527,8 @@ impl Container {
             self.cold_start(progress)?;
         }
 
+        // Kills from before this start aren't any command's.
+        self.oom_seen.store(self.read_oom_kills().unwrap_or(u64::MAX), std::sync::atomic::Ordering::Relaxed);
         self.write_marker()
     }
 
@@ -462,8 +612,9 @@ impl Container {
             std::env::var("TERM_PROGRAM").unwrap_or_default()
         );
 
-        let memory = format!("--memory={}", self.options.memory);
-        let label = format!("{OPTIONS_LABEL}={}", self.options.label());
+        let res = self.resources();
+        let memory = format!("--memory={}m", res.memory_mb);
+        let label = format!("{OPTIONS_LABEL}={}", self.options.label(&res));
         let cpus = self.options.cpus.as_ref().map(|c| format!("--cpus={c}"));
         let network = self.options.network.as_ref().map(|n| format!("--network={n}"));
         let mut args: Vec<&str> = vec![
@@ -535,10 +686,12 @@ impl Container {
 
     /// Run `cmd` with `/bin/bash -c` in the container, blocking.
     pub fn exec_sync(&self, cmd: &str) -> std::io::Result<ExecOutput> {
-        self.podman()
-            .args(["exec", &self.name, "/bin/bash", "-c", cmd])
-            .output()
-            .map(ExecOutput::from_output)
+        let mut c = self.podman();
+        c.arg("exec");
+        for e in self.resources().job_env() {
+            c.arg("--env").arg(e);
+        }
+        c.args([&self.name, "/bin/bash", "-c", cmd]).output().map(ExecOutput::from_output)
     }
 
     /// Like `exec_sync`, but a non-zero exit is an error carrying
@@ -573,10 +726,13 @@ impl Container {
         timeout: Duration,
         cancel: &CancellationToken,
     ) -> Result<ExecOutput, ExecError> {
-        let mut child = tokio::process::Command::new(&self.podman)
-            .args(["exec", "--workdir", &self.workdir, &self.name])
+        let tag = new_exec_tag();
+        let mut child = self
+            .tagged_exec(&tag)
+            .args(["--workdir", &self.workdir, &self.name])
             // Killing the host-side podman client doesn't stop the process
-            // in the container, so it is bounded in there too.
+            // in the container: on timeout or cancel the tagged processes
+            // are killed, and `timeout` bounds them in case that fails.
             .args(["timeout", "-s", "KILL", &in_container_limit(timeout)])
             .args(["/bin/bash", "-c", cmd])
             .stdout(Stdio::piped())
@@ -605,11 +761,13 @@ impl Container {
                 Ok((_, _, Err(e))) => Err(ExecError::Wait(e)),
                 Err(_) => {
                     let _ = child.kill().await;
+                    self.kill_tagged(&tag).await;
                     Err(ExecError::TimedOut(timeout))
                 }
             },
             _ = cancel.cancelled() => {
                 let _ = child.kill().await;
+                self.kill_tagged(&tag).await;
                 Err(ExecError::Cancelled)
             }
         }
@@ -641,8 +799,8 @@ impl Container {
         cancel: &CancellationToken,
     ) -> Result<RawOutput, ExecError> {
         use tokio::io::AsyncWriteExt;
-        let mut cmd = tokio::process::Command::new(&self.podman);
-        cmd.arg("exec");
+        let tag = new_exec_tag();
+        let mut cmd = self.tagged_exec(&tag);
         if stdin.is_some() {
             cmd.arg("-i");
         }
@@ -682,14 +840,69 @@ impl Container {
             let ((), stdout, stderr) = tokio::join!(feed, read_out, read_err);
             (stdout, stderr, child.wait().await)
         };
-        tokio::select! {
+        let result = tokio::select! {
             result = tokio::time::timeout(timeout, work) => match result {
                 Ok((stdout, stderr, Ok(status))) => Ok(RawOutput { stdout, stderr, code: status.code() }),
                 Ok((_, _, Err(e))) => Err(ExecError::Wait(e)),
                 Err(_) => Err(ExecError::TimedOut(timeout)),
             },
             _ = cancel.cancelled() => Err(ExecError::Cancelled),
+        };
+        if matches!(result, Err(ExecError::TimedOut(_) | ExecError::Cancelled)) {
+            // `work` holds the child; dropping it kills the podman client.
+            self.kill_tagged(&tag).await;
         }
+        result
+    }
+
+    /// `podman exec` with the build-job variables and `SYL_EXEC=<tag>` in
+    /// the environment.
+    fn tagged_exec(&self, tag: &str) -> tokio::process::Command {
+        let mut cmd = tokio::process::Command::new(&self.podman);
+        cmd.arg("exec");
+        for e in self.resources().job_env() {
+            cmd.arg("--env").arg(e);
+        }
+        cmd.arg("--env").arg(format!("{EXEC_TAG}={tag}"));
+        cmd
+    }
+
+    /// Kill every process an exec tagged `tag` started. Bounded, so a stuck
+    /// podman can't hold up the caller for long.
+    async fn kill_tagged(&self, tag: &str) {
+        let run = tokio::process::Command::new(&self.podman)
+            .args(["exec", &self.name, "/bin/sh", "-c", &kill_tagged_script(tag)])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .status();
+        let _ = tokio::time::timeout(Duration::from_secs(10), run).await;
+    }
+
+    /// Out-of-memory kills in the container since it started.
+    fn read_oom_kills(&self) -> Option<u64> {
+        let out = self.podman().args(["exec", &self.name, "/bin/sh", "-c", OOM_EVENTS_CMD]).output().ok()?;
+        parse_oom_kills(&String::from_utf8_lossy(&out.stdout))
+    }
+
+    /// Processes the memory limit killed since the last time this was asked
+    /// (or the container started). 0 when that can't be told.
+    pub async fn new_oom_kills(&self) -> u64 {
+        let run = tokio::process::Command::new(&self.podman)
+            .args(["exec", &self.name, "/bin/sh", "-c", OOM_EVENTS_CMD])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .output();
+        let Ok(Ok(out)) = tokio::time::timeout(Duration::from_secs(10), run).await else {
+            return 0;
+        };
+        let Some(now) = parse_oom_kills(&String::from_utf8_lossy(&out.stdout)) else {
+            return 0;
+        };
+        let before = self.oom_seen.swap(now, std::sync::atomic::Ordering::Relaxed);
+        if before == u64::MAX { 0 } else { now.saturating_sub(before) }
     }
 
     // -----------------------------------------------------------------------
@@ -737,6 +950,10 @@ fn parse_mem_str(s: &str) -> f64 {
     n.trim().parse::<f64>().unwrap_or(0.0) * scale
 }
 
+/// Prints the container's cgroup memory events (v2, else v1).
+const OOM_EVENTS_CMD: &str =
+    "cat /sys/fs/cgroup/memory.events 2>/dev/null || cat /sys/fs/cgroup/memory/memory.oom_control 2>/dev/null";
+
 const SETUP_TOOLS_CMD: &str = concat!(
     "apt-get update -qq && ",
     "apt-get install -y --no-install-recommends ",
@@ -765,6 +982,100 @@ mod tests {
         assert_eq!(parse_mem_str(" 123.5MB "), 123.5);
         assert_eq!(parse_mem_str("512kB"), 0.5);
         assert_eq!(parse_mem_str("?"), 0.0);
+    }
+
+    #[test]
+    fn parses_memory_sizes() {
+        assert_eq!(parse_size_mb("4g"), Some(4096));
+        assert_eq!(parse_size_mb("4GB"), Some(4096));
+        assert_eq!(parse_size_mb("512m"), Some(512));
+        assert_eq!(parse_size_mb("1.5g"), Some(1536));
+        assert_eq!(parse_size_mb("2147483648"), Some(2048));
+        assert_eq!(parse_size_mb("auto"), None);
+        assert_eq!(parse_size_mb("0g"), None);
+        assert_eq!(parse_size_mb(""), None);
+    }
+
+    fn opts(memory: &str, cpus: Option<&str>) -> ContainerOptions {
+        ContainerOptions { network: None, memory: memory.into(), cpus: cpus.map(Into::into) }
+    }
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    #[test]
+    fn auto_memory_is_a_share_of_podmans() {
+        // podman's VM on a Mac: 4 GiB, 5 CPUs.
+        let r = Resources::plan(&opts("auto", None), Some((4 * GIB, 5)));
+        assert_eq!(r, Resources { memory_mb: 3072, cpus: 5, jobs: 3 });
+        // A bigger VM: jobs follow the CPUs once memory allows.
+        let r = Resources::plan(&opts("auto", None), Some((16 * GIB, 8)));
+        assert_eq!(r, Resources { memory_mb: 12288, cpus: 8, jobs: 8 });
+        // Without podman's figures, the old 2g.
+        let r = Resources::plan(&opts("auto", None), None);
+        assert_eq!(r, Resources { memory_mb: 2048, cpus: 2, jobs: 2 });
+    }
+
+    #[test]
+    fn explicit_limits_win_and_jobs_fit_them() {
+        let r = Resources::plan(&opts("2g", Some("4")), Some((16 * GIB, 8)));
+        assert_eq!(r, Resources { memory_mb: 2048, cpus: 4, jobs: 2 });
+        let r = Resources::plan(&opts("512m", Some("1.5")), Some((16 * GIB, 8)));
+        assert_eq!(r, Resources { memory_mb: 512, cpus: 2, jobs: 1 });
+        // More CPUs than podman has can't be used.
+        let r = Resources::plan(&opts("64g", Some("32")), Some((16 * GIB, 8)));
+        assert_eq!(r.cpus, 8);
+        assert_eq!(r.jobs, 8);
+    }
+
+    #[test]
+    fn job_env_names_the_usual_tools() {
+        let r = Resources { memory_mb: 3072, cpus: 5, jobs: 3 };
+        assert_eq!(r.job_env(), ["CARGO_BUILD_JOBS=3", "MAKEFLAGS=-j3", "CMAKE_BUILD_PARALLEL_LEVEL=3"]);
+        assert_eq!(r.memory_text(), "3.0 GB");
+    }
+
+    #[test]
+    fn label_records_the_worked_out_memory() {
+        let r = Resources { memory_mb: 3072, cpus: 5, jobs: 3 };
+        assert_eq!(opts("auto", None).label(&r), "memory=3072m;cpus=;network=");
+    }
+
+    #[test]
+    fn reads_oom_kill_counts() {
+        let v2 = "low 0\nhigh 0\nmax 12\noom 3\noom_kill 2\noom_group_kill 0\n";
+        assert_eq!(parse_oom_kills(v2), Some(2));
+        let v1 = "oom_kill_disable 0\nunder_oom 0\noom_kill 7\n";
+        assert_eq!(parse_oom_kills(v1), Some(7));
+        assert_eq!(parse_oom_kills(""), None);
+    }
+
+    /// Runs the script for real on the host, where there is a /proc: a
+    /// tagged process in its own session dies, an untagged one lives.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kill_script_kills_tagged_processes_even_in_another_session() {
+        use std::process::Command;
+        let tag = new_exec_tag();
+        let mut tagged = Command::new("setsid")
+            .args(["sleep", "30"])
+            .env(EXEC_TAG, &tag)
+            .spawn()
+            .unwrap();
+        let mut other = Command::new("sleep").arg("30").env(EXEC_TAG, "someone-else").spawn().unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        let st = Command::new("/bin/sh").args(["-c", &kill_tagged_script(&tag)]).status().unwrap();
+        assert!(st.success());
+        let status = tagged.wait().unwrap();
+        assert!(!status.success(), "the tagged process should have been killed");
+        assert!(other.try_wait().unwrap().is_none(), "the untagged one should still run");
+        let _ = other.kill();
+    }
+
+    #[test]
+    fn kill_script_matches_only_its_own_tag() {
+        let s = kill_tagged_script("123-4-5");
+        assert!(s.contains("grep -qxF 'SYL_EXEC=123-4-5'"));
+        assert!(s.contains("kill -KILL"));
     }
 
     #[test]

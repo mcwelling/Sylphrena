@@ -28,11 +28,35 @@ pub async fn run_bash(
         .await
     {
         Ok(out) if out.success() => (process_tool_output_spilled(&out.stdout, spill, call_id), false),
-        Ok(out) => (process_tool_output_spilled(&out.error_text(), spill, call_id), true),
+        Ok(out) => {
+            let mut text = process_tool_output_spilled(&out.error_text(), spill, call_id);
+            // A build that ran out of memory fails like any other (cargo
+            // says `signal: 9, SIGKILL`), so say what happened.
+            let killed = container.new_oom_kills().await;
+            if killed > 0 {
+                text.push_str(&oom_note(killed, &container.resources()));
+            }
+            (text, true)
+        }
         Err(ExecError::TimedOut(_)) => (
-            format!("[Tool error: command timed out after {}s]", config.timeout_ms / 1000),
+            format!(
+                "[Tool error: command timed out after {}s; it and everything it started were stopped]",
+                config.timeout_ms / 1000
+            ),
             true,
         ),
         Err(e) => (format!("[Tool error: {e}]"), true),
     }
+}
+
+/// Told to the model when the memory limit killed processes of a command.
+pub fn oom_note(killed: u64, res: &syl_container::Resources) -> String {
+    let what = if killed == 1 { "1 process was".to_string() } else { format!("{killed} processes were") };
+    format!(
+        "\n[Syl: the container ran out of memory during this command and {what} killed \
+         (limit {}, {} build jobs at once by default). Run fewer at once, e.g. `cargo build -j1`, \
+         `cargo test -j1 -- --test-threads=2` or `make -j1`, or the user can raise [container] memory.]",
+        res.memory_text(),
+        res.jobs
+    )
 }

@@ -145,7 +145,8 @@ fn default_reviewer_timeout() -> u64 {
 pub struct ContainerConfig {
     /// `"none"` runs the container without a network.
     pub network: Option<String>,
-    /// Memory limit, as podman takes it (`"4g"`). Default `"2g"`.
+    /// Memory limit, as podman takes it (`"4g"`), or `"auto"` (the default):
+    /// three quarters of podman's memory (its VM's, on macOS).
     pub memory: Option<String>,
     /// CPU limit (`"2"`, `"1.5"`). Default: no limit.
     pub cpus: Option<String>,

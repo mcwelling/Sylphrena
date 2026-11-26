@@ -527,6 +527,14 @@ fn system_prompt(
     // Skills and MCP tools are fixed with the prompt, for the conversation.
     let skills = crate::commands::list_skills(&agent.paths.project_dir);
     let mut workspace = gather_workspace_context(&agent.paths.project_dir);
+    let res = agent.container.resources();
+    workspace.push_str(&format!(
+        "Container: {} memory, {} CPUs. CARGO_BUILD_JOBS, MAKEFLAGS and CMAKE_BUILD_PARALLEL_LEVEL \
+         are set to {} jobs, which fit the memory; going above that can get processes killed.\n",
+        res.memory_text(),
+        res.cpus,
+        res.jobs
+    ));
     workspace.push_str(&crate::commands::skills_prompt(&skills).unwrap_or_default());
     workspace.push_str(&crate::mcp::instructions_prompt(mcp).unwrap_or_default());
     let mut tools = mcp.definitions.clone();
