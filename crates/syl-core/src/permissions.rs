@@ -225,6 +225,7 @@ pub fn subjects(tool: &str, input: &serde_json::Value) -> Vec<String> {
             vec![s("pattern"), path]
         }
         "dispatch_agent" => vec![s("source")],
+        "fetch" => vec![s("url")],
         "memory_read" | "memory_write" => vec![s("key")],
         "workflow_write" | "workflow_delete" | "skill" => vec![s("name")],
         // MCP tools: their arguments, as compact JSON.

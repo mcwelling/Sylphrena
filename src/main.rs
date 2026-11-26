@@ -317,7 +317,7 @@ fn draw_bars(tui: &TuiState, state: &SharedState, config: &AppConfig, model: &st
 
     let (input_tokens, output_tokens, cost_usd) = {
         let tok = state.session_tokens.lock().unwrap();
-        let cost = syl_core::pricing::compute_cost_usd(&tok, model);
+        let cost = syl_core::pricing::compute_cost_usd(&tok, model) + *state.subagent_cost_usd.lock().unwrap();
         (tok.input_tokens, tok.output_tokens, cost)
     };
 
@@ -1092,6 +1092,23 @@ impl Repl<'_> {
                     // discarded part ends (streaming was ended above).
                     self.print("\x1b[2m[cut off by an API error; the reply starts again below]\x1b[0m\r\n");
                 }
+                AgentEvent::Subagent { agent, event, .. } => match *event {
+                    // On the ticker, under the task call that started it.
+                    AgentEvent::ToolCallStarted { name, input, .. } => {
+                        self.tui.stop_anim();
+                        self.tui.stop_spinner();
+                        let line = format!(" \x1b[2m↳ {agent} ›\x1b[0m {}", tool_brief(&name, &input));
+                        terminal::draw_ticker(&self.tui.stdout, self.rows, &clip_visible(&line, self.cols));
+                    }
+                    // Back to the spinner for the task call, so a subagent
+                    // waiting on the model doesn't look stuck.
+                    AgentEvent::ToolCallFinished { .. } if !active.is_empty() => self.show_running(&active),
+                    AgentEvent::Notice { message } => {
+                        self.print(&format!("\x1b[2m[{agent}] {}\x1b[0m\r\n", sanitize(&message)))
+                    }
+                    AgentEvent::Usage { .. } => self.redraw_bars(),
+                    _ => {}
+                },
                 AgentEvent::Usage { .. } => {
                     self.tui.stop_anim();
                     // Keep the meters current through a long turn.

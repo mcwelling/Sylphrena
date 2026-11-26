@@ -32,7 +32,7 @@ pub struct Template {
     pub path: PathBuf,
 }
 
-fn home() -> Option<PathBuf> {
+pub(crate) fn home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
 
@@ -85,12 +85,12 @@ pub fn front_matter(text: &str) -> (Vec<(String, String)>, String) {
     (fields, t[offset..].to_string())
 }
 
-fn field(fields: &[(String, String)], key: &str) -> Option<String> {
+pub(crate) fn field(fields: &[(String, String)], key: &str) -> Option<String> {
     fields.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone()).filter(|v| !v.is_empty())
 }
 
 /// The first line of the body, as a fallback description.
-fn first_line(body: &str) -> String {
+pub(crate) fn first_line(body: &str) -> String {
     let line = body.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
     crate::session::one_line(line.trim_start_matches('#').trim(), 100)
 }
@@ -138,14 +138,14 @@ pub fn list_commands(project: &Path) -> Vec<Template> {
     out
 }
 
-fn is_link(p: &Path) -> bool {
+pub(crate) fn is_link(p: &Path) -> bool {
     std::fs::symlink_metadata(p).map(|m| m.file_type().is_symlink()).unwrap_or(true)
 }
 
 /// A skill directory root that is really inside `base` (the project or
 /// home): code in the container can write the project's `.agents/`, and a
 /// symbolic link there would point Syl, reading on the host, anywhere.
-fn contained(dir: &Path, base: &Path) -> bool {
+pub(crate) fn contained(dir: &Path, base: &Path) -> bool {
     match (dir.canonicalize(), base.canonicalize()) {
         (Ok(d), Ok(b)) => d.starts_with(b),
         _ => false,

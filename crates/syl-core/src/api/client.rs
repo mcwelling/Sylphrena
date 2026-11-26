@@ -118,11 +118,20 @@ fn build_payload(
         "messages": crate::api::cache::messages_with_cache_points(messages),
     });
     if config.tools {
-        let mut tools = syl_tools();
-        if let Some(list) = tools.as_array_mut() {
-            list.extend(config.extra_tools.iter().cloned());
+        let tools: Vec<serde_json::Value> = syl_tools()
+            .as_array()
+            .into_iter()
+            .flatten()
+            .chain(config.extra_tools.iter())
+            .filter(|t| t["name"].as_str().is_some_and(|n| config.tool_allowed(n)))
+            .cloned()
+            .collect();
+        if !tools.is_empty() {
+            body["tools"] = serde_json::Value::Array(tools);
+            if config.tool_choice_none {
+                body["tool_choice"] = serde_json::json!({ "type": "none" });
+            }
         }
-        body["tools"] = tools;
     }
 
     if let Some(thinking) = thinking_param(config) {
@@ -446,6 +455,16 @@ pub fn input_need(
     need.max(1000)
 }
 
+/// Where in `SharedState::model_limits` the cache estimate for this
+/// request's conversation is kept: the model's own entry (which also holds
+/// its buckets) when there's no conversation, else one per conversation.
+fn estimate_key(config: &AppConfig) -> String {
+    match &config.conversation {
+        Some(c) => format!("{}\u{1f}{c}", config.model),
+        None => config.model.clone(),
+    }
+}
+
 /// How long until `config.model`'s buckets (as its last response left
 /// them, refilled since) can hold about what this request needs.
 fn api_wait(
@@ -454,8 +473,12 @@ fn api_wait(
     messages: &[Message],
     system: &[SystemBlock],
 ) -> std::time::Duration {
-    let limits = state.model_limits.lock().unwrap().get(&config.model).copied().unwrap_or_default();
-    let Some(api) = limits.api else { return std::time::Duration::ZERO };
+    // The buckets are the model's; what's cached is the conversation's.
+    let (api, limits) = {
+        let all = state.model_limits.lock().unwrap();
+        (all.get(&config.model).and_then(|l| l.api), all.get(&estimate_key(config)).copied().unwrap_or_default())
+    };
+    let Some(api) = api else { return std::time::Duration::ZERO };
     let now = crate::api::rate_limit::now_ms();
     let prefix = messages.get(..limits.last_count).map(|sent| prefix_fingerprint(config, system, sent));
     let need_in = input_need(&limits, messages, system, now, prefix);
@@ -542,7 +565,7 @@ pub async fn call_with_retry_shared(
                 let uncached = result.usage.input_tokens + result.usage.cache_write_tokens;
                 {
                     let mut all = state.model_limits.lock().unwrap();
-                    let l = all.entry(config.model.clone()).or_default();
+                    let l = all.entry(estimate_key(config)).or_default();
                     l.last_total = uncached + result.usage.cache_read_tokens;
                     l.last_ms = crate::api::rate_limit::now_ms();
                     l.last_count = messages.len();
@@ -723,6 +746,18 @@ pub fn syl_tools() -> serde_json::Value {
                     "path": {"type": "string", "description": "Directory to list. Default: the workspace."}
                 },
                 "required": []
+            }
+        },
+        {
+            "name": "fetch",
+            "description": "Fetch a web page (or PDF) over http or https and return it as text, at most 32,000 bytes at a time. Long pages say where to continue: call again with that start.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "url":   {"type": "string", "description": "The URL."},
+                    "start": {"type": "integer", "description": "Byte offset to continue from. Default 0."}
+                },
+                "required": ["url"]
             }
         },
         {

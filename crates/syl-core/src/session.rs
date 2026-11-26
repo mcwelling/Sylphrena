@@ -111,6 +111,9 @@ pub enum EntryKind {
     /// The workspace was put back to `commit`; `safety` is the snapshot taken
     /// just before, so the restore can be undone.
     Restored { commit: String, safety: String },
+    /// A `task` (or `dispatch_agent`) call ran `agent` in the child session
+    /// `session`, logged under `agents/<this session's id>/`.
+    Subagent { tool_use_id: String, agent: String, session: String },
     /// Something the model should know that isn't a prompt: the mode
     /// changed, or files were restored. Added to the next user message.
     Note { text: String },
@@ -299,7 +302,10 @@ impl History {
                     }
                 }
             }
-            EntryKind::Approval { .. } | EntryKind::Checkpoint { .. } | EntryKind::Restored { .. } => {}
+            EntryKind::Approval { .. }
+            | EntryKind::Checkpoint { .. }
+            | EntryKind::Restored { .. }
+            | EntryKind::Subagent { .. } => {}
         }
     }
 

@@ -675,7 +675,8 @@ fn tool_kind(name: &str) -> &'static str {
         "workflow_delete" => "delete",
         "grep" | "glob" | "ls" => "search",
         "run_bash" => "execute",
-        "dispatch_agent" => "fetch",
+        "dispatch_agent" | "fetch" => "fetch",
+        "task" => "think",
         _ => "other",
     }
 }
@@ -688,6 +689,8 @@ fn tool_title(name: &str, input: &Value) -> String {
         "read_file" | "edit_file" | "write_file" | "show_image" | "ls" => arg("path"),
         "grep" | "glob" => arg("pattern"),
         "dispatch_agent" => arg("source"),
+        "fetch" => arg("url"),
+        "task" => format!("{} — {}", arg("agent"), arg("description")),
         "memory_read" | "memory_write" => arg("key"),
         _ => String::new(),
     };
@@ -812,6 +815,40 @@ async fn pump(
             AgentEvent::ToolCallFinished { id: call, output, is_error, .. } => {
                 announced.remove(&call);
                 server.update(&id, tool_result(&call, &output, is_error));
+            }
+            // A subagent's calls are tool calls of this session too, each
+            // saying which call started it (ACP has no nested sessions).
+            // They keep their own ids, which its permission questions use.
+            AgentEvent::Subagent { call_id, agent, session: child, event } => {
+                let meta = json!({ "syl": { "parentToolCallId": call_id, "agent": agent, "session": child } });
+                let with_meta = |mut v: Value| {
+                    v["_meta"] = meta.clone();
+                    v
+                };
+                match *event {
+                    AgentEvent::ToolCallStarted { id: call, name, input } => {
+                        if announced.remove(&call) {
+                            server.update(
+                                &id,
+                                with_meta(json!({ "sessionUpdate": "tool_call_update", "toolCallId": call, "status": "in_progress" })),
+                            );
+                        } else {
+                            server.update(&id, with_meta(tool_call(&call, &name, &input, "in_progress", &cwd)));
+                        }
+                    }
+                    AgentEvent::ToolCallFinished { id: call, output, is_error, .. } => {
+                        announced.remove(&call);
+                        server.update(&id, with_meta(tool_result(&call, &output, is_error)));
+                    }
+                    AgentEvent::Notice { message } if notices => server.update(
+                        &id,
+                        json!({
+                            "sessionUpdate": "notice", "severity": "info",
+                            "title": crate::session::one_line(&format!("[{agent}] {message}"), 200),
+                        }),
+                    ),
+                    _ => {}
+                }
             }
             AgentEvent::PermissionRequested { id: call, name, input, subject, note } => {
                 server.update(&id, tool_call(&call, &name, &input, "pending", &cwd));

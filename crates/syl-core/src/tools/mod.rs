@@ -75,9 +75,9 @@ pub async fn execute(
         "grep" => fs::grep(input, ctx.config, ctx.container, &cancel).await,
         "glob" => fs::glob(input, ctx.config, ctx.container, &cancel).await,
         "ls" => fs::ls(input, ctx.config, ctx.container, &cancel).await,
-        "dispatch_agent" => {
-            dispatch::dispatch_agent(input, ctx.config, ctx.model, ctx.container, cancel).await
-        }
+        "fetch" => dispatch::fetch(input, ctx.config, ctx.container, cancel).await,
+        // They start subagents, which needs the agent loop (agent.rs).
+        "task" | "dispatch_agent" => (format!("[Tool error: {name} can only run in the agent loop]"), true),
         "show_image" => image::show_image(input, ctx.container),
         "skill" => crate::commands::load_skill(ctx.project_dir, &str_field("name")),
         other => match ctx.mcp.filter(|m| m.has(other)) {

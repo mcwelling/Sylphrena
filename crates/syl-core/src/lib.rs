@@ -2,6 +2,7 @@
 //! client. It has no terminal dependency; clients drive it through
 //! `agent::spawn`, `AgentCommand` and `AgentEvent`.
 pub mod acp;
+pub mod agents;
 pub mod agent;
 pub mod attachments;
 pub mod checkpoint;

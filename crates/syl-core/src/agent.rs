@@ -43,6 +43,10 @@ pub enum AgentEvent {
     RequestStarted,
     TextDelta { text: String },
     ThinkingDelta { text: String },
+    /// Something a subagent did, started by the tool call `call_id`: its
+    /// tool calls, notices and usage. Its permission questions come as
+    /// plain `PermissionRequested` events, answered the usual way.
+    Subagent { call_id: String, agent: String, session: String, event: Box<AgentEvent> },
     /// The model request failed after some of its text or thinking was
     /// streamed, and is being sent again: drop what this request streamed
     /// so far (since its `RequestStarted`); the reply starts over.
@@ -259,6 +263,10 @@ struct ContextState {
     checkpoint_error_reported: bool,
     /// Nested git repositories were already reported.
     nested_repos_reported: bool,
+    /// A subagent's model requests and budget tokens so far, over all its
+    /// turns (a dispatch_agent retry is a second turn on the same budget).
+    sub_requests: u32,
+    sub_spent: u64,
 }
 
 fn open_session(dir: Option<&std::path::Path>, id: &str) -> anyhow::Result<SessionLog> {
@@ -391,7 +399,9 @@ async fn run(agent: Agent, mut commands: mpsc::UnboundedReceiver<AgentCommand>, 
         let mut shutting_down = false;
         let mut dropped_prompts = 0usize;
         let reason = {
-            let turn = run_turn(&agent, &mut session, &mut ctx, &events, &steer, &pending, mode, &mcp, cancel.clone());
+            let shared = TurnShared::default();
+            let parent = Parent { events: &events, pending: &pending, mcp_cell: &mcp, shared: &shared };
+            let turn = run_turn(&agent, &mut session, &mut ctx, &parent, &steer, mode, cancel.clone());
             tokio::pin!(turn);
             loop {
                 tokio::select! {
@@ -529,7 +539,8 @@ fn system_prompt(
         return blocks;
     }
     // Skills and MCP tools are fixed with the prompt, for the conversation.
-    let skills = crate::commands::list_skills(&agent.paths.project_dir);
+    let sub = agent.config.subagent.clone();
+    let skills = if sub.is_some() { Vec::new() } else { crate::commands::list_skills(&agent.paths.project_dir) };
     let mut workspace = gather_workspace_context(&agent.paths.project_dir);
     let res = agent.container.resources();
     workspace.push_str(&format!(
@@ -545,12 +556,25 @@ fn system_prompt(
     if !skills.is_empty() {
         tools.push(tools::skill_tool());
     }
+    if sub.is_none() && agent.config.tools {
+        let (agents, problems) = crate::agents::list_agents(&agent.paths.project_dir);
+        for p in problems {
+            let _ = events.send(AgentEvent::Notice { message: format!("[Syl] {p}") });
+        }
+        tools.push(crate::agents::task_tool(&agents));
+    }
     if session.history().tools.as_ref().map_or(!tools.is_empty(), |t| *t != tools) {
         record(agent, session, ctx, events, EntryKind::ToolSet { tools: tools.clone() });
     }
     *agent.state.extra_tools.lock().unwrap() = Arc::new(tools);
     let instructions = crate::system_prompt::load_project_instructions(&agent.paths.project_dir);
-    let blocks: Vec<SystemBlock> = build_system_blocks(&workspace, &agent.paths.memory_dir, instructions.as_deref())
+    let blocks: Vec<SystemBlock> = if let Some(def) = &sub {
+        let instructions = instructions
+            .map(|i| format!("\n### PROJECT INSTRUCTIONS (AGENTS.md / CLAUDE.md)\n{i}\n"))
+            .unwrap_or_default();
+        vec![SystemBlock::cached(format!("{}\n\n{workspace}{instructions}", crate::agents::system_text(def)))]
+    } else {
+        build_system_blocks(&workspace, &agent.paths.memory_dir, instructions.as_deref())
         .into_iter()
         .filter_map(|b| match b {
             ContentBlock::Text { text, cache_control } => Some(if cache_control.is_some() {
@@ -560,7 +584,8 @@ fn system_prompt(
             }),
             _ => None,
         })
-        .collect();
+        .collect()
+    };
     let logged: Vec<PromptBlock> = blocks.iter().map(PromptBlock::from_system).collect();
     if session.history().system.as_ref() != Some(&logged) {
         record(agent, session, ctx, events, EntryKind::SystemPrompt { blocks: logged });
@@ -655,17 +680,57 @@ async fn compact(
 
 /// One user turn: model calls and tool calls until the model stops.
 #[allow(clippy::too_many_arguments)]
-async fn run_turn(
+/// What a turn shares with the subagents it starts.
+#[derive(Default)]
+struct TurnShared {
+    /// Held while a subagent asks the user something: several can run at
+    /// once, and the user is asked one question at a time. A subagent's
+    /// turn shares its parent's.
+    ask_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Subagents started by this turn's calls: (call id, agent, session),
+    /// for the log.
+    started: std::sync::Mutex<Vec<(String, String, String)>>,
+}
+
+/// The channels of the turn a call runs in: a subagent's events and
+/// permission questions go to the parent's.
+#[derive(Clone, Copy)]
+struct Parent<'a> {
+    events: &'a Events,
+    pending: &'a Pending,
+    mcp_cell: &'a tokio::sync::OnceCell<Arc<crate::mcp::McpHub>>,
+    shared: &'a TurnShared,
+}
+
+/// A turn as a boxed future, so a subagent's turn can run inside a call
+/// of its parent's (an async fn can't contain itself).
+type TurnFuture<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = TurnEnd> + Send + 'a>>;
+
+#[allow(clippy::too_many_arguments)]
+fn run_turn<'a>(
+    agent: &'a Agent,
+    session: &'a mut SessionLog,
+    ctx: &'a mut ContextState,
+    parent: &'a Parent<'a>,
+    steer: &'a std::sync::Mutex<Vec<String>>,
+    mode: Mode,
+    cancel: CancellationToken,
+) -> TurnFuture<'a> {
+    Box::pin(turn_body(agent, session, ctx, parent, steer, mode, cancel))
+}
+
+async fn turn_body(
     agent: &Agent,
     session: &mut SessionLog,
     ctx: &mut ContextState,
-    events: &Events,
+    parent: &Parent<'_>,
     steer: &std::sync::Mutex<Vec<String>>,
-    pending: &Pending,
     mode: Mode,
-    mcp_cell: &tokio::sync::OnceCell<Arc<crate::mcp::McpHub>>,
     cancel: CancellationToken,
 ) -> TurnEnd {
+    let events = parent.events;
+    let pending = parent.pending;
+    let mcp_cell = parent.mcp_cell;
     let emit = |e: AgentEvent| {
         let _ = events.send(e);
     };
@@ -677,6 +742,7 @@ async fn run_turn(
         if !model.is_empty() {
             c.model = model;
         }
+        c.conversation = Some(session.id().to_string());
         c
     };
     // Started on the first turn. Cancelling leaves it unstarted, so the next
@@ -728,13 +794,30 @@ async fn run_turn(
     };
     // In plan mode the turn isn't checkpointed: each run_bash is snapshotted
     // and put back on its own, and /undo should find the last build turn.
-    let mut checkpointed = mode == Mode::Plan;
+    // A subagent's turn neither: its parent's turn was checkpointed before it.
+    let mut checkpointed = mode == Mode::Plan || agent.config.subagent.is_some();
+
+    // A subagent's budgets: requests, and tokens over all of them. The last
+    // request it may make is sent with tool_choice none, after a note, so
+    // it answers with what it has.
+    let budget = agent.config.subagent.clone();
+    let mut wrapping_up = false;
 
     let mut overflow_retries = 0;
     let mut images_dropped = false;
     // The error of a request rejected as too long, while it is retried.
     let mut overflow: Option<String> = None;
     loop {
+        if let Some(def) = &budget {
+            if !wrapping_up && (ctx.sub_requests + 1 >= def.max_requests || ctx.sub_spent >= def.token_budget) {
+                wrapping_up = true;
+                record(agent, session, ctx, events, EntryKind::Note {
+                    text: "[Budget reached: no more tool calls. Reply now with what you found and what is left undone.]"
+                        .to_string(),
+                });
+            }
+            config.tool_choice_none = wrapping_up;
+        }
         emit(AgentEvent::RequestStarted);
         let system = system_prompt(agent, session, ctx, events, &mcp);
         config.extra_tools = agent.state.extra_tools.lock().unwrap().clone();
@@ -832,14 +915,20 @@ async fn run_turn(
             tok.clone()
         };
         emit(AgentEvent::Usage { request: turn.usage.clone(), session: session_usage });
+        // Cache reads aren't counted: each request reads the whole context
+        // back, at a tenth of the price.
+        ctx.sub_requests += 1;
+        ctx.sub_spent += turn.usage.input_tokens + turn.usage.cache_write_tokens + turn.usage.output_tokens;
 
         // A tool_use the model did not finish (stop_reason max_tokens etc.)
         // gets no tool_result, and a tool_use without one makes every later
         // request fail with a 400, so only a tool_use turn keeps them.
         record(agent, session, ctx, events, EntryKind::Message {
+            // A wrap-up reply's tool calls won't run (tool_choice was none),
+            // so they go too.
             message: Message::assistant_blocks(compaction::drop_unanswered_tool_uses(
                 &turn.content,
-                &turn.stop_reason,
+                if wrapping_up { &StopReason::EndTurn } else { &turn.stop_reason },
             )),
         });
         let u = &turn.usage;
@@ -851,7 +940,7 @@ async fn run_turn(
         if turn.stop_reason == StopReason::ContextWindowExceeded {
             ctx.force_compact = true;
         }
-        if turn.stop_reason != StopReason::ToolUse {
+        if turn.stop_reason != StopReason::ToolUse || wrapping_up {
             return TurnEnd::Completed(turn.stop_reason);
         }
 
@@ -899,11 +988,16 @@ async fn run_turn(
             mcp: Some(&mcp),
         };
         let plan_denied = if mode == Mode::Plan { mcp.mutating() } else { Vec::new() };
-        // Consecutive read-only calls run together; anything else runs alone.
+        // Consecutive read-only calls run together, and so do consecutive
+        // subagent calls (at most MAX_PARALLEL at a time); anything else
+        // runs alone.
+        let starts = |n: &str| crate::agents::STARTS_SUBAGENTS.contains(&n);
         let mut i = 0;
         while i < calls.len() {
             let j = if tools::is_read_only(&calls[i].1) {
                 calls[i..].iter().position(|c| !tools::is_read_only(&c.1)).map_or(calls.len(), |n| i + n)
+            } else if starts(&calls[i].1) {
+                calls[i..].iter().position(|c| !starts(&c.1)).map_or(calls.len(), |n| i + n)
             } else {
                 i + 1
             };
@@ -923,7 +1017,7 @@ async fn run_turn(
             // Permissions first, one call at a time (asking is sequential).
             let mut results: Vec<Option<(String, bool)>> = vec![None; group.len()];
             for (k, (id, name, input)) in group.iter().enumerate() {
-                let gate = Gate { agent, config: &config, pending, mode, cancel: &cancel, plan_denied: &plan_denied };
+                let gate = Gate { agent, config: &config, pending, mode, cancel: &cancel, plan_denied: &plan_denied, ask_lock: &parent.shared.ask_lock };
                 if let Err(denied) = gate.authorize(session, ctx, events, &mut approvals, id, name, input).await {
                     results[k] = Some((denied, true));
                 }
@@ -932,8 +1026,8 @@ async fn run_turn(
             let will_change = group
                 .iter()
                 .zip(&results)
-                .any(|((_, name, _), r)| {
-                    r.is_none() && may_write(agent, &mcp, name)
+                .any(|((_, name, input), r)| {
+                    r.is_none() && (may_write(agent, &mcp, name) || subagent_may_write(agent, name, input))
                 });
             if will_change && !checkpointed && agent.paths.checkpoints && !cancel.is_cancelled() {
                 checkpointed = true;
@@ -950,11 +1044,20 @@ async fn run_turn(
                 }
             }
             let runnable: Vec<usize> = (0..group.len()).filter(|&k| results[k].is_none()).collect();
+            let slots = tokio::sync::Semaphore::new(crate::agents::MAX_PARALLEL);
+            let user_prompt = config.user_task.clone().unwrap_or_else(|| {
+                crate::session::user_prompts(session.entries()).last().map(|p| p.text.clone()).unwrap_or_default()
+            });
+            let call = CallCtx { parent, model: &config.model, session_id: session.id(), slots: &slots, user_prompt: &user_prompt };
             let outputs = futures_util::future::join_all(runnable.iter().map(|&k| {
                 let (id, name, input) = &group[k];
-                execute_call(agent, &tool_ctx, mode, session.id(), id, name, input, cancel.clone())
+                execute_call(agent, &tool_ctx, mode, &call, id, name, input, cancel.clone())
             }))
             .await;
+            let started = std::mem::take(&mut *parent.shared.started.lock().unwrap());
+            for (tool_use_id, agent_name, child) in started {
+                record(agent, session, ctx, events, EntryKind::Subagent { tool_use_id, agent: agent_name, session: child });
+            }
             for (k, (output, is_error, put_back)) in runnable.into_iter().zip(outputs) {
                 if let Some((commit, safety)) = put_back {
                     // The files as they were before the put-back stay reachable.
@@ -1168,6 +1271,280 @@ fn has_tool_hooks(agent: &Agent, name: &str) -> bool {
         || !matching(&agent.config.hooks, HookEvent::PostTool, Some(name)).is_empty()
 }
 
+/// What one batch of tool calls runs with.
+struct CallCtx<'a> {
+    parent: &'a Parent<'a>,
+    /// The turn's model: a subagent without one of its own uses it.
+    model: &'a str,
+    session_id: &'a str,
+    /// Subagents running at once.
+    slots: &'a tokio::sync::Semaphore,
+    /// The user's latest request, for a subagent's reviewer.
+    user_prompt: &'a str,
+}
+
+/// Whether a `task` call's agent can change the workspace.
+fn subagent_may_write(agent: &Agent, name: &str, input: &serde_json::Value) -> bool {
+    use crate::hooks::HookEvent;
+    // Tool hooks can write whatever the tool.
+    let hooks = agent.config.hooks.iter().any(|h| matches!(h.event, HookEvent::PreTool | HookEvent::PostTool));
+    if name == "dispatch_agent" {
+        // Its fetch agent can't write; a hook on fetch can.
+        return hooks;
+    }
+    name == "task"
+        && (hooks
+            || input["agent"]
+                .as_str()
+                .and_then(|a| crate::agents::find(&agent.paths.project_dir, a))
+                .is_some_and(|d| d.can_write()))
+}
+
+/// Run a `task` or `dispatch_agent` call.
+async fn start_subagent(
+    agent: &Agent,
+    call: &CallCtx<'_>,
+    mode: Mode,
+    id: &str,
+    name: &str,
+    input: &serde_json::Value,
+    cancel: &CancellationToken,
+) -> (String, bool) {
+    if name == "dispatch_agent" {
+        let d = match crate::tools::dispatch::parse_dispatch(input) {
+            Ok(d) => d,
+            Err(e) => return e,
+        };
+        // Always the built-in fetch agent: a project's `fetch.md` (it comes
+        // with the project) mustn't decide what dispatch_agent can do.
+        let Some(mut def) = crate::agents::builtins().into_iter().find(|a| a.name == "fetch") else {
+            return ("[Tool error: no fetch agent]".to_string(), true);
+        };
+        def.max_requests = def.max_requests.min(8);
+        let max_tokens = d.max_tokens.max(1024);
+        let err = |error: &str, reason: &str| {
+            (serde_json::json!({ "error": error, "reason": reason, "source_url": d.source }).to_string(), true)
+        };
+        return match run_subagent(agent, call, mode, id, def, &d.prompt(), Some(max_tokens), Some(&|r: &str| {
+            (!d.accepts(r)).then(|| crate::tools::dispatch::Dispatch::RETRY_JSON.to_string())
+        }), cancel)
+        .await
+        {
+            // Nothing was fetched: the page couldn't be had, whatever the reply says.
+            Ok(r) if r.fetched == 0 && r.fetch_error.is_some() => {
+                err("Content retrieval failed", r.fetch_error.as_deref().unwrap_or_default())
+            }
+            Ok(r) => d.finish(&r.reply, r.truncated),
+            Err(e) if e == CANCELLED => err("Cancelled", "request cancelled by user"),
+            Err(e) => err("Sub-agent call failed", &e),
+        };
+    }
+    let Some(agent_name) = input["agent"].as_str() else {
+        return ("[Tool error: task requires an 'agent']".to_string(), true);
+    };
+    let Some(prompt) = input["prompt"].as_str().filter(|p| !p.trim().is_empty()) else {
+        return ("[Tool error: task requires a 'prompt']".to_string(), true);
+    };
+    let Some(def) = crate::agents::find(&agent.paths.project_dir, agent_name) else {
+        let names: Vec<String> = crate::agents::list_agents(&agent.paths.project_dir).0.into_iter().map(|a| a.name).collect();
+        return (format!("[Tool error: no agent `{agent_name}`; there are: {}]", names.join(", ")), true);
+    };
+    match run_subagent(agent, call, mode, id, def, prompt, None, None, cancel).await {
+        Ok(r) if r.reply.trim().is_empty() => (format!("[{agent_name} finished without a reply]"), true),
+        Ok(r) => {
+            let mut out = r.reply;
+            if r.truncated {
+                out.push_str("\n\n[The reply was cut off at max_tokens.]");
+            }
+            (out, false)
+        }
+        Err(e) if e == CANCELLED => ("[Tool error: cancelled by user]".to_string(), true),
+        Err(e) => (format!("[Tool error: {agent_name} failed: {e}]"), true),
+    }
+}
+
+/// `run_subagent`'s error when it was cancelled.
+const CANCELLED: &str = "cancelled by user";
+
+/// Looks at a subagent's reply: Some is what to tell it to try again.
+type ReplyCheck<'a> = dyn Fn(&str) -> Option<String> + Sync + 'a;
+
+/// A subagent's final reply.
+struct SubagentReply {
+    reply: String,
+    /// Cut off at max_tokens.
+    truncated: bool,
+    /// Its `fetch` calls that succeeded, and the last one's error if any
+    /// failed.
+    fetched: usize,
+    fetch_error: Option<String>,
+}
+
+/// Run `def` on `prompt` in a child session (logged under
+/// `agents/<parent session>/`), with the parent's container, model
+/// adapter (so its rate limits), MCP servers, permission rules and mode.
+/// Its permission questions go to the parent's client; its tool calls,
+/// notices and usage are passed on as `Subagent` events. `check` may ask
+/// for one more turn when the reply isn't acceptable.
+#[allow(clippy::too_many_arguments)]
+async fn run_subagent(
+    agent: &Agent,
+    call: &CallCtx<'_>,
+    mode: Mode,
+    call_id: &str,
+    def: crate::agents::AgentDef,
+    prompt: &str,
+    max_tokens: Option<u32>,
+    check: Option<&ReplyCheck<'_>>,
+    cancel: &CancellationToken,
+) -> Result<SubagentReply, String> {
+    let parent = call.parent;
+    let model = def.model.clone().unwrap_or_else(|| call.model.to_string());
+    let name = def.name.clone();
+    if cancel.is_cancelled() {
+        return Err(CANCELLED.to_string());
+    }
+    let mut config = agent.config.clone();
+    if model != call.model {
+        // Set for the main model; another model has its own window, and
+        // --thinking's budget would only add cost to a cheap one.
+        config.thinking_budget = None;
+        config.context_window = None;
+    }
+    config.model = model.clone();
+    if let Some(m) = max_tokens {
+        config.max_tokens = m;
+    }
+    config.subagent = Some(Arc::new(def));
+    config.user_task = Some(call.user_prompt.to_string());
+    let state = SharedState::new();
+    *state.current_model.lock().unwrap() = model.clone();
+    // Snapshots stay on: plan mode needs them to put changes back. The
+    // child's turn isn't checkpointed itself (see turn_body): the parent's
+    // is, before a subagent that can write.
+    let paths = SessionPaths {
+        sessions_dir: agent.paths.sessions_dir.as_ref().map(|d| d.join("agents").join(call.session_id)),
+        ..agent.paths.clone()
+    };
+    let child = Agent {
+        config,
+        state,
+        model: agent.model.clone(),
+        container: agent.container.clone(),
+        paths,
+        start: SessionStart::New,
+    };
+    let mut session = SessionLog::create(child.paths.sessions_dir.as_deref(), &child.paths.project_dir);
+    let child_id = session.id().to_string();
+    parent.shared.started.lock().unwrap().push((call_id.to_string(), name.clone(), child_id.clone()));
+    let mut ctx = ContextState::default();
+    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+    let wrap = |event: AgentEvent| AgentEvent::Subagent {
+        call_id: call_id.to_string(),
+        agent: name.clone(),
+        session: child_id.clone(),
+        event: Box::new(event),
+    };
+    let mut error: Option<String> = None;
+    let mut fetched = 0usize;
+    let mut fetch_error: Option<String> = None;
+    let mut forward = |e: AgentEvent, error: &mut Option<String>| {
+        let send = |e: AgentEvent| {
+            let _ = parent.events.send(e);
+        };
+        if let AgentEvent::ToolCallFinished { name: tool, output, is_error, .. } = &e {
+            if tool == "fetch" {
+                if *is_error {
+                    fetch_error = Some(output.clone());
+                } else {
+                    fetched += 1;
+                }
+            }
+        }
+        match e {
+            // Answered by the user through the parent's client and pending
+            // map; the note says which subagent is asking.
+            AgentEvent::PermissionRequested { id, name: tool, input, subject, note } => {
+                let by = format!("Asked by the {name} subagent.");
+                let note = Some(match note {
+                    Some(n) => format!("{by} {n}"),
+                    None => by,
+                });
+                send(AgentEvent::PermissionRequested { id, name: tool, input, subject, note })
+            }
+            AgentEvent::PermissionDecided { .. } => send(e),
+            AgentEvent::Usage { ref request, .. } => {
+                *agent.state.subagent_cost_usd.lock().unwrap() += crate::pricing::compute_cost_usd(request, &model);
+                send(wrap(e));
+            }
+            AgentEvent::ToolCallStarted { .. } | AgentEvent::ToolCallFinished { .. } | AgentEvent::Notice { .. } => send(wrap(e)),
+            AgentEvent::Error { message } => *error = Some(message),
+            _ => {}
+        }
+    };
+    let steer = std::sync::Mutex::new(Vec::new());
+    // Its own list of started subagents (it can't start any), the parent's lock.
+    let child_shared = TurnShared { ask_lock: parent.shared.ask_lock.clone(), started: Default::default() };
+    let child_parent = Parent { events: &tx, pending: parent.pending, mcp_cell: parent.mcp_cell, shared: &child_shared };
+    let mut next = Some(Message::user_text(prompt));
+    let mut retried = false;
+    let mut last = TurnEnd::Failed;
+    while let Some(message) = next.take() {
+        record(&child, &mut session, &mut ctx, &tx, EntryKind::Message { message });
+        let mut turn = run_turn(&child, &mut session, &mut ctx, &child_parent, &steer, mode, cancel.child_token());
+        last = loop {
+            tokio::select! {
+                end = &mut turn => break end,
+                Some(e) = rx.recv() => forward(e, &mut error),
+            }
+        };
+        drop(turn);
+        while let Ok(e) = rx.try_recv() {
+            forward(e, &mut error);
+        }
+        // A reply cut off at max_tokens would be cut off again.
+        if let (TurnEnd::Completed(StopReason::EndTurn), Some(check), false) = (&last, check, retried) {
+            if let Some(again) = check(&final_reply(&session)) {
+                retried = true;
+                next = Some(Message::user_text(again));
+            }
+        }
+    }
+    match last {
+        TurnEnd::Completed(reason) => Ok(SubagentReply {
+            reply: final_reply(&session),
+            truncated: reason == StopReason::MaxTokens,
+            fetched,
+            fetch_error,
+        }),
+        TurnEnd::Cancelled => Err(CANCELLED.to_string()),
+        TurnEnd::Failed => Err(error.unwrap_or_else(|| "the request failed".to_string())),
+    }
+}
+
+/// The text of the session's last assistant message.
+fn final_reply(session: &SessionLog) -> String {
+    session
+        .messages()
+        .iter()
+        .rev()
+        .find(|m| m.role == "assistant")
+        .map(|m| match &m.content {
+            MessageContent::Text(t) => t.clone(),
+            MessageContent::Blocks(b) => b
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Text { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        })
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
 /// Run one tool call, with its hooks. In plan mode a call that could write
 /// (`run_bash`, any MCP tool, any call with hooks) runs between two
 /// snapshots, and anything it or its hooks changed in the workspace is put
@@ -1179,12 +1556,23 @@ async fn execute_call(
     agent: &Agent,
     tool_ctx: &ToolContext<'_>,
     mode: Mode,
-    session_id: &str,
+    call: &CallCtx<'_>,
     id: &str,
     name: &str,
     input: &serde_json::Value,
     cancel: CancellationToken,
 ) -> (String, bool, Option<(String, String)>) {
+    if crate::agents::STARTS_SUBAGENTS.contains(&name) {
+        // A subagent takes the project lock and snapshots for its own calls
+        // as they run: holding them here would deadlock it. Its hooks get
+        // them in run_hooked instead.
+        let _slot = tokio::select! {
+            s = call.slots.acquire() => s,
+            _ = cancel.cancelled() => return ("[Tool error: cancelled by user]".to_string(), true, None),
+        };
+        let (o, e) = run_hooked(agent, tool_ctx, Some((call, mode)), id, name, input, &cancel).await;
+        return (o, e, None);
+    }
     let lock = project_lock(&agent.paths.project_dir);
     let is_mcp = tool_ctx.mcp.is_some_and(|m| m.has(name));
     let hooked = has_tool_hooks(agent, name);
@@ -1194,10 +1582,10 @@ async fn execute_call(
         // put-back.
         let writes = CHANGES_FILES.contains(&name) || is_mcp || hooked;
         let _shared = if writes { Some(lock.read().await) } else { None };
-        let (o, e) = run_hooked(agent, tool_ctx, session_id, id, name, input, &cancel).await;
+        let (o, e) = run_hooked(agent, tool_ctx, Some((call, mode)), id, name, input, &cancel).await;
         return (o, e, None);
     }
-    let run = run_hooked(agent, tool_ctx, session_id, id, name, input, &cancel);
+    let run = run_hooked(agent, tool_ctx, Some((call, mode)), id, name, input, &cancel);
     let ((output, is_error), put_back) = match in_snapshot(agent, run).await {
         Ok(r) => r,
         Err(why) => {
@@ -1350,42 +1738,80 @@ async fn run_event_hooks(
 async fn run_hooked(
     agent: &Agent,
     tool_ctx: &ToolContext<'_>,
-    session_id: &str,
+    call: Option<(&CallCtx<'_>, Mode)>,
     id: &str,
     name: &str,
     input: &serde_json::Value,
     cancel: &CancellationToken,
 ) -> (String, bool) {
     use crate::hooks::{matching, run_all, HookEvent, HookOutcome};
+    let session_id = call.map_or("", |(c, _)| c.session_id);
     let hooks = &agent.config.hooks;
     if !matching(hooks, HookEvent::PreTool, Some(name)).is_empty() {
         let payload = serde_json::json!({
             "event": "pre_tool", "session_id": session_id, "tool": name, "tool_use_id": id, "input": input,
         });
-        if let HookOutcome::Failed(why) = run_all(&agent.container, hooks, HookEvent::PreTool, Some(name), &payload, cancel).await {
+        let run = run_all(&agent.container, hooks, HookEvent::PreTool, Some(name), &payload, cancel);
+        if let HookOutcome::Failed(why) = guarded_hook(agent, call, name, run).await {
             if cancel.is_cancelled() {
                 return ("[Cancelled]".to_string(), true);
             }
             return (format!("[Blocked by a pre_tool hook: {why}]"), true);
         }
     }
-    let (output, is_error) = tools::execute(name, id, input, tool_ctx, cancel.clone()).await;
+    let (output, is_error) = match call {
+        Some((c, mode)) if crate::agents::STARTS_SUBAGENTS.contains(&name) => {
+            start_subagent(agent, c, mode, id, name, input, cancel).await
+        }
+        _ => tools::execute(name, id, input, tool_ctx, cancel.clone()).await,
+    };
     if !matching(hooks, HookEvent::PostTool, Some(name)).is_empty() && !cancel.is_cancelled() {
         let payload = serde_json::json!({
             "event": "post_tool", "session_id": session_id, "tool": name, "tool_use_id": id, "input": input,
             "output": output, "is_error": is_error,
         });
-        if let HookOutcome::Failed(why) = run_all(&agent.container, hooks, HookEvent::PostTool, Some(name), &payload, cancel).await {
+        let run = run_all(&agent.container, hooks, HookEvent::PostTool, Some(name), &payload, cancel);
+        if let HookOutcome::Failed(why) = guarded_hook(agent, call, name, run).await {
             return (format!("{output}\n\n[post_tool hook: {why}]"), is_error);
         }
     }
     (output, is_error)
 }
 
+/// A hook of a subagent call, run as a writing tool's would be: under the
+/// project lock, and in plan mode between snapshots so what it changes is
+/// put back. (`execute_call` doesn't hold them around the whole subagent
+/// call, which takes them for its own calls.) Other calls' hooks already
+/// run inside `execute_call`'s.
+async fn guarded_hook<F: std::future::Future<Output = crate::hooks::HookOutcome>>(
+    agent: &Agent,
+    call: Option<(&CallCtx<'_>, Mode)>,
+    name: &str,
+    run: F,
+) -> crate::hooks::HookOutcome {
+    let Some((_, mode)) = call.filter(|_| crate::agents::STARTS_SUBAGENTS.contains(&name)) else {
+        return run.await;
+    };
+    if mode == Mode::Plan {
+        match in_snapshot(agent, run).await {
+            Ok((outcome, _put_back)) => outcome,
+            Err(why) => crate::hooks::HookOutcome::Failed(format!(
+                "plan mode can't run it: the workspace can't be snapshotted ({why}), so its changes couldn't be put back"
+            )),
+        }
+    } else {
+        let lock = project_lock(&agent.paths.project_dir);
+        let _shared = lock.read().await;
+        run.await
+    }
+}
+
 /// Decides whether a tool call may run.
 struct Gate<'a> {
     /// In plan mode, MCP tools that don't say they only read.
     plan_denied: &'a [String],
+    /// Held while the user is asked (see `TurnShared::ask_lock`).
+    ask_lock: &'a tokio::sync::Mutex<()>,
     agent: &'a Agent,
     config: &'a AppConfig,
     pending: &'a Pending,
@@ -1408,6 +1834,9 @@ impl Gate<'_> {
     ) -> Result<(), String> {
         if self.cancel.is_cancelled() {
             return Err("[Tool error: cancelled by user]".to_string());
+        }
+        if !self.config.tool_allowed(name) {
+            return Err(format!("[Tool error: `{name}` isn't one of this agent's tools]"));
         }
         let policy = Policy::new(self.config.permissions.clone())
             .with_approvals(approvals.clone())
@@ -1443,7 +1872,11 @@ impl Gate<'_> {
             Action::Ask => {
                 let mut note = None;
                 if let Some(reviewer) = &self.config.reviewer {
-                    let task = crate::session::user_prompts(session.entries()).last().map(|p| p.text.clone()).unwrap_or_default();
+                    // A subagent's prompt was written by the model: the reviewer
+                    // judges against what the user asked for.
+                    let task = self.config.user_task.clone().unwrap_or_else(|| {
+                        crate::session::user_prompts(session.entries()).last().map(|p| p.text.clone()).unwrap_or_default()
+                    });
                     match crate::control::review(
                         self.agent.model.as_ref(),
                         self.config,
@@ -1473,6 +1906,26 @@ impl Gate<'_> {
                 // A cancel during the review: don't ask about a turn that's over.
                 if self.cancel.is_cancelled() {
                     return Err("[Tool error: cancelled by user]".to_string());
+                }
+                // One question at a time, however many subagents are running.
+                let _asking = tokio::select! {
+                    g = self.ask_lock.lock() => g,
+                    _ = self.cancel.cancelled() => return Err("[Tool error: cancelled by user]".to_string()),
+                };
+                // A subagent running alongside may have just been told
+                // "always" for this: take the saved answers again.
+                if let Some(Ok(fresh)) = self.agent.paths.approvals.as_deref().map(crate::permissions::load_approvals) {
+                    if fresh != *approvals {
+                        *approvals = fresh;
+                        let again = Policy::new(self.config.permissions.clone())
+                            .with_approvals(approvals.clone())
+                            .with_mode(self.mode)
+                            .deny_tools(self.plan_denied)
+                            .decide(name, input);
+                        if again.action == Action::Allow {
+                            return Ok(());
+                        }
+                    }
                 }
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 self.pending.lock().unwrap().insert(id.to_string(), tx);

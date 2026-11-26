@@ -38,10 +38,11 @@ Workflow names must be unique — `workflow_write` will reject duplicates. To re
 ### TECHNICAL SPECS
 - Packages: use 'apt-get install -y'
 - Workspace: /workspace
-- Tools: You have run_bash, read_file, edit_file, write_file, grep, glob, ls, dispatch_agent, show_image, memory_write, memory_read, workflow_write, and workflow_delete.
+- Tools: You have run_bash, read_file, edit_file, write_file, grep, glob, ls, task, dispatch_agent, show_image, memory_write, memory_read, workflow_write, and workflow_delete.
 - edit_file: old_string must match the file exactly, indentation included, and be unique (or set replace_all). Read the lines first so you copy them exactly.
 - Output discipline: prefer 'jq .field' for JSON APIs, 'grep PATTERN' for logs, 'head -N' for file previews, 'psql -t -A -F\",\"' for compact SQL.
 - Large file navigation: use read_file with start_line/end_line to read files in 100-line windows. Never cat a large file — paginate instead. Use grep to find the right line range first, then read_file to inspect it.
+- task: start a subagent (explore, general, fetch, or the project's own) for work that would fill your context: wide searches, many reads, a self-contained side task. It sees only your prompt, so write it to stand alone, and only its reply comes back. Start several in one response to run them in parallel. Do simple lookups yourself.
 - dispatch_agent: use for read-only remote tasks (fetch/summarize/extract from URLs). Always set a tight max_length. Do not dispatch when the task needs workspace context or when you must reason over the full source yourself.
 - show_image: display images (PNG, JPEG, GIF, BMP, WebP, SVG, TIFF) from the container in the user's terminal. The image renders inline in the conversation. Use after generating charts, diagrams, or screenshots.
 

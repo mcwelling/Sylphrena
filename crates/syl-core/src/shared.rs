@@ -22,7 +22,9 @@ pub struct SharedState {
 
     /// Rate limits by model. The API limits each model separately, so a
     /// sub-agent's calls (`dispatch_agent` on Haiku, the reviewer) must not
-    /// pace the main model's.
+    /// pace the main model's. The buckets are under the model's name; the
+    /// estimate of what's cached also under `model␟conversation` for each
+    /// conversation (see `client::estimate_key`).
     pub model_limits: Mutex<HashMap<String, ModelLimits>>,
 
     /// Model for the next turn. Initialised from `AppConfig::model` and
@@ -43,6 +45,10 @@ pub struct SharedState {
     /// Tool definitions sent besides the built-in ones, frozen with the
     /// system prompt (MCP tools, the `skill` tool).
     pub extra_tools: Mutex<std::sync::Arc<Vec<serde_json::Value>>>,
+
+    /// What subagents have cost this session, priced at their own models
+    /// (their tokens aren't in `session_tokens`).
+    pub subagent_cost_usd: Mutex<f64>,
 }
 
 /// One model's rate limits, as its requests have seen them.
@@ -77,6 +83,7 @@ impl SharedState {
             available_models: Mutex::new(crate::api::models::static_fallback()),
             system_prompt: Mutex::new(None),
             extra_tools: Mutex::new(Default::default()),
+            subagent_cost_usd: Mutex::new(0.0),
         })
     }
 }
