@@ -233,6 +233,20 @@ pub enum BlockDeltaEvent {
     ThinkingDelta  { text: String },
     TextDelta      { text: String },
     InputJsonDelta { text: String },
+    /// The request failed after some text or thinking was streamed, and is
+    /// being sent again: what was shown is not part of the reply.
+    Restart,
+}
+
+/// An error response's body, read until `cancel` or for at most 10 s (a
+/// proxy can stall it), whichever is first. Empty if it can't be read.
+async fn error_body(resp: reqwest::Response, cancel: &CancellationToken) -> anyhow::Result<String> {
+    tokio::select! {
+        r = tokio::time::timeout(std::time::Duration::from_secs(10), resp.text()) => {
+            Ok(r.ok().and_then(Result::ok).unwrap_or_default())
+        }
+        _ = cancel.cancelled() => Err(CancelledError.into()),
+    }
 }
 
 fn extract_block_delta(data: &serde_json::Value) -> Option<BlockDeltaEvent> {
@@ -303,7 +317,7 @@ async fn stream_turn_observed(
     if status == 429 || status.as_u16() == 529 {
         // A typed error, so the retry loop can retry and honour retry-after.
         let retry_after = crate::api::rate_limit::retry_after(resp.headers());
-        let body = resp.text().await.unwrap_or_default();
+        let body = error_body(resp, &cancel).await?;
         let detail = serde_json::from_str::<serde_json::Value>(&body)
             .ok()
             .and_then(|v| v["error"]["message"].as_str().map(str::to_string))
@@ -311,7 +325,7 @@ async fn stream_turn_observed(
         return Err(RateLimited { status: status.as_u16(), retry_after, detail }.into());
     }
     if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
+        let body = error_body(resp, &cancel).await?;
         anyhow::bail!("API error {}: {}", status, body);
     }
 
@@ -496,7 +510,16 @@ pub async fn call_with_retry_shared(
 
     let mut attempts = 0u32;
     loop {
-        match stream_turn_observed(client, config, messages, system, cancel.clone(), &on_delta, Some(state)).await {
+        // Whether this attempt showed anything: a retry then starts the
+        // reply again, and the clients are told so.
+        let shown = std::sync::atomic::AtomicBool::new(false);
+        let observe = |d: BlockDeltaEvent| {
+            if matches!(d, BlockDeltaEvent::TextDelta { .. } | BlockDeltaEvent::ThinkingDelta { .. }) {
+                shown.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            on_delta(d)
+        };
+        match stream_turn_observed(client, config, messages, system, cancel.clone(), &observe, Some(state)).await {
             Ok(result) => {
                 let uncached = result.usage.input_tokens + result.usage.cache_write_tokens;
                 {
@@ -520,8 +543,14 @@ pub async fn call_with_retry_shared(
             Err(e) if is_rate_limit_error(&e) && attempts < MAX_RETRIES => {
                 let delay = retry_delay(&e, attempts, api_wait(config, state, messages, system));
                 tracing::warn!(attempt = attempts, delay_ms = delay.as_millis(), error = %e, "rate limited, retrying");
-                if delay >= std::time::Duration::from_secs(2) {
-                    let what = if e.to_string().starts_with("rate_limit:529") { "The API is overloaded" } else { "The API's rate limit was reached" };
+                let what = if e.to_string().starts_with("rate_limit:529") { "The API is overloaded" } else { "The API's rate limit was reached" };
+                if shown.load(std::sync::atomic::Ordering::Relaxed) {
+                    on_delta(BlockDeltaEvent::Restart);
+                    notify_fn(&format!(
+                        "[Rate limit] {what} partway through the reply; it is discarded and starts again in {}s...",
+                        delay.as_secs_f64().ceil() as u64
+                    ));
+                } else if delay >= std::time::Duration::from_secs(2) {
                     notify_fn(&format!("[Rate limit] {what}; retrying in {}s...", delay.as_secs()));
                 }
                 tokio::select! {

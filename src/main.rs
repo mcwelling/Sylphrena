@@ -1080,6 +1080,11 @@ impl Repl<'_> {
                     }
                     let _ = terminal::write_streaming(&self.tui.stdout, &text);
                 }
+                AgentEvent::ReplyRestarted => {
+                    // Scrollback can't be taken back: mark where the
+                    // discarded part ends (streaming was ended above).
+                    self.print("\x1b[2m[cut off by an API error; the reply starts again below]\x1b[0m\r\n");
+                }
                 AgentEvent::Usage { .. } => {
                     self.tui.stop_anim();
                     // Keep the meters current through a long turn.

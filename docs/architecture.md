@@ -114,7 +114,7 @@ Syl follows the limits the API reports rather than guessing them (`api/rate_limi
 
    The wait is just long enough for the shortfall to refill, never past the bucket's reset, and at most two minutes. Reset times are in the server's clock. When the response's `Date` header shows the local clock is more than 2 s off, they are moved onto the local one, so a fast clock doesn't see a bucket full too early.
 
-2. **Retries.** A `429` or `529` (before or during the stream) is retried up to 6 times. The wait is the `retry-after` the API sent (at most two minutes). Without one, it is 1 s doubling to at most 30 s, or longer if the headers on the error itself say the bucket needs longer to refill. Waits of 2 s or more are shown as a notice.
+2. **Retries.** A `429` or `529` (before or during the stream) is retried up to 6 times. The wait is the `retry-after` the API sent (at most two minutes). Without one, it is 1 s doubling to at most 30 s, or longer if the headers on the error itself say the bucket needs longer to refill. Waits of 2 s or more are shown as a notice. An error response's body is read only until a cancel, and for at most 10 s. If the request failed after some of the reply was streamed, the agent emits `ReplyRestarted` and a notice before sending it again: the TUI marks where the discarded part ends, `-p` sets the new start apart (and says so on stderr), and `--output json` readers can drop the text streamed since `RequestStarted`.
 
 3. **An optional cap of your own.** `rate_limit` (tokens a minute, default 0 = none) keeps Syl below what the API allows, for example to leave room for other tools sharing the key: a sliding 60-second window of uncached input tokens, and past 80% of the cap the next request waits for the window.
 
