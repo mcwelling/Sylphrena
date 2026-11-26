@@ -373,3 +373,39 @@ mod estimate {
         assert!(n < 5_000, "{n}");
     }
 }
+
+#[tokio::test]
+async fn each_conversation_keeps_its_own_cache_estimate() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(SSE, "text/event-stream")
+                .insert_header("anthropic-ratelimit-input-tokens-limit", "400000")
+                .insert_header("anthropic-ratelimit-input-tokens-remaining", "390000")
+                .insert_header("anthropic-ratelimit-input-tokens-reset", rfc3339_in(2_000).as_str()),
+        )
+        .mount(&server)
+        .await;
+    let state = syl_core::shared::SharedState::new();
+    let send = |conversation: &str, n: usize| {
+        let cfg = AppConfig { conversation: Some(conversation.to_string()), ..config(&server) };
+        let messages: Vec<Message> = (0..n).map(|_| Message::user_text("hi")).collect();
+        let state = state.clone();
+        async move {
+            call_with_retry_shared(&reqwest::Client::new(), &cfg, &state, &messages, &[SystemBlock::text("sys")], CancellationToken::new(), |_| {}, |_| {})
+                .await
+                .unwrap();
+        }
+    };
+    // The parent's conversation, then a subagent's on the same model.
+    send("parent", 5).await;
+    send("child", 1).await;
+    let model = config(&server).model;
+    let all = state.model_limits.lock().unwrap();
+    assert_eq!(all[&format!("{model}\u{1f}parent")].last_count, 5, "the subagent didn't overwrite the parent's");
+    assert_eq!(all[&format!("{model}\u{1f}child")].last_count, 1);
+    // The buckets stay the model's, shared.
+    assert_eq!(all[&model].api.unwrap().input.unwrap().limit, 400_000);
+}

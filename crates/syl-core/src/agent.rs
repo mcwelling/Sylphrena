@@ -742,6 +742,7 @@ async fn turn_body(
         if !model.is_empty() {
             c.model = model;
         }
+        c.conversation = Some(session.id().to_string());
         c
     };
     // Started on the first turn. Cancelling leaves it unstarted, so the next
@@ -1287,6 +1288,10 @@ fn subagent_may_write(agent: &Agent, name: &str, input: &serde_json::Value) -> b
     use crate::hooks::HookEvent;
     // Tool hooks can write whatever the tool.
     let hooks = agent.config.hooks.iter().any(|h| matches!(h.event, HookEvent::PreTool | HookEvent::PostTool));
+    if name == "dispatch_agent" {
+        // Its fetch agent can't write; a hook on fetch can.
+        return hooks;
+    }
     name == "task"
         && (hooks
             || input["agent"]
@@ -1910,7 +1915,7 @@ impl Gate<'_> {
                 // A subagent running alongside may have just been told
                 // "always" for this: take the saved answers again.
                 if let Some(Ok(fresh)) = self.agent.paths.approvals.as_deref().map(crate::permissions::load_approvals) {
-                    if fresh.len() != approvals.len() {
+                    if fresh != *approvals {
                         *approvals = fresh;
                         let again = Policy::new(self.config.permissions.clone())
                             .with_approvals(approvals.clone())

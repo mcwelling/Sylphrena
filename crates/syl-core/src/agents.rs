@@ -260,7 +260,18 @@ pub fn list_agents(project: &Path) -> (Vec<AgentDef>, Vec<String>) {
                 continue;
             }
             let Ok(text) = crate::util::read_regular(&path) else { continue };
-            out.push(parse(&name, &text, Some(path), &mut problems));
+            let def = parse(&name, &text, Some(path), &mut problems);
+            // A cloned project can redefine `explore`, say, without a
+            // tools line: say so, since nothing else would.
+            if dir.starts_with(project) && builtins().iter().any(|b| b.name == name) {
+                let tools = match &def.tools {
+                    None => "every tool".to_string(),
+                    Some(t) if t.is_empty() => "no tools".to_string(),
+                    Some(t) => t.join(", "),
+                };
+                problems.push(format!("agent {name}: this project's .syl/agents/{name}.md replaces the built-in one (tools: {tools})"));
+            }
+            out.push(def);
         }
     }
     for b in builtins() {
@@ -383,8 +394,10 @@ mod tests {
         std::fs::write(tmp.path().join("secret"), "s").unwrap();
         std::os::unix::fs::symlink(tmp.path().join("secret"), dir.join("leak.md")).unwrap();
         let (agents, _) = list_agents(tmp.path());
+        let (agents, problems) = (agents, list_agents(tmp.path()).1);
         let explore = agents.iter().find(|a| a.name == "explore").unwrap();
         assert_eq!(explore.description, "Mine.");
+        assert!(problems.iter().any(|p| p.contains("replaces the built-in") && p.contains("every tool")), "{problems:?}");
         assert!(agents.iter().all(|a| a.name != "leak"));
         assert!(agents.iter().any(|a| a.name == "general") && agents.iter().any(|a| a.name == "fetch"));
     }

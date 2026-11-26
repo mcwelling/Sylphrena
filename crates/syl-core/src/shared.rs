@@ -22,7 +22,9 @@ pub struct SharedState {
 
     /// Rate limits by model. The API limits each model separately, so a
     /// sub-agent's calls (`dispatch_agent` on Haiku, the reviewer) must not
-    /// pace the main model's.
+    /// pace the main model's. The buckets are under the model's name; the
+    /// estimate of what's cached also under `model␟conversation` for each
+    /// conversation (see `client::estimate_key`).
     pub model_limits: Mutex<HashMap<String, ModelLimits>>,
 
     /// Model for the next turn. Initialised from `AppConfig::model` and

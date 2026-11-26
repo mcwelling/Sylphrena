@@ -129,6 +129,11 @@ pub struct AppConfig {
     /// which its reviewer judges calls against (its own prompt was written
     /// by the model).
     pub user_task: Option<String>,
+    /// The session this request belongs to. The prompt cache is per
+    /// conversation, so the rate-limit estimate of what's cached is kept
+    /// for each one (subagents and ACP sessions on the same model would
+    /// otherwise overwrite each other's).
+    pub conversation: Option<String>,
 }
 
 /// Tools only subagents are offered.
@@ -211,6 +216,7 @@ impl Default for AppConfig {
             subagent: None,
             tool_choice_none: false,
             user_task: None,
+            conversation: None,
         }
     }
 }
