@@ -74,7 +74,7 @@ fn throwaway(options: ContainerOptions) -> Throwaway {
     std::fs::write(&podman, format!("#!/bin/sh\nHOME='{real_home}' exec '{}' \"$@\"\n", real.trim())).unwrap();
     std::fs::set_permissions(&podman, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-    let container = Container::for_project(project.path()).with_podman(podman.clone()).with_options(options);
+    let container = syl_core::container::for_project(project.path()).with_podman(podman.clone()).with_options(options);
     assert!(container.name().starts_with("syl-agent-"));
     let t = Throwaway { container, _project: project };
     t.container.start_or_resume(false, &|m| eprintln!("{m}")).unwrap();

@@ -48,7 +48,7 @@ esac
 /// is the project directory itself (commands run on the host).
 pub fn fake_container(project_dir: &Path, bin_dir: &Path) -> Container {
     let dir = project_dir.canonicalize().unwrap_or_else(|_| project_dir.to_path_buf());
-    Container::for_project(project_dir)
+    syl_core::container::for_project(project_dir)
         .with_podman(fake_podman(bin_dir))
         .with_workdir(dir.to_string_lossy().into_owned())
 }

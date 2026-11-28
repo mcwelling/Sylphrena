@@ -124,7 +124,7 @@ async fn main() -> anyhow::Result<()> {
 
     // 7. Container lifecycle
     let defaults = syl_container::ContainerOptions::default();
-    let container = Arc::new(Container::for_project(&project_dir).with_options(syl_container::ContainerOptions {
+    let container = Arc::new(syl_container::for_project(&project_dir).with_options(syl_container::ContainerOptions {
         network: config.container.network.clone(),
         memory: config.container.memory.clone().unwrap_or(defaults.memory),
         cpus: config.container.cpus.clone(),

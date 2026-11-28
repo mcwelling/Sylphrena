@@ -1486,13 +1486,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 name = "syl-container"
 version = "0.1.0"
 dependencies = [
- "anyhow",
- "hex",
- "serde_json",
- "sha2",
- "tempfile",
- "tokio",
- "tokio-util",
+ "urithiru",
 ]
 
 [[package]]
@@ -1941,6 +1935,19 @@ name = "untrusted"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
+
+[[package]]
+name = "urithiru"
+version = "0.1.0"
+source = "git+https://github.com/mcwelling/urithiru#c8e5fd77fe845d86a1da468099e8923947fd95e8"
+dependencies = [
+ "anyhow",
+ "hex",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tokio-util",
+]
 
 [[package]]
 name = "url"
