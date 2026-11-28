@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 /// A stand-in podman that logs every call to `calls.log` and answers:
 /// - `info`: a 4 GiB VM with 4 CPUs
 /// - `exec ... memory.events`: `oom_kill N`, N one more on each call
-/// - `exec ... SYL_EXEC=` (the kill script): nothing
+/// - `exec ... URITHIRU_EXEC=` (the kill script): nothing
 /// - other `exec`s: runs the command on the host, dropping `timeout N`
 fn logging_podman(dir: &Path) -> PathBuf {
     let fake = dir.join("podman");
@@ -33,7 +33,7 @@ case "$1" in
         echo "oom_kill $n"
         echo $((n + 1)) > "{dir}/oom"
         exit 0 ;;
-      *grep\ -qxF\ \'SYL_EXEC=*) exit 0 ;;
+      *grep\ -qxF\ \'URITHIRU_EXEC=*) exit 0 ;;
     esac
     shift
     while :; do
@@ -62,7 +62,7 @@ esac
 
 fn container(dir: &Path) -> Container {
     let real = dir.canonicalize().unwrap();
-    Container::for_project(dir)
+    syl_core::container::for_project(dir)
         .with_podman(logging_podman(&real))
         .with_workdir(real.to_string_lossy().into_owned())
 }
@@ -75,9 +75,9 @@ fn calls(dir: &Path) -> Vec<String> {
         .collect()
 }
 
-/// The `SYL_EXEC` tag a call carried in its environment.
+/// The `URITHIRU_EXEC` tag a call carried in its environment.
 fn tag_of(call: &str) -> Option<&str> {
-    call.split_whitespace().find_map(|w| w.strip_prefix("SYL_EXEC="))
+    call.split_whitespace().find_map(|w| w.strip_prefix("URITHIRU_EXEC="))
 }
 
 #[tokio::test]
@@ -110,9 +110,9 @@ async fn a_timed_out_command_has_its_processes_killed() {
     let calls = calls(tmp.path());
     let tag = calls.iter().find(|l| l.contains("sleep 5")).and_then(|l| tag_of(l)).unwrap().to_string();
     let kill = calls.iter().find(|l| l.contains("grep -qxF")).expect("a kill call");
-    assert!(kill.contains(&format!("'SYL_EXEC={tag}'")), "{kill}");
+    assert!(kill.contains(&format!("'URITHIRU_EXEC={tag}'")), "{kill}");
     // The kill call itself isn't tagged, so it can't kill itself.
-    assert!(!kill.contains("--env SYL_EXEC"), "{kill}");
+    assert!(!kill.contains("--env URITHIRU_EXEC"), "{kill}");
 }
 
 #[tokio::test]
@@ -133,7 +133,7 @@ async fn a_cancelled_command_has_its_processes_killed_too() {
 
     let calls = calls(tmp.path());
     let tag = calls.iter().find(|l| l.contains("sleep 5")).and_then(|l| tag_of(l)).unwrap().to_string();
-    assert!(calls.iter().any(|l| l.contains(&format!("'SYL_EXEC={tag}'"))), "{calls:?}");
+    assert!(calls.iter().any(|l| l.contains(&format!("'URITHIRU_EXEC={tag}'"))), "{calls:?}");
 }
 
 #[tokio::test]

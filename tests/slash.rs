@@ -10,7 +10,7 @@ use syl_rs::slash::{handle_slash, SlashAction, SlashContext};
 
 /// Never started: these tests don't run workflows.
 static CONTAINER: LazyLock<Container> =
-    LazyLock::new(|| Container::for_project(std::path::Path::new("/nonexistent/syl-slash-test")));
+    LazyLock::new(|| syl_core::container::for_project(std::path::Path::new("/nonexistent/syl-slash-test")));
 
 // ============================================================
 // Helpers

@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Container Toolchains</title>
+<meta name="description" content="How other tools get the right toolchain into a sandbox, what is wrong with Syl's approach today, and a critique of building minimal images on demand.">
+<style>
+:root {
+  --bg: #fbfaf7; --surface: #ffffff; --surface-2: #f3f1ec; --text: #1d1c1a; --muted: #6b6760;
+  --border: #e4e0d8; --accent: #2f6fb3; --accent-soft: #e6eef8;
+  --yes: #1f7a4d; --yes-bg: #e3f3ea; --part: #8a5a00; --part-bg: #fbf0d9; --no: #a23b32; --no-bg: #f8e5e3;
+  --code-bg: #f1eee8; color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #151514; --surface: #1d1d1b; --surface-2: #252522; --text: #ebe8e2; --muted: #a19c93;
+    --border: #34332f; --accent: #7fb0e6; --accent-soft: #1f2c3b;
+    --yes: #6fd09c; --yes-bg: #17301f; --part: #e6b65c; --part-bg: #33281a; --no: #f08f85; --no-bg: #3a1e1b;
+    --code-bg: #262521; color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #151514; --surface: #1d1d1b; --surface-2: #252522; --text: #ebe8e2; --muted: #a19c93;
+  --border: #34332f; --accent: #7fb0e6; --accent-soft: #1f2c3b;
+  --yes: #6fd09c; --yes-bg: #17301f; --part: #e6b65c; --part-bg: #33281a; --no: #f08f85; --no-bg: #3a1e1b;
+  --code-bg: #262521; color-scheme: dark;
+}
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body { margin: 0; background: var(--bg); color: var(--text);
+  font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif; }
+main { max-width: 860px; margin: 0 auto; padding: 40px 16px 64px; }
+h1 { font-size: 1.9rem; line-height: 1.2; margin: 0 0 6px; }
+h2 { font-size: 1.3rem; margin: 44px 0 10px; padding-top: 12px; border-top: 1px solid var(--border); }
+h3 { font-size: 1.05rem; margin: 24px 0 6px; }
+p, li { max-width: 72ch; }
+.meta { color: var(--muted); font-size: 0.9rem; margin: 0 0 24px; }
+a { color: var(--accent); }
+code { font-family: ui-monospace, Menlo, monospace; font-size: 0.88em; background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
+pre { background: var(--code-bg); padding: 12px 14px; border-radius: 8px; overflow-x: auto; font-size: 0.85rem; line-height: 1.5; }
+pre code { background: none; padding: 0; }
+.lede { font-size: 1.05rem; }
+.box { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px 18px; margin: 16px 0; }
+.box.key { border-left: 4px solid var(--accent); }
+.box h3 { margin-top: 4px; }
+.table-wrap { overflow-x: auto; margin: 12px 0; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
+table { border-collapse: collapse; width: 100%; font-size: 0.9rem; min-width: 640px; }
+th, td { text-align: left; vertical-align: top; padding: 9px 12px; border-bottom: 1px solid var(--border); }
+th { background: var(--surface-2); font-weight: 600; }
+tr:last-child td { border-bottom: none; }
+.tag { display: inline-block; font-size: 0.75rem; font-weight: 600; padding: 1px 8px; border-radius: 999px; white-space: nowrap; }
+.yes { color: var(--yes); background: var(--yes-bg); }
+.part { color: var(--part); background: var(--part-bg); }
+.no { color: var(--no); background: var(--no-bg); }
+.hole { border-left: 4px solid var(--no); }
+.keep { border-left: 4px solid var(--yes); }
+ol.layers li { margin-bottom: 10px; }
+.small { font-size: 0.88rem; color: var(--muted); }
+footer { margin-top: 56px; padding-top: 16px; border-top: 1px solid var(--border); }
+footer li { font-size: 0.88rem; }
+</style>
+</head>
+<body>
+<main>
+<h1>Getting the right toolchain into the container</h1>
+<p class="meta">Research notes for discussion · 28 November 2026 · written against <code>phase6-subagents</code> (<code>3a35935</code>)</p>
+
+<p class="lede">Syl runs every project in one Rust-flavoured image. Other tools solve this problem in roughly six ways, and the "build a minimal image on demand" idea is one of them. That approach is sound, and the tools for it already exist. The hard parts are elsewhere: <strong>working out what a project needs</strong>, and <strong>handling the toolchain the agent discovers it needs halfway through a session</strong>. Assembling the image is the easy part.</p>
+
+<h2>1. What Syl does today</h2>
+<p>In <code>crates/syl-container/src/lib.rs</code>, the first cold start does the following:</p>
+<ol>
+  <li>Starts from <code>mcr.microsoft.com/devcontainers/base:ubuntu</code>.</li>
+  <li>Runs <code>SETUP_TOOLS_CMD</code>, which runs <code>apt-get</code> (python3, ripgrep, jq, build-essential, libssl-dev, …), downloads <code>yq</code>, and runs <code>rustup</code> stable.</li>
+  <li>Runs <code>podman commit</code> to save the result as <code>syl-agent-ready:latest</code>, which every later start reuses.</li>
+</ol>
+<p>Problems with this, roughly from most to least important:</p>
+<ul>
+  <li><strong>One image for every project.</strong> A Node 20 + pnpm project, a Python 3.11 project and a Go project all get the same Rust stable toolchain and nothing else. When the agent installs what's missing with <code>apt</code> or <code>curl</code> during a session, those installs live only in that container and are lost on <code>--fresh</code> or a rebuild.</li>
+  <li><strong>The image is not reproducible.</strong> <code>podman commit</code> captures whatever state the container was in, and nothing records how it was produced. "stable" and <code>latest</code> mean different things on different days.</li>
+  <li><strong>The architecture is hard-coded.</strong> <code>yq_linux_amd64</code> is downloaded even on Apple Silicon, where Podman's VM is arm64. It's a small bug, but it shows that any composer has to handle more than one architecture from day one.</li>
+  <li><strong>Network-off mode can't do a first start.</strong> That's already reported as an error, but it's the same problem: setup is imperative and network-bound.</li>
+</ul>
+
+<h2>2. How others solve it</h2>
+<p>The approaches fall into six groups. Most real systems combine two of them.</p>
+
+<div class="table-wrap">
+<table>
+<thead><tr><th>Approach</th><th>Examples</th><th>How it works</th><th>Good at</th><th>Weak at</th></tr></thead>
+<tbody>
+<tr>
+  <td><strong>A. One large image plus a setup script</strong></td>
+  <td>Codex cloud (<code>codex-universal</code>), Claude Code on the web, Codespaces' default image</td>
+  <td>A large shared image with many languages already installed. Versions are picked with environment variables (<code>CODEX_ENV_*</code>), and a per-repo setup script adds the rest. Codex caches the container after setup and throws the cache away when the script, variables or secrets change.</td>
+  <td>Works for most repos with no configuration. Only one image to maintain.</td>
+  <td>Several GB on disk. Version pinning only covers what the image's authors anticipated.</td>
+</tr>
+<tr>
+  <td><strong>B. A declarative spec built into an image</strong></td>
+  <td>Dev Containers (<code>devcontainer.json</code> plus Features), Coder <code>envbuilder</code>, OpenHands runtime images</td>
+  <td>The repo declares a base image and Features (tarballs with <code>install.sh</code>, distributed as OCI artifacts, installed in a set order). A builder turns that into an image. OpenHands tags each image with a hash of its base image and dependency lock files, and checks the most specific tag first, then the more general ones, before building.</td>
+  <td>An existing standard that many repos already ship. Builds are cached by content hash.</td>
+  <td>Features are arbitrary shell scripts. The Dev Containers CLI assumes Docker semantics.</td>
+</tr>
+<tr>
+  <td><strong>C. Detect from the repo, then build</strong></td>
+  <td>Railpack (successor to Nixpacks), repo2docker (Binder)</td>
+  <td>Detectors look for files such as <code>package.json</code>, <code>requirements.txt</code> or <code>go.mod</code> and produce a build plan. Railpack gets runtime versions from <strong>mise</strong> and builds with BuildKit. repo2docker splits installs into separate steps so layers cache well.</td>
+  <td>Needs no configuration for common stacks.</td>
+  <td>Built to produce deployable apps, not development environments. Struggles with uncommon cases such as native libraries and monorepos.</td>
+</tr>
+<tr>
+  <td><strong>D. Build images from packages, with no RUN steps</strong></td>
+  <td>Nix <code>dockerTools</code> / <code>nix2container</code>, Chainguard <code>apko</code> (Wolfi), <code>mise oci build</code> (experimental), <code>flox containerize</code>, Devbox</td>
+  <td>The image is assembled directly from a package list. Nothing runs inside it while it's built. <code>mise oci build</code> puts one layer per tool, so changing one version rebuilds only that tool's layer. nix2container skips layers that already exist.</td>
+  <td>Reproducible, cacheable at a fine grain, and nothing from the project runs at build time. <strong>This is the user's idea</strong>, and it's already implemented several times.</td>
+  <td>Only works within one consistent package set (apko can't mix Wolfi and Alpine packages). Nix has a steep learning curve. mise oci is still experimental.</td>
+</tr>
+<tr>
+  <td><strong>E. A version manager inside a general container</strong></td>
+  <td>mise / asdf, <code>devbox shell</code>, a Dev Container with a mise Feature</td>
+  <td>Keep the image generic, and install the versions the repo asks for (<code>mise.toml</code>, <code>.tool-versions</code>, <code>.nvmrc</code>, <code>.python-version</code>) into a cache directory at startup. Installs are symlinks into a shared download cache.</td>
+  <td>No image rebuilds. Mid-session changes take seconds. One cache can be shared by every project.</td>
+  <td>Covers language runtimes, not system libraries like <code>libpq-dev</code>, <code>protoc</code> or <code>libvips</code>.</td>
+</tr>
+<tr>
+  <td><strong>F. The agent sets up its own environment</strong></td>
+  <td>EnvBench, SetupBench, ExecutionAgent, SWE-Factory, Repo2Run</td>
+  <td>An LLM reads the repo, installs things, runs the build and tests, and repairs failures from the errors.</td>
+  <td>The long tail that no detector covers.</td>
+  <td><strong>Unreliable.</strong> EnvBench: the best agent fully set up 29% of JVM repos and 7% of Python repos. SetupBench: 38–57% on repo setup, with 38–89% of actions unnecessary. It works much better when error feedback is part of the loop.</td>
+</tr>
+</tbody>
+</table>
+</div>
+
+<p class="small">Podman detail worth knowing: <code>--mount type=image,source=…,destination=…</code> mounts one image's filesystem into another container, read-only by default according to one tutorial (check on our Podman version). That would let a toolchain image be attached to the agent container without merging layers.</p>
+
+<h2>3. Testing the "build minimal images on demand" idea</h2>
+<p>As I understand the proposal: a separate CLI reads a project's needs, builds a minimal image, and hands it over. Bondsmith orchestrates it, or Syl calls it when running alone. No registry is needed, because an image is only a tarball.</p>
+
+<div class="box keep">
+<h3>What holds up</h3>
+<ul>
+  <li><strong>Declarative and keyed by hash is the right shape.</strong> OpenHands, Codex and envbuilder have all converged on "a hash of the inputs is the image tag; rebuild only when it changes." Doing the same replaces <code>podman commit</code> with something reproducible.</li>
+  <li><strong>No registry is right for solo use.</strong> Podman's local image store is the cache. A registry only matters for sharing between machines or a team, and that can be added later.</li>
+  <li><strong>Making it reusable is right.</strong> It matches the existing decision that <code>syl-container</code> is shared, so Bondsmith can run agents that have no sandbox of their own in the same environments.</li>
+</ul>
+</div>
+
+<div class="box hole">
+<h3>Hole 1: "an image is just a tarball" is true of the format, not of what goes in it</h3>
+<p>Layers stack cleanly only when every binary in them agrees on the C library, the filesystem layout and the dynamic linker. That's why apko won't mix Wolfi and Alpine packages, and why Nix works: each store path carries its own dependencies. A composer therefore needs <em>one consistent package set</em>. The realistic options are Nix, Wolfi apk, Debian apt, or the relocatable toolchain tarballs that mise downloads (Node, Go, Rust, JDK, python-build-standalone). Writing the tarball assembler ourselves is the least valuable part. <code>buildah</code> (Podman-native and scriptable), <code>mise oci build</code> and <code>nix2container</code> all do it already.</p>
+</div>
+
+<div class="box hole">
+<h3>Hole 2: working out what to install is the hard part</h3>
+<p>Version files cover runtimes: <code>rust-toolchain.toml</code>, <code>.nvmrc</code>, <code>go.mod</code>'s <code>go</code> line, <code>.python-version</code>, <code>mise.toml</code>. They don't cover the system libraries a build pulls in, such as <code>openssl-sys</code> needing <code>libssl-dev</code>, a Python wheel needing a compiler, or a test suite expecting Postgres. Detectors handle the common cases, and the benchmarks show that even agents fail on the rest. Any design needs (a) a written spec a person or agent can edit, and (b) a way to check it, by running the project's build or test command.</p>
+</div>
+
+<div class="box hole">
+<h3>Hole 3: "minimal" works against what an agent needs</h3>
+<p>An agent needs a development environment: compilers, headers, git, ripgrep, a debugger, a shell, and Syl's own tools. A minimal runtime image lacks those. Separate minimal images per project also cost more disk than one shared base plus small per-project layers, because layers are only shared when their digests match. In practice the efficient shape is a <strong>shared development base</strong> plus <strong>thin, per-project toolchain layers</strong>. That's mostly what group D tools produce when you give them a fixed base.</p>
+</div>
+
+<div class="box hole">
+<h3>Hole 4: needs change mid-session</h3>
+<p>The agent finds out it needs <code>protoc</code> after twenty minutes of work. A design where images only change at build time means rebuilding and restarting a container that several sessions share (one per project, per Phase 4). There needs to be an immediate path, installing into the running container or a cache volume, whose result is written back into the spec. The next build then picks it up instead of losing it.</p>
+</div>
+
+<div class="box hole">
+<h3>Hole 5: a cloned repo's spec decides what gets installed</h3>
+<p>This is the same trust problem as hooks and MCP servers. A <code>devcontainer.json</code> Feature or a Railpack plan runs arbitrary shell during the build. Two rules follow: builds run inside the container or VM, never on the host, and anything beyond a pinned package list (any script) goes through the existing trust prompt. A purely declarative spec (packages and versions, with checksums) is the safe default, and that favours groups D and E.</p>
+</div>
+
+<div class="box hole">
+<h3>Hole 6: a separate CLI is one more thing to install and version</h3>
+<p>A separate CLI isn't wrong, but it doesn't have to be a separate project. A second binary in this workspace, built on <code>syl-container</code> (for example <code>syl-env</code>, or <code>syl env build</code>), gives Bondsmith something to call and Syl something to link against, with one release process. Split it out only if a non-Syl user turns up.</p>
+</div>
+
+<h2>4. What I'd suggest, for discussion</h2>
+<ol class="layers">
+  <li><strong>A shared base image, built from a checked-in Containerfile instead of <code>podman commit</code>.</strong> It has Syl's agent tools, build-essential, python3 and mise, but no Rust. Tag it with a hash of the Containerfile, and build it for both arm64 and amd64. This alone fixes reproducibility and the yq bug.</li>
+  <li><strong>Runtimes from the project's own version files, through mise.</strong> Read the files that already exist (<code>rust-toolchain.toml</code>, <code>.nvmrc</code>, <code>.python-version</code>, <code>.tool-versions</code>, <code>mise.toml</code>, the <code>go</code> line in <code>go.mod</code>). Install into a <strong>named Podman volume shared by every project</strong>, so Node 20 is downloaded once per machine, not once per project. No image rebuild is needed, and mid-session changes are a <code>mise use</code> away.</li>
+  <li><strong>System packages from a small spec,</strong> such as an <code>[env]</code> section in <code>.syl/config.toml</code> listing apt packages. Build them as one thin layer on top of the base with buildah, tagged with <code>hash(base digest, spec, arch)</code>, the way OpenHands does it. When a repo already has <code>devcontainer.json</code>, use it: its <code>image</code> as the base, and its Features behind the trust prompt. That follows the "standards before inventing formats" principle.</li>
+  <li><strong>Agent-assisted setup as the fallback, not the first resort.</strong> When the build or test command fails for an environment reason, a <code>setup</code> subagent (Phase 6 makes this cheap) proposes spec changes, checks them against the build command, and the result is <em>written to the spec</em> for review, not left inside the container.</li>
+  <li><strong>Bondsmith's role:</strong> show the resolved environment per project, let people edit the spec, run builds in the background, and share the base image and mise volume across every agent it hosts.</li>
+</ol>
+<p>The second step might solve 80% of the problem for little work, so it's the one I'd prototype first. Nix (via <code>flake.nix</code> or Devbox) is worth supporting as an opt-in when a repo already uses it, but I wouldn't make it the default.</p>
+
+<h2>5. Questions to settle</h2>
+<ol>
+  <li><strong>Spec format:</strong> an <code>[env]</code> section in Syl's own config, <code>devcontainer.json</code> only, or both, with devcontainer.json taking precedence when present?</li>
+  <li><strong>Runtime installs:</strong> into a shared mise volume (fast, can change mid-session), or baked into per-project layers (fully reproducible, slower to change)? I lean towards the volume, with an option to bake.</li>
+  <li><strong>Packaging:</strong> a subcommand or a second binary in this workspace, or a standalone project?</li>
+  <li><strong>Which distribution the base uses:</strong> stay on the Ubuntu devcontainers base (works with Features, large), or move to Debian slim or Wolfi (smaller, but Features are less certain to work)?</li>
+  <li><strong>Whether the agent may change the environment on its own,</strong> or only propose spec changes for approval.</li>
+</ol>
+
+<footer>
+<h3>Sources</h3>
+<ul>
+  <li><a href="https://containers.dev/implementors/features/">Dev Container Features spec</a> · <a href="https://code.visualstudio.com/blogs/2022/09/15/dev-container-features">VS Code: Dev Container Features</a></li>
+  <li><a href="https://coder.com/docs/v2.37/admin/templates/managing-templates/envbuilder.md">Coder envbuilder</a> · <a href="https://github.com/coder/envbuilder">envbuilder repo</a></li>
+  <li><a href="https://docs.openhands.dev/usage/architecture/runtime">OpenHands runtime architecture</a> (image tagging scheme)</li>
+  <li><a href="https://developers.openai.com/codex/cloud/environments">Codex cloud environments</a> · <a href="https://code.claude.com/docs/en/cloud-environments.md">Claude Code cloud environments</a></li>
+  <li><a href="https://github.com/railwayapp/railpack">Railpack</a> · <a href="https://coolify.io/docs/applications/builds/railpack">Coolify: Railpack vs Nixpacks</a> · <a href="https://repo2docker.readthedocs.io/en/latest/architecture/">repo2docker architecture</a></li>
+  <li><a href="https://github.com/nlewo/nix2container">nix2container</a> · <a href="https://www.chainguard.dev/docs/open-source/build-tools/apko/getting-started-with-apko">Getting started with apko</a> · <a href="https://jetify.com/blog/creating-nix-powered-containers-with-devbox">Devbox containers</a> · <a href="https://flox.dev/blog/flox-and-containers">Flox and containers</a></li>
+  <li><a href="https://mise.jdx.dev/dev-tools/mise-oci.html">mise oci</a> · <a href="https://mise.jdx.dev/configuration">mise configuration</a></li>
+  <li><a href="https://docs.podman.io/en/v4.4/markdown/options/mount.html">Podman --mount options</a> · <a href="https://oneuptime.com/blog/post/2026-03-17-image-based-volumes-podman/view">Image-based volumes with Podman</a> · <a href="https://redhat.com/sysadmin/getting-started-buildah">Getting started with Buildah</a></li>
+  <li><a href="https://arxiv.org/abs/2503.14443">EnvBench</a> · <a href="https://arxiv.org/abs/2507.09063v1">SetupBench</a> · <a href="https://arxiv.org/html/2512.06915v3">Multi-Docker-Eval</a></li>
+</ul>
+<p class="small">Gaps: I didn't read the full Claude Code installed-tools list or confirm Podman's image-mount read-only default. The OpenHands tag details come partly from mirrored source. Benchmark numbers are as the papers report them.</p>
+</footer>
+</main>
+</body>
+</html>

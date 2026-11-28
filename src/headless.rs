@@ -16,7 +16,7 @@ use syl_core::shared::SharedState;
 /// The container a project's config asks for.
 pub fn container_for(project_dir: &Path, config: &AppConfig) -> Container {
     let defaults = ContainerOptions::default();
-    Container::for_project(project_dir).with_options(ContainerOptions {
+    syl_container::for_project(project_dir).with_options(ContainerOptions {
         network: config.container.network.clone(),
         memory: config.container.memory.clone().unwrap_or(defaults.memory),
         cpus: config.container.cpus.clone(),

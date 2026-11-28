@@ -35,11 +35,11 @@ The repository is a Cargo workspace with three crates:
 
 | Crate | Owns | Depends on |
 |---|---|---|
-| `syl-container` (`crates/syl-container`) | Podman lifecycle (start, resume, remove, health check), command execution, stats | nothing in Syl |
+| `syl-container` (`crates/syl-container`) | Syl's container profile: names, the baked image and its tool install, the read-only `.syl` mount, SSH and git setup | [`urithiru`](https://github.com/mcwelling/urithiru) |
 | `syl-core` (`crates/syl-core`) | Agent loop, tools, sessions, compaction, the model client and the `ModelAdapter` seam | `syl-container` |
 | `syl-rs` (root, binary `syl`) | The terminal client: status bars, animation, picker, slash commands, image rendering | both |
 
-`syl-container` has no dependency on the agent, so Bondsmith can reuse it for agents that don't bring a sandbox. Its progress messages go to a callback instead of stdout.
+The container machinery itself (Podman lifecycle, health checks, command execution, sizing, stats) lives in [Urithiru](https://github.com/mcwelling/urithiru), a separate repository that Syl and Bondsmith both depend on. It knows nothing about agents: what differs between callers is a `Profile`, and `syl-container` is a thin layer that builds Syl's and re-exports the rest. Progress messages go to a callback instead of stdout. Toolchain provisioning (the right languages and libraries per project) is planned there; see its `docs/roadmap.html`.
 
 The core runs the loop on its own task (`agent::spawn`) and has no terminal dependency. A client sends commands and reads events:
 
@@ -270,7 +270,7 @@ Run with `/workflow <name>`. List all with `/workflow`. Claude can create and de
 
 - `edit_file` reads the file, requires `old_string` to occur exactly once (or `replace_all`), writes the result, and returns a unified diff (`similar`, computed off the async runtime with a deadline). On a CRLF file, `\n` line breaks in `old_string` match `\r\n`. `write_file` creates parent directories and returns a diff against the old contents. In the TUI the ticker shows each edit's size, and `/tools` shows the diffs in colour, with control characters made visible.
 - Writes go to a temp file beside the target, are checked for length, take the old file's mode, and are renamed over it, so a cancel, timeout or full disk leaves the old file whole. A symlink is written through to its target.
-- Killing the host-side `podman exec` doesn't stop the process inside, so each command carries `SYL_EXEC=<tag>` in its environment. On a timeout or cancel, Syl kills every process in the container whose `/proc/<pid>/environ` has that tag. That includes ones that left the command's process group or session (`setsid`, a test harness, a backgrounded server), which a group kill misses. A command that finishes is left alone, so a server it started on purpose keeps running. Each command also runs under `timeout -s KILL`, a little past the host's limit, in case the kill fails.
+- Killing the host-side `podman exec` doesn't stop the process inside, so each command carries `URITHIRU_EXEC=<tag>` in its environment. On a timeout or cancel, Syl kills every process in the container whose `/proc/<pid>/environ` has that tag. That includes ones that left the command's process group or session (`setsid`, a test harness, a backgrounded server), which a group kill misses. A command that finishes is left alone, so a server it started on purpose keeps running. Each command also runs under `timeout -s KILL`, a little past the host's limit, in case the kill fails.
 - `grep` uses ripgrep (installed in new images) and falls back to `grep -rnE` in older ones, which skips `.git`, `.syl`, `target`, `node_modules` and similar by name and matches `glob` against base names. `glob` uses bash `globstar`, expands `{a,b}` itself, and lists only paths that exist. Paths in results are relative to `/workspace`.
 - `tools::is_read_only` names the tools with no side effects. The agent loop runs a consecutive run of them with `join_all` and everything else one at a time, in the order the model asked; results always go back in call order, in one user message.
 
@@ -301,7 +301,7 @@ Nothing prompts by default: the container limits the damage, and checkpoints and
 **Container limits.** `[container]` in config.toml sets `memory`, `cpus` and `network` (`"none"` for no network; `dispatch_agent`, package installs and git over the network then fail).
 
 - `memory = "auto"`, the default, is three quarters of what `podman info` reports: the VM's memory on macOS and Windows, the host's on Linux. It falls back to 2 GB if podman can't say. An explicit size (`"4g"`) wins. With no `cpus`, the container can use all of podman's CPUs.
-- **Build jobs** (`Resources` in `syl-container`). Build tools start one job per CPU they see, whatever the memory limit, and linking many binaries at once is what runs a container out of memory. So every command gets `CARGO_BUILD_JOBS`, `MAKEFLAGS=-jN` and `CMAKE_BUILD_PARALLEL_LEVEL` set to N: one job per CPU, but no more than one per GB of the limit, and at least one. The system prompt states the memory, the CPUs and N.
+- **Build jobs** (`Resources` in Urithiru). Build tools start one job per CPU they see, whatever the memory limit, and linking many binaries at once is what runs a container out of memory. So every command gets `CARGO_BUILD_JOBS`, `MAKEFLAGS=-jN` and `CMAKE_BUILD_PARALLEL_LEVEL` set to N: one job per CPU, but no more than one per GB of the limit, and at least one. The system prompt states the memory, the CPUs and N.
 - **Out-of-memory kills.** When a `run_bash` command fails, Syl reads `oom_kill` from the container's cgroup (`memory.events`, or `memory.oom_control` on cgroup v1). If it went up since the last read (or since the container started), the result says how many processes the limit killed and suggests fewer jobs. Otherwise the failure looks like any other: cargo reports `signal: 9, SIGKILL`.
 - The worked-out memory, the `cpus` setting and the network are recorded as a label on the container. A container started with other values is recreated, so resizing podman's VM resizes an `auto` container at the next start.
 - `tests/real_podman.rs` in `syl-core` checks all of this against real podman, in throwaway containers it removes: `SYL_REAL_PODMAN=1 cargo test -p syl-core --test real_podman -- --ignored --test-threads=1`.
@@ -511,7 +511,7 @@ src/                       # syl-rs: the terminal client (binary `syl`)
     └── image_render.rs    # draws show_image output (timg / chafa)
 
 crates/syl-container/src/
-└── lib.rs                 # Container: lifecycle, exec, exec_argv (stdin), stats
+└── lib.rs                 # Syl's urithiru profile: names, tool install, mounts, SSH
 
 crates/syl-core/src/
 ├── agent.rs               # AgentEvent, AgentCommand, spawn, the loop, subagents
